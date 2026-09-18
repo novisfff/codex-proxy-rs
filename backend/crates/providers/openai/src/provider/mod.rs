@@ -95,10 +95,12 @@ use crate::transport::{
     CodexWebSocketPool, endpoint_url,
 };
 
+mod dynamic_egress;
 mod execution;
 mod failure;
 mod observation;
 pub(crate) mod turn_state;
+pub(crate) mod turn_state_fetcher;
 mod workers;
 
 use turn_state::TurnStateCache;
@@ -108,6 +110,7 @@ use execution::*;
 pub use failure::openai_failure_affects_account_score;
 use failure::*;
 use observation::*;
+pub(crate) use workers::fetcher_worker;
 pub(crate) use workers::worker_contributions;
 
 const PROVIDER_NAME: &str = "openai";

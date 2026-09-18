@@ -187,7 +187,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         cooldowns,
         runtime_policy,
         oauth_pending,
-    );
+    )
+    .with_turn_state(Arc::new(postgres::PgTurnStateStore::new(pool.clone())));
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
     ));

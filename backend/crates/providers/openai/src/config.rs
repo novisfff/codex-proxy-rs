@@ -33,6 +33,8 @@ pub struct OpenAiConfig {
     #[serde(default)]
     pub api: CodexApiConfig,
     #[serde(default)]
+    pub dynamic_egress: Option<DynamicEgressConfig>,
+    #[serde(default)]
     pub ws_pool: CodexWebSocketPoolSettings,
     #[serde(default)]
     pub quota: CodexQuotaSettings,
@@ -52,6 +54,19 @@ impl OpenAiConfig {
         runtime_data_dir: &Path,
     ) -> Result<(), OpenAiConfigError> {
         self.api.validate()?;
+        if let Some(config) = &self.dynamic_egress {
+            let valid = Url::parse(&config.url).is_ok_and(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.query().is_none()
+                    && url.fragment().is_none()
+            });
+            if !valid || config.token_file.as_os_str().is_empty() {
+                return Err(OpenAiConfigError::InvalidField("openai.dynamic_egress"));
+            }
+        }
         self.ws_pool.validate()?;
         self.quota.validate()?;
         self.auth.validate()?;
@@ -116,6 +131,7 @@ impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
             api: CodexApiConfig::default(),
+            dynamic_egress: None,
             ws_pool: CodexWebSocketPoolSettings::default(),
             quota: CodexQuotaSettings::default(),
             auth: CodexAuthSettings::default(),
@@ -124,6 +140,13 @@ impl Default for OpenAiConfig {
             identity_secret_path: PathBuf::new(),
         }
     }
+}
+
+/// 专用出口控制面；认证秘密仅从宿主挂载文件读取，不下发给管理端。
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DynamicEgressConfig {
+    pub url: String,
+    pub token_file: PathBuf,
 }
 
 /// Codex 上游 API 的 Provider-owned 地址配置。

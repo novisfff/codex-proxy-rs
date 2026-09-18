@@ -64,6 +64,10 @@ api:
   request_id_header: 'x-request-id'
 
 openai:
+  # 可选：292 获取器专用动态出口服务，安装方式见 dynamic-egress/README.md。
+  # dynamic_egress:
+  #   url: http://127.0.0.1:19080
+  #   token_file: /run/secrets/cpr292-egress-token
   # 上游地址、WebSocket 池、额度刷新和 OAuth 使用 Provider 内置默认值；模板只保留画像启动基线。
   wire_profile:
     # 版本元组来自同一个官方 macOS Desktop ZIP；Provider 每 24 小时检查 appcast，

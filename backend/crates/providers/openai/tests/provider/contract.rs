@@ -4735,10 +4735,11 @@ async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoni
         if let Some(value) = returned_value.filter(|value| value.len() == 292) {
             let current = current.expect("valid response should be visible to administrators");
             assert_eq!(current.value, value);
-            assert!(current.acquired_at >= started);
-            assert!(current.acquired_at <= Utc::now());
-            if let Some(before) = before {
-                assert!(current.acquired_at > before.acquired_at);
+            if let Some(before) = before.filter(|old| old.value == value) {
+                assert_eq!(current.acquired_at, before.acquired_at, "相同值不得续期");
+            } else {
+                assert!(current.acquired_at.timestamp_millis() >= started.timestamp_millis());
+                assert!(current.acquired_at <= Utc::now());
             }
         } else {
             assert_eq!(

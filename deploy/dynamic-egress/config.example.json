@@ -1,0 +1,9 @@
+{
+  "owner": "cpr292-main",
+  "database": "/var/lib/cpr292-egress/state.db",
+  "listen": "127.0.0.1",
+  "controlPort": 19080,
+  "proxyPort": 19081,
+  "proxyUrl": "http://127.0.0.1:19081",
+  "instances": {}
+}

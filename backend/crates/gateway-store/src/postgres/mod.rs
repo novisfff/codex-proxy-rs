@@ -26,6 +26,8 @@ mod proxies;
 mod retention;
 mod runtime_settings;
 mod snapshot;
+mod turn_state;
+pub use turn_state::PgTurnStateStore;
 mod usage_facts;
 
 pub use account_groups::*;

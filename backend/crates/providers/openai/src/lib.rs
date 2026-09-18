@@ -184,11 +184,37 @@ pub async fn initialize(
         )
         .with_oauth_client_id(config.oauth_client_id()),
     );
+    let fetcher = if let Some(store) = ports.turn_state() {
+        let cache = core_provider.turn_state_cache();
+        cache.restore(
+            store
+                .values()
+                .await
+                .map_err(|_| OpenAiInitializeError::Transport)?,
+        );
+        Some(Arc::new(
+            provider::turn_state_fetcher::TurnStateFetcher::new(
+                store,
+                Arc::clone(&accounts),
+                Arc::clone(&leases),
+                ports.cooldowns(),
+                Arc::clone(&catalog),
+                cache,
+                profile.clone(),
+                config.base_url().to_owned(),
+            )
+            .with_dynamic_egress(config.dynamic_egress.as_ref())
+            .map_err(|()| OpenAiInitializeError::Transport)?,
+        ))
+    } else {
+        None
+    };
     let admin_provider: Arc<dyn ProviderAdmin> = Arc::new(OpenAiAdminProvider::new(
         provider_kind,
         profile,
         accounts,
         OpenAiAdminServices {
+            fetcher: fetcher.clone(),
             turn_state: core_provider.turn_state_cache(),
             credentials: credential_admin,
             oauth: oauth_admin,
@@ -199,7 +225,7 @@ pub async fn initialize(
         websocket_pool,
         desktop_release_status,
     ));
-    let worker_contributions = provider::worker_contributions(
+    let mut worker_contributions = provider::worker_contributions(
         refresh,
         quota,
         catalog,
@@ -208,6 +234,10 @@ pub async fn initialize(
         desktop_release,
     )
     .map_err(|_| OpenAiInitializeError::Worker)?;
+    if let Some(fetcher) = fetcher {
+        worker_contributions
+            .push(provider::fetcher_worker(fetcher).map_err(|_| OpenAiInitializeError::Worker)?);
+    }
 
     Ok(ProviderBundle {
         core_provider,

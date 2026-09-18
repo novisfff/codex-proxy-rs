@@ -1,0 +1,27 @@
+[Unit]
+Description=Dedicated dynamic egress for the 292 fetcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cpr292
+Group=cpr292
+WorkingDirectory=/opt/cpr292-egress
+Environment=EGRESS_CONFIG=/etc/cpr292-egress/config.json
+Environment=EGRESS_TOKEN_FILE=/etc/cpr292-egress/token
+Environment=AZURE_CONFIG_DIR=/var/lib/cpr292-egress/azure
+ExecStart=/opt/cpr292-egress/venv/bin/python /opt/cpr292-egress/egress.py
+Restart=on-failure
+RestartSec=10
+StateDirectory=cpr292-egress
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+TimeoutStopSec=660
+
+[Install]
+WantedBy=multi-user.target

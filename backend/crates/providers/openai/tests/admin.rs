@@ -1,3 +1,600 @@
+mod turn_state_fetcher {
+    use super::*;
+    use gateway_core::account::OutboundProxy;
+    use gateway_core::provider_ports::{ProviderStoreErrorKind, turn_state::*};
+    use gateway_core::task::{ScheduledTask, WorkerCycleContext, WorkerId};
+
+    #[derive(Default)]
+    struct MemoryTurnStateStore {
+        configs: Mutex<Vec<TurnStateFetcherConfig>>,
+        values: Mutex<Vec<TurnStateValue>>,
+        attempts: Mutex<Vec<TurnStateFetchAttempt>>,
+        proxy: Mutex<Option<OutboundProxy>>,
+    }
+    impl TurnStateStore for MemoryTurnStateStore {
+        fn configs(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<TurnStateFetcherConfig>, ProviderStoreError>> {
+            Box::pin(async { Ok(self.configs.lock().unwrap().clone()) })
+        }
+        fn save_config(
+            &self,
+            mut config: TurnStateFetcherConfig,
+        ) -> BoxFuture<'_, Result<(), ProviderStoreError>> {
+            Box::pin(async move {
+                let mut configs = self.configs.lock().unwrap();
+                let old = configs.iter().find(|c| c.account_id == config.account_id);
+                if old.map_or(0, |c| c.revision) != config.revision {
+                    return Err(ProviderStoreError::new(
+                        ProviderStoreErrorKind::Conflict,
+                        "revision",
+                    ));
+                }
+                config.revision += 1;
+                configs.retain(|c| c.account_id != config.account_id);
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .retain(|a| a.account_id != config.account_id);
+                configs.push(config);
+                Ok(())
+            })
+        }
+        fn values(&self) -> BoxFuture<'_, Result<Vec<TurnStateValue>, ProviderStoreError>> {
+            Box::pin(async { Ok(self.values.lock().unwrap().clone()) })
+        }
+        fn save_values(
+            &self,
+            values: Vec<TurnStateValue>,
+        ) -> BoxFuture<'_, Result<(), ProviderStoreError>> {
+            Box::pin(async move {
+                let mut stored = self.values.lock().unwrap();
+                for value in values {
+                    stored.retain(|v| v.account_id != value.account_id || v.model != value.model);
+                    stored.push(value);
+                }
+                Ok(())
+            })
+        }
+        fn attempts(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<TurnStateFetchAttempt>, ProviderStoreError>> {
+            Box::pin(async { Ok(self.attempts.lock().unwrap().clone()) })
+        }
+        fn save_attempt(
+            &self,
+            attempt: TurnStateFetchAttempt,
+        ) -> BoxFuture<'_, Result<(), ProviderStoreError>> {
+            Box::pin(async move {
+                if self.configs.lock().unwrap().iter().any(|c| {
+                    c.account_id == attempt.account_id && c.revision == attempt.config_revision
+                }) {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    attempts
+                        .retain(|a| a.account_id != attempt.account_id || a.model != attempt.model);
+                    attempts.push(attempt);
+                }
+                Ok(())
+            })
+        }
+        fn egress(
+            &self,
+            _: TurnStateFetcherConfig,
+        ) -> BoxFuture<'_, Result<TurnStateFetchEgress, ProviderStoreError>> {
+            Box::pin(async {
+                Ok(TurnStateFetchEgress {
+                    proxy: self.proxy.lock().unwrap().clone(),
+                    max_concurrent: 1,
+                    request_interval_ms: 0,
+                })
+            })
+        }
+    }
+
+    const ACCOUNT: &str = "acct_fetcher";
+    const MODEL: &str = "gpt-5.4";
+    fn fetch_config() -> TurnStateFetcherConfig {
+        TurnStateFetcherConfig {
+            account_id: ACCOUNT.to_owned(),
+            enabled: true,
+            models: vec![MODEL.to_owned()],
+            proxy_id: None,
+            dynamic_egress: None,
+            revision: 0,
+        }
+    }
+    async fn fetch_accounts(server: &MockServer) -> Arc<MemoryAccountStore> {
+        let accounts = Arc::new(MemoryAccountStore::default());
+        accounts
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: ACCOUNT.to_owned(),
+                name: "Fetcher test".to_owned(),
+                secret: secret("test-only-token"),
+                verified_account: profile("chatgpt-fetcher"),
+                next_refresh_at: None,
+                enabled: true,
+            })
+            .await;
+        accounts
+            .set_openai_base_url(ACCOUNT, Some(server.uri()))
+            .await;
+        accounts
+            .set_turn_state(
+                ACCOUNT,
+                gateway_core::policy::CodexTurnStateConfig {
+                    mode: gateway_core::policy::CodexTurnStateMode::Manual,
+                    value: "must-not-leak".to_owned(),
+                },
+            )
+            .await;
+        accounts
+    }
+    fn fetch_worker(
+        bundle: &mut provider_openai::ProviderBundle,
+    ) -> (WorkerId, Arc<dyn ScheduledTask>) {
+        bundle
+            .take_worker_contributions()
+            .into_iter()
+            .find_map(|contribution| match contribution {
+                WorkerContribution::Registration(r)
+                    if r.id.owner() == "openai-turn-state-fetcher" =>
+                {
+                    match r.runnable {
+                        WorkerRunnable::Scheduled { task, .. } => Some((r.id, Arc::from(task))),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("fetch worker")
+    }
+    async fn cycle(worker: &(WorkerId, Arc<dyn ScheduledTask>)) {
+        worker
+            .1
+            .run_cycle(WorkerCycleContext::new(
+                worker.0.clone(),
+                None,
+                CancellationToken::new(),
+            ))
+            .await
+            .unwrap();
+    }
+    async fn mount(server: &MockServer, header: &str, status: u16) {
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-codex-turn-state", header)
+                    .set_body_string(COMPLETED_SESSION_SSE),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dynamic_egress_uses_new_lease_on_retry_and_never_falls_back_to_account_gateway() {
+        let control = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        mount(&upstream, &"a".repeat(292), 200).await;
+        Mock::given(method("GET")).and(path("/v1/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{"id":"azure","families":["ipv4","ipv6"]}],"history":[]})))
+            .mount(&control).await;
+        Mock::given(method("POST")).and(path("/v1/leases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state":"ready","ip":"203.0.113.42","proxyUrl":"http://127.0.0.1:1","secret":"test-lease-secret"})))
+            .mount(&control).await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&control)
+            .await;
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            token.path(),
+            "test-control-secret-with-at-least-32-characters",
+        )
+        .unwrap();
+        let mut config = valid_config();
+        config.config.dynamic_egress = Some(provider_openai::config::DynamicEgressConfig {
+            url: control.uri(),
+            token_file: token.path().to_owned(),
+        });
+        let accounts = fetch_accounts(&upstream).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let mut bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store.clone()),
+        )
+        .await
+        .unwrap();
+        let admin = bundle.admin_provider();
+        let mut selected = fetch_config();
+        selected.dynamic_egress = Some(DynamicEgressSelection {
+            instance: "azure".to_owned(),
+            family: "ipv4".to_owned(),
+        });
+        admin.configure_turn_state_fetcher(selected).await.unwrap();
+        let worker = fetch_worker(&mut bundle);
+        cycle(&worker).await;
+        store.attempts.lock().unwrap()[0].next_attempt_at = 0;
+        cycle(&worker).await;
+        let snapshot = admin.turn_state_fetcher().await.unwrap();
+        assert_eq!(
+            snapshot.attempts[0].exit_ip.as_deref(),
+            Some("203.0.113.42")
+        );
+        assert!(snapshot.values.is_empty());
+        assert!(upstream.received_requests().await.unwrap().is_empty());
+        let requests = control.received_requests().await.unwrap();
+        let ids: Vec<String> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| {
+                r.body_json::<Value>().unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        store.configs.lock().unwrap()[0].enabled = false;
+        Mock::given(method("PUT"))
+            .and(path("/v1/instances"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&control)
+            .await;
+        assert_eq!(
+            admin
+                .configure_dynamic_egress(json!({"revision":0,"instances":{}}))
+                .await
+                .unwrap_err()
+                .kind(),
+            ProviderAdminErrorKind::Conflict
+        );
+        for _ in 0..100 {
+            if control
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method.as_str() == "DELETE")
+                .count()
+                == 2
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("both dynamic leases must be released");
+    }
+
+    #[tokio::test]
+    async fn dynamic_egress_cancellation_releases_provisioning_lease() {
+        let control = MockServer::start().await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/status"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"instances":[{"id":"azure","families":["ipv6"]}]})),
+            )
+            .mount(&control)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/leases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state":"provisioning"})))
+            .mount(&control)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&control)
+            .await;
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            token.path(),
+            "test-control-secret-with-at-least-32-characters",
+        )
+        .unwrap();
+        let mut config = valid_config();
+        config.config.dynamic_egress = Some(provider_openai::config::DynamicEgressConfig {
+            url: control.uri(),
+            token_file: token.path().to_owned(),
+        });
+        let accounts = fetch_accounts(&upstream).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let scheduling = Arc::new(TestLeaseCoordinator::default());
+        let ports = ProviderStorePorts::new(
+            accounts,
+            scheduling.clone(),
+            Arc::new(MemorySessionAffinity::default()),
+            Arc::new(MemorySessionExclusions::default()),
+            Arc::new(TestCatalogCache::default()),
+            Arc::new(TestArtifactProfiles),
+            Arc::new(TestCredentialState),
+            Arc::new(TestCooldown),
+            Arc::new(TestRuntimePolicy),
+            Arc::new(TestOAuthPending::default()),
+        )
+        .with_turn_state(store);
+        let mut bundle = provider_openai::initialize(config.config.clone(), ports)
+            .await
+            .unwrap();
+        let admin = bundle.admin_provider();
+        let mut selected = fetch_config();
+        selected.dynamic_egress = Some(DynamicEgressSelection {
+            instance: "azure".to_owned(),
+            family: "ipv6".to_owned(),
+        });
+        admin.configure_turn_state_fetcher(selected).await.unwrap();
+        let worker = fetch_worker(&mut bundle);
+        let cancellation = CancellationToken::new();
+        let context = WorkerCycleContext::new(worker.0, None, cancellation.clone());
+        let task = tokio::spawn(async move { worker.1.run_cycle(context).await });
+        for _ in 0..100 {
+            if control
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "POST")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            scheduling.requests.lock().unwrap().is_empty(),
+            "IP provisioning must not occupy account concurrency"
+        );
+        cancellation.cancel();
+        task.await.unwrap().unwrap();
+        for _ in 0..100 {
+            if control
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.method.as_str() == "DELETE")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("cancelled provisioning must release its attempt ID");
+    }
+
+    #[tokio::test]
+    async fn fetcher_uses_dedicated_direct_gateway_without_turn_state_and_restores_cache() {
+        let server = MockServer::start().await;
+        mount(&server, &"a".repeat(292), 200).await;
+        let accounts = fetch_accounts(&server).await;
+        accounts.set_egress(
+            ACCOUNT,
+            Some(OutboundProxy::parse("http://127.0.0.1:1").unwrap()),
+            None,
+        );
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let config = valid_config();
+        let ports = || {
+            provider_ports_with(accounts.clone(), Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store.clone())
+        };
+        let mut bundle = provider_openai::initialize(config.config.clone(), ports())
+            .await
+            .unwrap();
+        let admin = bundle.admin_provider();
+        admin
+            .configure_turn_state_fetcher(fetch_config())
+            .await
+            .unwrap();
+        let worker = fetch_worker(&mut bundle);
+        tokio::join!(cycle(&worker), cycle(&worker));
+        let snapshot = admin.turn_state_fetcher().await.unwrap();
+        assert_eq!(snapshot.values.len(), 1);
+        assert_eq!(snapshot.values[0].value, "a".repeat(292));
+        assert_eq!(snapshot.attempts[0].input_tokens, Some(1));
+        assert_eq!(snapshot.attempts[0].status, "success");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("x-codex-turn-state").is_none());
+        let body = zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], MODEL);
+        assert!(body.get("previous_response_id").is_none());
+        assert!(
+            body.get("tools")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+        );
+        cycle(&worker).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "fresh cache skips calls"
+        );
+        let restored = provider_openai::initialize(config.config.clone(), ports())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .admin_provider()
+                .turn_state_fetcher()
+                .await
+                .unwrap()
+                .values,
+            snapshot.values
+        );
+    }
+
+    #[tokio::test]
+    async fn fetcher_retries_due_values_without_renewing_identical_or_accepting_other_lengths() {
+        for returned in ["a".repeat(292), "b".repeat(291)] {
+            let server = MockServer::start().await;
+            mount(&server, &returned, 200).await;
+            let accounts = fetch_accounts(&server).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let acquired = Utc::now().timestamp_millis() - 41 * 60 * 1000;
+            let previous = TurnStateValue {
+                account_id: ACCOUNT.to_owned(),
+                model: MODEL.to_owned(),
+                value: "a".repeat(292),
+                acquired_at: acquired,
+                last_seen_at: acquired,
+                expires_at: acquired + 3600000,
+                source: "traffic".to_owned(),
+            };
+            store.values.lock().unwrap().push(previous.clone());
+            let config = valid_config();
+            let mut bundle = provider_openai::initialize(
+                config.config.clone(),
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                    .with_turn_state(store.clone()),
+            )
+            .await
+            .unwrap();
+            let admin = bundle.admin_provider();
+            admin
+                .configure_turn_state_fetcher(fetch_config())
+                .await
+                .unwrap();
+            let worker = fetch_worker(&mut bundle);
+            cycle(&worker).await;
+            let state = admin.turn_state_fetcher().await.unwrap();
+            assert_eq!(state.values[0].acquired_at, acquired);
+            assert_eq!(state.values[0].expires_at, previous.expires_at);
+            assert_eq!(state.values[0].value, previous.value);
+            assert_eq!(state.attempts[0].failures, 1);
+            assert!(state.attempts[0].next_attempt_at >= state.attempts[0].attempted_at + 60000);
+            assert!(
+                admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.is_err(),
+                "manual action cannot bypass backoff"
+            );
+            cycle(&worker).await;
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetcher_broken_dedicated_proxy_never_falls_back_to_account_or_direct() {
+        let server = MockServer::start().await;
+        mount(&server, &"x".repeat(292), 200).await;
+        let accounts = fetch_accounts(&server).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        *store.proxy.lock().unwrap() = Some(OutboundProxy::parse("http://127.0.0.1:1").unwrap());
+        let config = valid_config();
+        let mut bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        bundle
+            .admin_provider()
+            .configure_turn_state_fetcher(fetch_config())
+            .await
+            .unwrap();
+        cycle(&fetch_worker(&mut bundle)).await;
+        let state = bundle.admin_provider().turn_state_fetcher().await.unwrap();
+        assert!(state.values.is_empty());
+        assert_eq!(state.attempts[0].status, "retrying");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetcher_honors_retry_after_and_config_change_cancels_inflight() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
+            .mount(&server)
+            .await;
+        let accounts = fetch_accounts(&server).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let config = valid_config();
+        let mut bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        let admin = bundle.admin_provider();
+        admin
+            .configure_turn_state_fetcher(fetch_config())
+            .await
+            .unwrap();
+        let worker = fetch_worker(&mut bundle);
+        cycle(&worker).await;
+        let state = admin.turn_state_fetcher().await.unwrap();
+        assert!(state.attempts[0].next_attempt_at >= state.attempts[0].attempted_at + 600000);
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-codex-turn-state", "b".repeat(292))
+                    .set_body_string(COMPLETED_SESSION_SSE)
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+        let mut enabled = state.configs[0].clone();
+        admin
+            .configure_turn_state_fetcher(enabled.clone())
+            .await
+            .unwrap();
+        let fetch = cycle(&worker);
+        let cancel = async {
+            for _ in 0..100 {
+                if !server.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            enabled.revision += 1;
+            enabled.enabled = false;
+            admin.configure_turn_state_fetcher(enabled).await.unwrap();
+        };
+        tokio::join!(fetch, cancel);
+        let state = admin.turn_state_fetcher().await.unwrap();
+        assert!(state.values.is_empty());
+        assert!(state.attempts.is_empty());
+        assert!(state.running.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetcher_restored_expired_values_are_visible_to_admin_but_not_used_in_auto_mode() {
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let acquired = Utc::now().timestamp_millis() - 3_700_000;
+        store.values.lock().unwrap().push(TurnStateValue {
+            account_id: ACCOUNT.to_owned(),
+            model: MODEL.to_owned(),
+            value: "a".repeat(292),
+            acquired_at: acquired,
+            last_seen_at: acquired,
+            expires_at: acquired + 3_600_000,
+            source: "traffic".to_owned(),
+        });
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports().with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bundle
+                .admin_provider()
+                .turn_state_fetcher()
+                .await
+                .unwrap()
+                .values
+                .len(),
+            1
+        );
+        assert!(bundle.admin_provider().automatic_turn_state().is_empty());
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};

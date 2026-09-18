@@ -26,6 +26,11 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/accounts/index.vue'),
       },
       {
+        path: 'turn-state-fetcher',
+        name: 'turn-state-fetcher',
+        component: () => import('@/views/turn-state-fetcher/index.vue'),
+      },
+      {
         path: 'proxies',
         name: 'proxies',
         component: () => import('@/views/proxies/index.vue'),

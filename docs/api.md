@@ -649,12 +649,52 @@ OAuth 授权、令牌刷新、模型目录和额度查询继续使用既有地�
 - `manual`：使用 `value` 覆盖请求中的 `X-Codex-Turn-State`；值必须为 1–8192 字节的可打印 ASCII 字符（不含空格）。
 - `auto`：按实际选中的账号 ID 和发送给上游的模型名分别保存最新的 292 字节 `X-Codex-Turn-State`，思考强度不参与区分。同一组合跨会话复用；其他长度或缺失值不覆盖缓存。该组合尚无有效值时不携带此头，也不沿用客户端透传值。
 
-手动配置和模式按账号持久化，凭据刷新或重新导入保留现有值；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
+手动配置和模式按账号持久化，凭据刷新或重新导入保留现有值；自动缓存按账号和模型共享，并持久化到数据库。正常流量的更新由后台周期写入，突然退出可能丢失最近约 15 秒及当次获取耗时内的更新；获取器成功结果在任务结束时写入。重启恢复已保存的值，运行中各实例不实时同步。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
 
 管理员可通过 `GET /api/admin/settings/turn-state` 读取自动模式使用的缓存，可用 `?accountId=...` 仅返回指定账号：`data` 为
 `[{ "accountId": "...", "model": "gpt-5.4", "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }]`，尚未获取时为空数组。
-每次收到有效的 292 字节值都会同时更新值与获取时间，包括返回值与之前相同的情况；其他长度和缺失值保留原缓存及时间。
+新值更新获取时间；相同值仅更新最近收到时间，不延长有效期。按获取后 60 分钟估算到期，过期值不再用于自动请求。其他长度和缺失值保留原缓存。
 该接口只读，不改变模式或手动配置，返回的原值仅供管理员查看和复制。
+
+### 292 获取器
+
+获取器使用所选账号的凭据，通过独立出口发送无历史的短请求，不携带 Turn State。
+静态代理或直连模式使用账号网关；动态出口模式始终直连官方 OpenAI，不使用账号自定义网关。
+配置独立于账号请求头模式；正常业务只有在该账号选择 `auto` 时使用缓存。
+按账号与实际上游模型分别调度，不区分思考强度；首次无值立即尝试，新值获取 40 分钟后开始续期。
+60 分钟为配置约定的估算有效期，不代表上游验证结果。相同值不续期。
+
+以下接口仅管理员可用：
+
+| 方法 | 路径 | 请求 / 响应 |
+| --- | --- | --- |
+| GET | `/api/admin/turn-state-fetcher` | `configs`、`values`、`attempts`、`running`、`dynamicEgress` |
+| POST | `/api/admin/turn-state-fetcher/configure` | `{accountId, enabled, models, proxyId, dynamicEgress, revision}` |
+| POST | `/api/admin/turn-state-fetcher/run` | `{accountId, model}`，为已启用模型排队 |
+| POST | `/api/admin/turn-state-fetcher/egress` | `{revision, instances}`，instances 以实例 ID 为键，暂停动态获取后更新 |
+
+`models` 为最多 32 个不同的上游模型名，开启时不能为空；两个出口字段均为 null 时明确选择直连。
+`dynamicEgress` 为 `{instance, family}`，family 只能是 `ipv4` 或 `ipv6`，与非空 `proxyId` 互斥。
+旧请求省略 `dynamicEgress` 等同 null。动态出口严格使用所选地址类型，不回退到其他出口。
+选定代理必须测试成功，连接失败不会回退到业务代理或直连。被引用代理须先解除获取器绑定才能删除。
+首次保存 `revision: 0`，后续携带 GET 返回版本；并发修改返回 409。重新保存清除失败暂停及退避。
+
+`values` 包含账号、模型、原值、来源 `traffic` / `fetcher`、`acquiredAt`、`lastSeenAt`、`expiresAt`；
+这些时间为 Unix 毫秒，过期值仍可在此接口查看。原值仅供管理员复制，不进入客户用量记录。
+`attempts` 返回最近一次的状态、返回长度、输入/输出 token 数（无法获得时为 null）、耗时、下一次尝试时间和安全错误说明。
+`running` 为正在获取的 `[accountId, model]`，没有任务时为 null。
+`attempts.exitIp` 为本次租约分配且通过出站验证的地址，无租约时为 null。
+`dynamicEgress` 返回服务可用性、实例和最近 50 条租约历史，不返回控制令牌和代理租约秘密。
+租约历史 `created`、`expires` 使用 Unix 秒。实例字段为 `provider: azure`、`name`、`subscription`、
+`resourceGroup`、`location`、`bindings`；bindings 以 `ipv4` / `ipv6` 为键，值为
+`{resourceGroup, nic, ipConfiguration, sourceIp, dedicated: true}`。编辑前必须暂停动态获取并等待租约释放。
+实例保存只修改配置；网络预检和分配发生在下一次获取中。
+实例更新携带 `dynamicEgress.revision` 防止并发覆盖；首次为 0，保存成功后递增。
+
+全局并发为 1，复用账号并发限制，账号繁忙则延后。失败按 1、2、5、10、15 分钟加少量随机延迟重试，
+429 尊重 `Retry-After`；手动排队不能跳过退避。账号、模型或专用代理配置无效会暂停，修复后重新保存配置恢复。
+动态 IP 分配阶段不占用账号并发；分配后重新核对配置、账号和额度。每次重试获得新租约。
+暂停或修改配置取消正在进行的请求。默认未启用，获取任务会消耗对应上游账号的额度。
 
 OAuth start 使用：
 

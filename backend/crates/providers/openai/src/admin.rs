@@ -72,7 +72,20 @@ const PROVIDER_NAME: &str = "openai";
 const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
+fn fetcher_store_error(
+    error: gateway_core::provider_ports::ProviderStoreError,
+) -> ProviderAdminError {
+    use gateway_core::provider_ports::ProviderStoreErrorKind;
+    provider_admin_error(match error.kind() {
+        ProviderStoreErrorKind::Conflict => ProviderAdminErrorKind::Conflict,
+        ProviderStoreErrorKind::InvalidData => ProviderAdminErrorKind::Invalid,
+        ProviderStoreErrorKind::Unavailable => ProviderAdminErrorKind::Internal,
+    })
+    .with_public_message("获取器操作失败：请检查配置、代理测试状态及重试等待时间，刷新后重试")
+}
+
 pub(crate) struct OpenAiAdminProvider {
+    fetcher: Option<Arc<crate::provider::turn_state_fetcher::TurnStateFetcher>>,
     turn_state: crate::provider::turn_state::TurnStateCache,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
@@ -87,6 +100,7 @@ pub(crate) struct OpenAiAdminProvider {
 }
 
 pub(crate) struct OpenAiAdminServices {
+    pub(crate) fetcher: Option<Arc<crate::provider::turn_state_fetcher::TurnStateFetcher>>,
     pub(crate) turn_state: crate::provider::turn_state::TurnStateCache,
     pub(crate) credentials: Arc<CodexCredentialAdminService>,
     pub(crate) oauth: Arc<dyn CodexOAuthAdmin>,
@@ -107,6 +121,7 @@ impl OpenAiAdminProvider {
     ) -> Self {
         Self {
             turn_state: services.turn_state,
+            fetcher: services.fetcher,
             provider_kind,
             profile,
             accounts,
@@ -166,6 +181,53 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
+    async fn configure_dynamic_egress(
+        &self,
+        config: serde_json::Value,
+    ) -> Result<(), ProviderAdminError> {
+        self.fetcher
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .configure_dynamic_egress(config)
+            .await
+            .map_err(fetcher_store_error)
+    }
+    async fn turn_state_fetcher(
+        &self,
+    ) -> Result<
+        gateway_core::provider_ports::turn_state::TurnStateFetcherSnapshot,
+        ProviderAdminError,
+    > {
+        self.fetcher
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .snapshot()
+            .await
+            .map_err(fetcher_store_error)
+    }
+    async fn configure_turn_state_fetcher(
+        &self,
+        config: gateway_core::provider_ports::turn_state::TurnStateFetcherConfig,
+    ) -> Result<(), ProviderAdminError> {
+        self.fetcher
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .configure(config)
+            .await
+            .map_err(fetcher_store_error)
+    }
+    async fn run_turn_state_fetcher(
+        &self,
+        account: &str,
+        model: &str,
+    ) -> Result<(), ProviderAdminError> {
+        self.fetcher
+            .as_ref()
+            .ok_or_else(|| provider_admin_error(ProviderAdminErrorKind::Unsupported))?
+            .enqueue(account, model)
+            .await
+            .map_err(fetcher_store_error)
+    }
     fn automatic_turn_state(&self) -> Vec<gateway_admin::model::settings::AutomaticTurnState> {
         self.turn_state.snapshot()
     }

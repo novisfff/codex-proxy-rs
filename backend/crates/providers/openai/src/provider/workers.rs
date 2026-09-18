@@ -3,6 +3,25 @@
 use super::*;
 
 pub(super) const WORKER_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) fn fetcher_worker(
+    fetcher: Arc<super::turn_state_fetcher::TurnStateFetcher>,
+) -> Result<WorkerContribution, WorkerDefinitionError> {
+    struct Task(Arc<super::turn_state_fetcher::TurnStateFetcher>);
+    impl ScheduledTask for Task {
+        fn run_cycle(
+            &self,
+            context: WorkerCycleContext,
+        ) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+            self.0.run_cycle(context)
+        }
+    }
+    Ok(WorkerContribution::Registration(scheduled_registration(
+        WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-turn-state-fetcher")?,
+        Duration::from_secs(15),
+        Box::new(Task(fetcher)),
+    )?))
+}
 pub(super) const WORKER_MAXIMUM_BACKOFF: Duration = Duration::from_secs(60);
 pub(super) const WORKER_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 pub(super) const WORKER_LEASE_RENEWAL: Duration = Duration::from_secs(5 * 60);

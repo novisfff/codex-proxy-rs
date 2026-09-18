@@ -28,6 +28,24 @@ use super::{
 /// OpenAI 固定管理路由消费的服务。
 #[async_trait]
 pub trait OpenAiService: Send + Sync {
+    async fn configure_dynamic_egress(&self, _config: serde_json::Value) -> Result<(), AdminError> {
+        Err(AdminError::bad_gateway("动态出口不可用"))
+    }
+    async fn turn_state_fetcher(
+        &self,
+    ) -> Result<gateway_core::provider_ports::turn_state::TurnStateFetcherSnapshot, AdminError>
+    {
+        Err(AdminError::bad_gateway("获取器不可用"))
+    }
+    async fn configure_turn_state_fetcher(
+        &self,
+        _config: gateway_core::provider_ports::turn_state::TurnStateFetcherConfig,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::bad_gateway("获取器不可用"))
+    }
+    async fn run_turn_state_fetcher(&self, _account: &str, _model: &str) -> Result<(), AdminError> {
+        Err(AdminError::bad_gateway("获取器不可用"))
+    }
     fn automatic_turn_state(&self) -> Vec<crate::model::settings::AutomaticTurnState>;
     async fn import_document(
         &self,
@@ -77,6 +95,36 @@ impl DefaultOpenAiService {
 
 #[async_trait]
 impl OpenAiService for DefaultOpenAiService {
+    async fn configure_dynamic_egress(&self, config: serde_json::Value) -> Result<(), AdminError> {
+        self.provider
+            .configure_dynamic_egress(config)
+            .await
+            .map_err(|e| map_provider_error(e, "dynamic egress"))
+    }
+    async fn turn_state_fetcher(
+        &self,
+    ) -> Result<gateway_core::provider_ports::turn_state::TurnStateFetcherSnapshot, AdminError>
+    {
+        self.provider
+            .turn_state_fetcher()
+            .await
+            .map_err(|e| map_provider_error(e, "turn state fetcher"))
+    }
+    async fn configure_turn_state_fetcher(
+        &self,
+        config: gateway_core::provider_ports::turn_state::TurnStateFetcherConfig,
+    ) -> Result<(), AdminError> {
+        self.provider
+            .configure_turn_state_fetcher(config)
+            .await
+            .map_err(|e| map_provider_error(e, "turn state fetcher"))
+    }
+    async fn run_turn_state_fetcher(&self, account: &str, model: &str) -> Result<(), AdminError> {
+        self.provider
+            .run_turn_state_fetcher(account, model)
+            .await
+            .map_err(|e| map_provider_error(e, "turn state fetcher"))
+    }
     fn automatic_turn_state(&self) -> Vec<crate::model::settings::AutomaticTurnState> {
         self.provider.automatic_turn_state()
     }

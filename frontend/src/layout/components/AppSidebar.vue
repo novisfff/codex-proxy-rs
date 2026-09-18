@@ -12,6 +12,7 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
+  RefreshCw,
   Settings,
   Sun,
   Users,
@@ -60,6 +61,7 @@ const preferredMotion = usePreferredReducedMotion()
 const navItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
+  { label: '292 获取器', icon: RefreshCw, path: '/turn-state-fetcher' },
   { label: '代理管理', icon: Network, path: '/proxies' },
   { label: '分组管理', icon: FolderTree, path: '/groups' },
   { label: 'API 密钥', icon: KeyRound, path: '/keys' },

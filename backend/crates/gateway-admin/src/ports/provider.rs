@@ -117,6 +117,34 @@ pub trait ProviderAdmin: Send + Sync {
         Vec::new()
     }
 
+    async fn turn_state_fetcher(
+        &self,
+    ) -> Result<
+        gateway_core::provider_ports::turn_state::TurnStateFetcherSnapshot,
+        ProviderAdminError,
+    > {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+    async fn configure_turn_state_fetcher(
+        &self,
+        _config: gateway_core::provider_ports::turn_state::TurnStateFetcherConfig,
+    ) -> Result<(), ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+    async fn configure_dynamic_egress(
+        &self,
+        _config: serde_json::Value,
+    ) -> Result<(), ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+    async fn run_turn_state_fetcher(
+        &self,
+        _account: &str,
+        _model: &str,
+    ) -> Result<(), ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 将原始套餐值投影为展示名称；默认保留未知 Provider 的原始名称。
     fn plan_type_display(&self, plan_type: &str) -> String {
         plan_type.to_owned()

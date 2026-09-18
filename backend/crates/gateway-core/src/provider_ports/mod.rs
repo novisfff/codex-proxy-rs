@@ -1,5 +1,7 @@
 //! Provider 运行时所需的中立存储能力。
 
+pub mod turn_state;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
@@ -1223,6 +1225,7 @@ pub trait OAuthPendingFlowPort: Send + Sync {
 /// Provider 只能按能力取用端口，无法取得 Redis client 或 repository 集合。
 #[derive(Clone)]
 pub struct ProviderStorePorts {
+    turn_state: Option<Arc<dyn turn_state::TurnStateStore>>,
     accounts: Arc<dyn ProviderAccountStore>,
     leases: Arc<dyn ProviderLeasePort>,
     session_affinity: Arc<dyn ProviderSessionAffinityPort>,
@@ -1254,6 +1257,7 @@ impl ProviderStorePorts {
     ) -> Self {
         Self {
             accounts,
+            turn_state: None,
             leases,
             session_affinity,
             session_exclusions,
@@ -1270,6 +1274,17 @@ impl ProviderStorePorts {
     #[must_use]
     pub fn accounts(&self) -> Arc<dyn ProviderAccountStore> {
         Arc::clone(&self.accounts)
+    }
+
+    #[must_use]
+    pub fn with_turn_state(mut self, store: Arc<dyn turn_state::TurnStateStore>) -> Self {
+        self.turn_state = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn turn_state(&self) -> Option<Arc<dyn turn_state::TurnStateStore>> {
+        self.turn_state.clone()
     }
 
     #[must_use]

@@ -716,3 +716,35 @@ async fn disable_fast_settings_updates_preserve_omitted_values() {
         );
     }
 }
+
+#[tokio::test]
+async fn turn_state_fetcher_endpoints_require_admin() {
+    let fixture = AdminTestFixture::new().await;
+    for (method, path, body) in [
+        (Method::GET, "/api/admin/turn-state-fetcher", None),
+        (
+            Method::POST,
+            "/api/admin/turn-state-fetcher/egress",
+            Some(json!({})),
+        ),
+        (
+            Method::POST,
+            "/api/admin/turn-state-fetcher/configure",
+            Some(
+                json!({"accountId":"acct_test","enabled":true,"models":["gpt-5.4"],"proxyId":null,"revision":0}),
+            ),
+        ),
+        (
+            Method::POST,
+            "/api/admin/turn-state-fetcher/run",
+            Some(json!({"accountId":"acct_test","model":"gpt-5.4"})),
+        ),
+    ] {
+        let response = gateway_api::admin::turn_state_fetcher::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(request(method, path, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
