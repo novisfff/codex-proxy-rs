@@ -401,6 +401,15 @@ mod turn_state_fetcher {
         let body = zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["model"], MODEL);
+        assert_eq!(
+            body["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Reply only OK."}]
+            }]),
+            "fetcher must use the Codex message-array input contract"
+        );
         assert!(body.get("previous_response_id").is_none());
         assert!(
             body.get("tools")

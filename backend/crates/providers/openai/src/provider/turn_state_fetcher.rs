@@ -5,7 +5,10 @@ use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
         CodexBackendClient, CodexClientError, CodexRequestContext,
-        client::build_account_http_client, encode_generate_request, profile::CodexWireProfileState,
+        client::build_account_http_client,
+        diagnostics::{CodexFailureCategory, CodexUpstreamFailure},
+        encode_generate_request,
+        profile::CodexWireProfileState,
     },
 };
 use chrono::Utc;
@@ -587,7 +590,18 @@ impl TurnStateFetcher {
             } else {
                 None
             });
-        let mut body = json!({"model":model,"input":"Reply only OK.","instructions":"Be brief.","stream":true,"store":false});
+        // 与账号连接测试及官方 Codex 一致，使用消息数组，不能依赖公开 API 的字符串简写。
+        let mut body = json!({
+            "model": model,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Reply only OK."}]
+            }],
+            "instructions": "Be brief.",
+            "stream": true,
+            "store": false
+        });
         if let Ok(Some(catalog)) = self.catalog.cached()
             && let Some(entry) = catalog
                 .models()
@@ -762,6 +776,7 @@ impl FetchOutcome {
             } else {
                 Self::retry("上游请求失败", upstream.retry_after_seconds.unwrap_or(60))
             };
+            result.message = fetch_failure_message(&upstream);
             if let CodexClientError::Upstream {
                 client_response: Some(client_response),
                 ..
@@ -782,6 +797,35 @@ impl FetchOutcome {
     }
 }
 
+fn fetch_failure_message(failure: &CodexUpstreamFailure) -> String {
+    let reason = match failure.category() {
+        CodexFailureCategory::ModelUnsupported => "模型不可用或不受支持",
+        CodexFailureCategory::CredentialExpired => "认证失败或凭据已过期",
+        CodexFailureCategory::IdentityVerificationRequired => "账号需要身份验证",
+        CodexFailureCategory::Banned => "账号或工作区被停用",
+        CodexFailureCategory::UsageLimitExhausted => "当前用量窗口已耗尽",
+        CodexFailureCategory::RateLimited => "请求受到限流",
+        CodexFailureCategory::QuotaExhausted => "账号额度不足",
+        CodexFailureCategory::CloudflareChallenge => "出口触发 Cloudflare 验证",
+        CodexFailureCategory::CloudflarePathBlocked => "请求路径被 Cloudflare 拦截",
+        CodexFailureCategory::InvalidRequest => "请求参数无效",
+        CodexFailureCategory::PermissionDenied => "访问被拒绝，具体原因未识别",
+        CodexFailureCategory::Timeout => "上游请求超时",
+        CodexFailureCategory::CapacityUnavailable => "模型容量暂时不足",
+        CodexFailureCategory::Unavailable => "上游不可用，具体原因未识别",
+        CodexFailureCategory::Transport => "上游连接失败",
+    };
+    let status = failure.status.map_or_else(
+        || "HTTP 状态未知".to_owned(),
+        |s| format!("HTTP {}", s.as_u16()),
+    );
+    // 仅持久化固定分类与已有白名单错误码，原始正文可能回显凭据或请求内容。
+    let code = failure
+        .persistable_code()
+        .map_or_else(String::new, |code| format!("；错误码：{code}"));
+    format!("{status}：{reason}{code}")
+}
+
 impl ScheduledTask for TurnStateFetcher {
     fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
         Box::pin(async move {
@@ -789,5 +833,50 @@ impl ScheduledTask for TurnStateFetcher {
                 .await
                 .map_err(|_| WorkerTaskError::safe("Turn State fetcher persistence failed"))
         })
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::transport::diagnostics::{CodexUpstreamDiagnostics, CodexUpstreamSendPhase};
+
+    fn message(status: u16, body: &str) -> String {
+        fetch_failure_message(&CodexUpstreamFailure::from_response(
+            reqwest::StatusCode::from_u16(status).unwrap(),
+            body,
+            None,
+            &CodexUpstreamDiagnostics::default(),
+            None,
+            &[],
+            &[],
+            CodexUpstreamSendPhase::AfterPayload,
+        ))
+    }
+
+    #[test]
+    fn fetch_diagnostics_preserve_status_and_safe_code_without_raw_secrets() {
+        let result = message(
+            401,
+            r#"{"error":{"code":"token_expired","message":"Bearer private-token user@example.com"}}"#,
+        );
+        assert_eq!(
+            result,
+            "HTTP 401：认证失败或凭据已过期；错误码：token_expired"
+        );
+    }
+
+    #[test]
+    fn fetch_diagnostics_do_not_persist_unknown_codes_or_html() {
+        for body in [
+            r#"{"error":{"code":"private-token","message":"user@example.com"}}"#,
+            "<html>private-token user@example.com</html>",
+        ] {
+            let result = message(403, body);
+            assert!(result.starts_with("HTTP 403："));
+            assert!(!result.contains("private-token"));
+            assert!(!result.contains("user@example.com"));
+            assert!(!result.contains("<html>"));
+        }
     }
 }
