@@ -356,6 +356,10 @@ where
 {
     Router::new()
         .route("/api/admin/settings", get(settings::<S>))
+        .route(
+            "/api/admin/settings/turn-state",
+            get(automatic_turn_state::<S>),
+        )
         .route("/api/admin/settings/update", post(update_settings::<S>))
         .route(
             "/api/admin/settings/client-downloads/codex-desktop/windows",
@@ -391,6 +395,27 @@ where
     AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(CodexDesktopWindowsDownloadsView::from(downloads)),
+    )
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutomaticTurnStateView {
+    value: String,
+    acquired_at: DateTime<Utc>,
+}
+
+async fn automatic_turn_state<S>(_auth: AdminAuth, State(state): State<S>) -> impl IntoResponse
+where
+    S: SessionState + Send + Sync,
+{
+    let current = state.admin_services().openai().automatic_turn_state();
+    AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(current.map(|current| AutomaticTurnStateView {
+            value: current.value,
+            acquired_at: current.acquired_at,
+        })),
     )
 }
 

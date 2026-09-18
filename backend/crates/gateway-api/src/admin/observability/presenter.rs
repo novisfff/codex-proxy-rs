@@ -297,6 +297,7 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
         created_at_display,
         client_ip: record.client_ip,
         user_agent: record.user_agent,
+        response_turn_state_byte_length: record.response_turn_state_byte_length,
     }
 }
 

@@ -975,6 +975,11 @@ accountAutoFreezeAdaptiveConcurrency
 
 手动配置和模式持久化；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
 
+管理员可通过 `GET /api/admin/settings/turn-state` 读取自动模式使用的缓存：`data` 为
+`{ "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }`，尚未获取时为 `null`。
+每次收到有效的 292 字节值都会同时更新值与获取时间，包括返回值与之前相同的情况；其他长度和缺失值保留原缓存及时间。
+该接口只读，不改变模式或手动配置，返回的原值仅供管理员查看和复制。
+
 `disableFast` 默认 `false`，更新时省略或 `null` 保留现值。全局开启时，所有 Key 的 OpenAI Responses 请求关闭 Fast；
 全局关闭时仍应用 Key 绑定分组的限制。关闭 Fast 只将顶层 `service_tier` 的 `priority`（含 `fast` 别名）
 改为显式 `default`，继续处理请求；不改变 `flex`、`ultrafast`、缺失值、默认档、嵌套字段或其他 Provider。
@@ -1180,6 +1185,9 @@ OpenAI 请求详情的 `metadata.responseTurnState` 保存最终尝试所观测�
 字段缺失表示历史记录或该路径未采集，不能解释为未返回。超过 4096 字节或不是有效 UTF-8 的值
 只保存长度，`value` 为 `null`。该字段随请求记录保留，仅供管理员详情读取，不进入普通列表、
 客户端用量查询、脱敏时间线或诊断包。它不作为自动重放的数据源；请求状态的覆盖行为由 `codexTurnState` 配置控制。
+
+管理员请求列表单独返回 `responseTurnStateByteLength`，只包含字节长度，不包含头值；
+未返回或历史记录未采集时为 `null`，返回空头值时为 `0`。
 
 管理端下载的诊断包 `schemaVersion: 2` 用于人工反馈，不是备份或导入格式。它包含关联 ID、错误分类摘要、
 请求与错误事件各自的状态、attempt、时间线阶段和计时；不自动导出 message/raw error、任意 metadata、

@@ -79,6 +79,19 @@ export function getSettings(options: RequestOptions = {}) {
   })
 }
 
+export interface AutomaticTurnState {
+  value: string
+  acquiredAt: string
+}
+
+export function getAutomaticTurnState(options: RequestOptions = {}) {
+  return request<AutomaticTurnState | null>({
+    url: '/api/admin/settings/turn-state',
+    method: 'GET',
+    ...options,
+  })
+}
+
 type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
 
 export function updateSettings(data: UpdateSettingsParam) {

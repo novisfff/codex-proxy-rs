@@ -111,6 +111,7 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
 
   return {
     id: options.id,
+    responseTurnStateByteLength: options.provider === 'openai' ? 292 : null,
     provider: options.provider,
     authenticationKind: options.authenticationKind,
     accountId: `account_${options.id}`,

@@ -70,6 +70,18 @@ withDefaults(
       <UsageModelCell :record="row" />
     </template>
 
+    <template #responseTurnStateByteLength="{ row }">
+      <span
+        class="whitespace-nowrap font-mono text-cp-sm tabular-nums"
+        :class="row.responseTurnStateByteLength == null
+          ? 'text-cp-text-secondary'
+          : row.responseTurnStateByteLength === 292 ? 'text-cp-green-text' : 'text-cp-red-text'"
+        :title="row.responseTurnStateByteLength == null ? '未返回或未采集' : 'X-Codex-Turn-State 字节长度'"
+      >
+        {{ row.responseTurnStateByteLength == null ? '—' : `${row.responseTurnStateByteLength} 字节` }}
+      </span>
+    </template>
+
     <template #reasoningEffort="{ row }">
       <UsageReasoningEffortCell :record="row" />
     </template>

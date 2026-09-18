@@ -71,6 +71,40 @@ fn postgres_observability_adapter_implements_query_port() {
     assert_port::<PgObservabilityRepository>();
 }
 
+#[tokio::test]
+async fn usage_list_should_project_turn_state_length_without_header_value() {
+    let Some(database) = TestDatabase::create("usage_turn_state_length").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now).await.unwrap();
+    let repository = observability_repository(&database.pool);
+    for length in [None, Some(292_u64), Some(291), Some(293), Some(0)] {
+        let metadata = serde_json::json!({"responseTurnState": {"byteLength": length, "value": "synthetic-private-value"}});
+        sqlx::query("update model_requests set provider_observation_json = $1 where id = 'req_observe_success'")
+            .bind(metadata).execute(&database.pool).await.unwrap();
+        let page = repository
+            .list_usage_records(UsageRecordQuery {
+                range: ObservabilityRange::new(
+                    now - TimeDelta::hours(1),
+                    now + TimeDelta::hours(1),
+                )
+                .unwrap(),
+                filter: UsageRecordFilter::default(),
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(10).unwrap(),
+            })
+            .await
+            .unwrap();
+        let record = page
+            .items
+            .iter()
+            .find(|record| record.id == "req_observe_success")
+            .unwrap();
+        assert_eq!(record.response_turn_state_byte_length, length);
+    }
+}
+
 #[test]
 fn postgres_admin_observability_adapter_implements_terminal_port() {
     fn assert_port<T: AdminObservabilityStore>() {}

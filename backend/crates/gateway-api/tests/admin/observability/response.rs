@@ -953,6 +953,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .lock()
         .expect("usage records")
         .push(UsageListRecord {
+            response_turn_state_byte_length: Some(292),
             id: "request_endpoint".to_owned(),
             endpoint: "/v1/responses".to_owned(),
             client_transport: "websocket".to_owned(),
@@ -1047,6 +1048,11 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .await
         .expect("usage response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
+
+    assert_eq!(
+        value["data"]["items"][0]["responseTurnStateByteLength"],
+        292
+    );
 
     assert_eq!(
         value["data"]["items"][0]["billing"]["inputPriceDisplay"],

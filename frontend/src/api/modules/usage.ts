@@ -72,6 +72,7 @@ export interface UsageRecordMetadata {
 }
 
 export interface UsageListRecord {
+  responseTurnStateByteLength: number | null
   id: string
   provider: string | null
   authenticationKind: string | null

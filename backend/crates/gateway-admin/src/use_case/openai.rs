@@ -28,6 +28,7 @@ use super::{
 /// OpenAI 固定管理路由消费的服务。
 #[async_trait]
 pub trait OpenAiService: Send + Sync {
+    fn automatic_turn_state(&self) -> Option<crate::model::settings::AutomaticTurnState>;
     async fn import_document(
         &self,
         command: ImportCredentials,
@@ -76,6 +77,10 @@ impl DefaultOpenAiService {
 
 #[async_trait]
 impl OpenAiService for DefaultOpenAiService {
+    fn automatic_turn_state(&self) -> Option<crate::model::settings::AutomaticTurnState> {
+        self.provider.automatic_turn_state()
+    }
+
     async fn import_document(
         &self,
         command: ImportCredentials,

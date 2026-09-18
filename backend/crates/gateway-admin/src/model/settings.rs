@@ -11,6 +11,23 @@ use super::Revision;
 /// 客户端模型到上游模型的全局精确映射。
 pub type ModelMappings = BTreeMap<PublicModelId, UpstreamModelId>;
 
+/// Provider 当前用于自动覆盖的状态；只允许管理员读取，不进入日志。
+#[derive(Clone, PartialEq, Eq)]
+pub struct AutomaticTurnState {
+    pub value: String,
+    pub acquired_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for AutomaticTurnState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AutomaticTurnState")
+            .field("value", &"[REDACTED]")
+            .field("acquired_at", &self.acquired_at)
+            .finish()
+    }
+}
+
 /// 账号调度策略；由 Core 拥有稳定值与 wire 映射。
 pub use gateway_core::account::RotationStrategy;
 

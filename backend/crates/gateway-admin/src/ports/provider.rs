@@ -112,6 +112,11 @@ impl ProviderAdminError {
 pub trait ProviderAdmin: Send + Sync {
     fn provider_kind(&self) -> &ProviderKind;
 
+    /// 返回 Provider 持有的自动请求状态快照；不支持的 Provider 返回空值。
+    fn automatic_turn_state(&self) -> Option<crate::model::settings::AutomaticTurnState> {
+        None
+    }
+
     /// 将原始套餐值投影为展示名称；默认保留未知 Provider 的原始名称。
     fn plan_type_display(&self, plan_type: &str) -> String {
         plan_type.to_owned()

@@ -98,7 +98,7 @@ use crate::transport::{
 mod execution;
 mod failure;
 mod observation;
-mod turn_state;
+pub(crate) mod turn_state;
 mod workers;
 
 use turn_state::GlobalTurnState;
@@ -156,6 +156,17 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
+    pub(crate) fn turn_state_cache(&self) -> GlobalTurnState {
+        self.turn_state.clone()
+    }
+
+    /// 管理端与请求发送读取同一份自动状态快照。
+    pub fn automatic_turn_state(
+        &self,
+    ) -> Option<gateway_admin::model::settings::AutomaticTurnState> {
+        self.turn_state.snapshot()
+    }
+
     // Provider 构造集中装配独立领域服务和透明传输依赖，拆分参数会模糊所有权。
     #[expect(clippy::too_many_arguments)]
     pub fn new(

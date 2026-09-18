@@ -139,6 +139,7 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             mr.provider_processing_ms, mr.latency_ms, mr.admission_decision_ms,
             mr.account_selection_wait_ms, mr.capacity_used_slots, mr.capacity_total_slots,
             host(mr.client_ip) as client_ip, mr.user_agent,
+            (mr.provider_observation_json #>> '{responseTurnState,byteLength}')::bigint as response_turn_state_byte_length,
             mr.reasoning_effort, mr.reasoning_preset, mr.subagent_kind, mr.compact,
             mr.started_at
      from model_requests mr";

@@ -1,13 +1,69 @@
 <script setup lang="ts">
-import type { CodexTurnStateConfig } from '@/api/modules/settings'
+import type { AutomaticTurnState, CodexTurnStateConfig } from '@/api/modules/settings'
+import { Copy, RefreshCw } from '@lucide/vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
+import { getAutomaticTurnState } from '@/api/modules/settings'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
 import BaseForm from '@/components/base/BaseForm/index.vue'
+import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
+import { useCopyText } from '@/composables/useCopyText'
+import { formatDateTime } from '@/utils/date'
 
 defineProps<{ disabled: boolean }>()
 const model = defineModel<CodexTurnStateConfig>({ required: true })
+const current = ref<AutomaticTurnState | null>(null)
+const loading = ref(false)
+const error = ref(false)
+const loaded = ref(false)
+const copyText = useCopyText()
+let timer: ReturnType<typeof setTimeout> | undefined
+let controller: AbortController | undefined
+
+async function refresh() {
+  clearTimeout(timer)
+  controller?.abort()
+  const pending = new AbortController()
+  controller = pending
+  loading.value = true
+  try {
+    const result = await getAutomaticTurnState({ silent: true, signal: pending.signal })
+    if (!pending.signal.aborted) {
+      current.value = result
+      error.value = false
+      loaded.value = true
+    }
+  }
+  catch {
+    if (!pending.signal.aborted) {
+      error.value = true
+      current.value = null
+    }
+  }
+  finally {
+    if (!pending.signal.aborted) {
+      loading.value = false
+      timer = setTimeout(refresh, 5000)
+    }
+  }
+}
+
+watch(() => model.value.mode, (mode) => {
+  clearTimeout(timer)
+  controller?.abort()
+  current.value = null
+  loaded.value = false
+  error.value = false
+  if (mode === 'auto')
+    void refresh()
+}, { immediate: true })
+
+onBeforeUnmount(() => {
+  clearTimeout(timer)
+  controller?.abort()
+})
 
 function setMode(mode: string) {
   if (mode === 'default' || mode === 'manual' || mode === 'auto')
@@ -40,6 +96,35 @@ function setMode(mode: string) {
           :disabled="disabled"
           @update:model-value="model = { ...model, value: $event }"
         />
+      </BaseFormItem>
+      <BaseFormItem v-if="model.mode === 'auto'" label="自动模式使用值">
+        <div class="min-w-0 space-y-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <span v-if="current" class="text-cp-sm text-cp-text-secondary">
+              292 字节 · 获取时间：{{ formatDateTime(current.acquiredAt) }}
+            </span>
+            <BaseIconButton label="刷新自动请求头" :disabled="loading" @click="refresh">
+              <RefreshCw class="size-4" />
+            </BaseIconButton>
+            <BaseIconButton
+              label="复制自动 X-Codex-Turn-State"
+              :disabled="!current"
+              @click="copyText(current?.value ?? '', { successText: 'X-Codex-Turn-State 已复制' })"
+            >
+              <Copy class="size-4" />
+            </BaseIconButton>
+          </div>
+          <p v-if="error" role="status" class="text-cp-sm text-cp-text-secondary">
+            读取失败，正在重试；也可点击刷新。
+          </p>
+          <pre v-else-if="current" class="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-cp-sm text-cp-text">{{ current.value }}</pre>
+          <p v-else class="text-cp-sm text-cp-text-secondary">
+            {{ loaded ? '尚未获取到 292 字节值，暂时沿用默认请求头。' : '正在读取…' }}
+          </p>
+          <p class="text-cp-xs text-cp-text-tertiary">
+            全站共用最新返回的 292 字节值，显示每 5 秒刷新。模式修改需保存后生效。
+          </p>
+        </div>
       </BaseFormItem>
     </BaseForm>
   </BaseCard>

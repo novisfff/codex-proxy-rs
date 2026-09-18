@@ -73,6 +73,7 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
+    turn_state: crate::provider::turn_state::GlobalTurnState,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -86,6 +87,7 @@ pub(crate) struct OpenAiAdminProvider {
 }
 
 pub(crate) struct OpenAiAdminServices {
+    pub(crate) turn_state: crate::provider::turn_state::GlobalTurnState,
     pub(crate) credentials: Arc<CodexCredentialAdminService>,
     pub(crate) oauth: Arc<dyn CodexOAuthAdmin>,
     pub(crate) profile_statistics: Arc<CodexCredentialProfileService>,
@@ -104,6 +106,7 @@ impl OpenAiAdminProvider {
         desktop_release: CodexDesktopReleaseStatus,
     ) -> Self {
         Self {
+            turn_state: services.turn_state,
             provider_kind,
             profile,
             accounts,
@@ -163,6 +166,10 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
+    fn automatic_turn_state(&self) -> Option<gateway_admin::model::settings::AutomaticTurnState> {
+        self.turn_state.snapshot()
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.provider_kind
     }

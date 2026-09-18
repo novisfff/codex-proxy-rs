@@ -479,6 +479,7 @@ pub struct DashboardObservation {
 /// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub response_turn_state_byte_length: Option<u64>,
     pub id: String,
     pub endpoint: String,
     pub client_transport: String,

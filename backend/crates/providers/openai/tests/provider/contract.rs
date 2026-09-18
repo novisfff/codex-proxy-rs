@@ -4435,6 +4435,7 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
     let provider = provider_with_base_url(&store, server.uri());
     let first = "a".repeat(292);
     let latest = "b".repeat(292);
+    assert!(provider.automatic_turn_state().is_none());
     for (index, (mode, returned, expected)) in [
         (CodexTurnStateMode::Auto, Some(first.clone()), None),
         (
@@ -4453,12 +4454,20 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
             Some("manual-state".to_owned()),
         ),
         (CodexTurnStateMode::Auto, None, Some(latest.clone())),
+        (
+            CodexTurnStateMode::Auto,
+            Some(latest.clone()),
+            Some(latest.clone()),
+        ),
         (CodexTurnStateMode::Default, None, None),
     ]
     .into_iter()
     .enumerate()
     {
         server.reset().await;
+        let before = provider.automatic_turn_state();
+        let started = Utc::now();
+        let returned_value = returned.clone();
         let mut response = ResponseTemplate::new(200)
             .insert_header("content-type", "text/event-stream")
             .set_body_string(CAPTURE_COMPLETED_SSE);
@@ -4530,6 +4539,21 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
         assert_eq!(stream.metadata().provider_account_id().as_str(), account);
         while let Some(event) = stream.next().await {
             event.unwrap();
+        }
+        let current = provider.automatic_turn_state();
+        if let Some(value) = returned_value.filter(|value| value.len() == 292) {
+            let current = current.expect("valid response should be visible to administrators");
+            assert_eq!(current.value, value);
+            assert!(current.acquired_at >= started);
+            assert!(current.acquired_at <= Utc::now());
+            if let Some(before) = before {
+                assert!(current.acquired_at > before.acquired_at);
+            }
+        } else {
+            assert_eq!(
+                current, before,
+                "invalid or missing response must retain value and time"
+            );
         }
         let requests = server.received_requests().await.unwrap();
         assert_eq!(

@@ -131,7 +131,7 @@ pub async fn initialize(
         Arc::clone(&account_feedback),
         CodexCookiePolicy::official().map_err(|_| OpenAiInitializeError::CookiePolicy)?,
     ));
-    let core_provider: Arc<dyn Provider> = Arc::new(
+    let core_provider = Arc::new(
         CodexProvider::new(
             selector,
             Arc::clone(&catalog),
@@ -189,6 +189,7 @@ pub async fn initialize(
         profile,
         accounts,
         OpenAiAdminServices {
+            turn_state: core_provider.turn_state_cache(),
             credentials: credential_admin,
             oauth: oauth_admin,
             profile_statistics,

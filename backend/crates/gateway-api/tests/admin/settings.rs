@@ -69,6 +69,23 @@ fn update_body() -> Value {
     })
 }
 
+#[tokio::test]
+async fn automatic_turn_state_should_require_admin_and_report_empty_cache() {
+    let fixture = AdminTestFixture::new().await;
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings/turn-state", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    fixture.auth.insert_session("valid-session");
+    let response = app(fixture.state())
+        .oneshot(request(Method::GET, "/api/admin/settings/turn-state", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await["data"].is_null());
+}
+
 #[test]
 fn settings_request_should_reject_unknown_rotation_strategy() {
     let mut body = update_body();

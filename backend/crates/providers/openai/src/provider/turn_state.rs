@@ -3,23 +3,36 @@
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use chrono::Utc;
+use gateway_admin::model::settings::AutomaticTurnState;
 use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
 
 use crate::transport::protocol::responses::CodexResponsesRequest;
 
 #[derive(Clone, Default)]
-pub(super) struct GlobalTurnState {
-    value: Arc<Mutex<Option<String>>>,
+pub(crate) struct GlobalTurnState {
+    value: Arc<Mutex<Option<AutomaticTurnState>>>,
 }
 
 impl GlobalTurnState {
     pub(super) fn observe(&self, value: &str) {
         if value.len() == 292 && value.bytes().all(|byte| byte.is_ascii_graphic()) {
-            *self
+            let mut current = self
                 .value
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(value.to_owned());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *current = Some(AutomaticTurnState {
+                value: value.to_owned(),
+                acquired_at: Utc::now(),
+            });
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<AutomaticTurnState> {
+        self.value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(super) fn observe_headers(&self, headers: &[(String, Bytes)]) {
@@ -36,11 +49,7 @@ impl GlobalTurnState {
         let value = match config.mode {
             CodexTurnStateMode::Default => None,
             CodexTurnStateMode::Manual => Some(config.value.clone()),
-            CodexTurnStateMode::Auto => self
-                .value
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            CodexTurnStateMode::Auto => self.snapshot().map(|state| state.value),
         };
         if let Some(value) = value {
             // 账号隔离已完成；管理员覆盖必须同时压过原始透传头，避免 HTTP 多值或 WS 两处不一致。

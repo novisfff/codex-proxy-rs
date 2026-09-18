@@ -533,6 +533,7 @@ pub struct DashboardObservation {
 /// 使用记录表格的窄读模型。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub response_turn_state_byte_length: Option<u64>,
     pub id: String,
     pub endpoint: String,
     pub client_transport: String,
