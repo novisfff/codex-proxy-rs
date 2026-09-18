@@ -147,7 +147,9 @@ class Azure:
             raise EgressError("Dedicated IPv6 source must have preferred_lft 0 to exclude ordinary traffic")
 
     async def allocate(self, instance, family):
+        await self.recover()
         config, binding = await self.preflight(instance, family)
+        await self.cleanup_unused_public_ips(config)
         for _ in range(5):
             name = f"cpr292-{secrets.token_hex(12)}"
             # 先记录确定性资源名；进程崩溃或 ARM 超时后可对账，不能盲目重放创建。
@@ -173,6 +175,32 @@ class Azure:
             await self.verify(binding["sourceIp"], family, address)
             return address, binding["sourceIp"]
         raise EgressError("Azure repeatedly allocated IPs already used within 24 hours")
+
+    async def cleanup_unused_public_ips(self, config):
+        # 此资源组专供获取器使用；先保护所有配置网卡的主 IPv4，再清理闲置公网地址。
+        protected = set()
+        for binding in config["bindings"].values():
+            nic = await self.nic(config, binding)
+            primary = next((p for p in nic.get("ipConfigurations", [])
+                            if p.get("primary") and p.get("privateIPAddressVersion", "IPv4") == "IPv4"), None)
+            public_id = (primary.get("publicIPAddress") or {}).get("id") if primary else None
+            if not public_id:
+                raise EgressError("Cannot identify primary IPv4 public IP; stale cleanup stopped")
+            protected.add(public_id.lower())
+        publics = await self.command("network", "public-ip", "list", "--subscription", config["subscription"],
+                                     "--resource-group", config["resourceGroup"])
+        candidates = [p for p in publics if p["id"].lower() not in protected]
+        # 先完整检查再删除，遇到其他业务绑定时不自动解绑。
+        if any(p.get("ipConfiguration") or p.get("natGateway") or p.get("linkedPublicIPAddress")
+               or p.get("servicePublicIPAddress") or p.get("provisioningState") != "Succeeded"
+               for p in candidates):
+            raise EgressError("Non-primary public IP is attached or not ready; stale cleanup stopped")
+        for public in candidates:
+            if public.get("ipAddress"):
+                self.journal.reserve(public["ipAddress"], time.time())
+                self.journal.used(public["ipAddress"])
+            await self.command("network", "public-ip", "delete", "--subscription", config["subscription"],
+                               "--resource-group", config["resourceGroup"], "--name", public["name"])
 
     async def verify(self, source, family, expected):
         connector = aiohttp.TCPConnector(

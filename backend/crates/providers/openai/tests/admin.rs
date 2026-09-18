@@ -437,7 +437,7 @@ mod turn_state_fetcher {
 
     #[tokio::test]
     async fn fetcher_retries_due_values_without_renewing_identical_or_accepting_other_lengths() {
-        for returned in ["a".repeat(292), "b".repeat(291)] {
+        for returned in ["a".repeat(292), "b".repeat(291), "c".repeat(312)] {
             let server = MockServer::start().await;
             mount(&server, &returned, 200).await;
             let accounts = fetch_accounts(&server).await;
@@ -467,19 +467,35 @@ mod turn_state_fetcher {
                 .await
                 .unwrap();
             let worker = fetch_worker(&mut bundle);
+            let started = Utc::now().timestamp_millis();
             cycle(&worker).await;
+            let finished = Utc::now().timestamp_millis();
             let state = admin.turn_state_fetcher().await.unwrap();
             assert_eq!(state.values[0].acquired_at, acquired);
             assert_eq!(state.values[0].expires_at, previous.expires_at);
             assert_eq!(state.values[0].value, previous.value);
             assert_eq!(state.attempts[0].failures, 1);
-            assert!(state.attempts[0].next_attempt_at >= state.attempts[0].attempted_at + 60000);
+            assert!(
+                (started + 10000..=finished + 10000).contains(&state.attempts[0].next_attempt_at)
+            );
             assert!(
                 admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.is_err(),
                 "manual action cannot bypass backoff"
             );
             cycle(&worker).await;
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            // 连续多次未获得新值也不能拉长重试间隔。
+            store.attempts.lock().unwrap()[0].next_attempt_at = 0;
+            store.attempts.lock().unwrap()[0].failures = 20;
+            let started = Utc::now().timestamp_millis();
+            cycle(&worker).await;
+            let finished = Utc::now().timestamp_millis();
+            let state = admin.turn_state_fetcher().await.unwrap();
+            assert_eq!(state.attempts[0].failures, 21);
+            assert!(
+                (started + 10000..=finished + 10000).contains(&state.attempts[0].next_attempt_at)
+            );
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
         }
     }
 

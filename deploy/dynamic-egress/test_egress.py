@@ -220,7 +220,7 @@ class AzureTests(unittest.IsolatedAsyncioTestCase):
             self.journal.execute("DELETE FROM resources WHERE name=?", (name,))
         async def verify(source, family, public):
             self.assertEqual((source, family, public), ("10.0.0.9", "ipv4", "203.0.113.2"))
-        with patch.object(self.azure, "preflight", preflight), patch.object(self.azure, "command", command), patch.object(self.azure, "cleanup", cleanup), patch.object(self.azure, "verify", verify):
+        with patch.object(self.azure, "preflight", preflight), patch.object(self.azure, "command", command), patch.object(self.azure, "cleanup", cleanup), patch.object(self.azure, "verify", verify), patch.object(self.azure, "cleanup_unused_public_ips", AsyncMock()):
             address, _ = await self.azure.allocate("azure", "ipv4")
         self.assertEqual(address, "203.0.113.2")
         self.assertEqual(len(deletions), 1)
@@ -260,7 +260,7 @@ class AzureTests(unittest.IsolatedAsyncioTestCase):
                 return {"publicIp": {"id": "public-v6", "ipAddress": "2001:db8::42"}}
         async def verify(source, family, address):
             self.assertEqual((source, family, address), ("2001:db8::9", "ipv6", "2001:db8::42"))
-        with patch.object(self.azure, "preflight", preflight), patch.object(self.azure, "command", command), patch.object(self.azure, "verify", verify):
+        with patch.object(self.azure, "preflight", preflight), patch.object(self.azure, "command", command), patch.object(self.azure, "verify", verify), patch.object(self.azure, "cleanup_unused_public_ips", AsyncMock()):
             self.assertEqual(await self.azure.allocate("azure", "ipv6"), ("2001:db8::42", "2001:db8::9"))
         self.assertTrue(any(c[:4] == ("network", "nic", "ip-config", "update") for c in commands))
 
@@ -272,6 +272,36 @@ class AzureTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(EgressError):
                 await self.azure.recover()
         self.assertEqual(self.journal.db.execute("SELECT count(*) FROM resources").fetchone()[0], 1)
+
+    async def test_stale_cleanup_protects_primary_and_deletes_unowned_ipv4_ipv6(self):
+        primary = {"name": "primary", "id": "/primary", "ipConfiguration": {"id": "/nic/primary"}}
+        stale = [{"name": "old4", "id": "/old4", "ipAddress": "203.0.113.7", "provisioningState": "Succeeded"},
+                 {"name": "old6", "id": "/old6", "ipAddress": "2001:db8::7", "provisioningState": "Succeeded"}]
+        nic = {"ipConfigurations": [{"primary": True, "publicIPAddress": {"id": "/PRIMARY"}}]}
+        command = AsyncMock(side_effect=[[primary, *stale], None, None])
+        with patch.object(self.azure, "nic", AsyncMock(return_value=nic)), patch.object(self.azure, "command", command):
+            await self.azure.cleanup_unused_public_ips(self.azure.instances["azure"])
+        self.assertEqual([call.args[-1] for call in command.call_args_list[1:]], ["old4", "old6"])
+        self.assertFalse(self.journal.reserve("203.0.113.7", time.time()))
+        self.assertFalse(self.journal.reserve("2001:db8::7", time.time()))
+
+    async def test_stale_cleanup_fails_closed_for_attached_or_unready_ip(self):
+        nic = {"ipConfigurations": [{"primary": True, "publicIPAddress": {"id": "/primary"}}]}
+        for extra in ({"ipConfiguration": {"id": "/other"}}, {"natGateway": {"id": "/nat"}},
+                      {"provisioningState": "Updating"}):
+            public = dict({"name": "other", "id": "/other", "provisioningState": "Succeeded"}, **extra)
+            command = AsyncMock(return_value=[public])
+            with patch.object(self.azure, "nic", AsyncMock(return_value=nic)), patch.object(self.azure, "command", command):
+                with self.assertRaises(EgressError):
+                    await self.azure.cleanup_unused_public_ips(self.azure.instances["azure"])
+            self.assertEqual(command.await_count, 1)
+
+    async def test_stale_cleanup_requires_primary_identification(self):
+        command = AsyncMock()
+        with patch.object(self.azure, "nic", AsyncMock(return_value={"ipConfigurations": []})), patch.object(self.azure, "command", command):
+            with self.assertRaises(EgressError):
+                await self.azure.cleanup_unused_public_ips(self.azure.instances["azure"])
+        command.assert_not_awaited()
 
     async def test_cleanup_refuses_foreign_resources(self):
         self.journal.execute("INSERT INTO resources(name,instance,family) VALUES('foreign','azure','ipv4')")

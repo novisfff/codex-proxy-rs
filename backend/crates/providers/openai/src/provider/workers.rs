@@ -18,7 +18,7 @@ pub(crate) fn fetcher_worker(
     }
     Ok(WorkerContribution::Registration(scheduled_registration(
         WorkerId::try_new(WorkerKind::QuotaCatalogHealth, "openai-turn-state-fetcher")?,
-        Duration::from_secs(15),
+        Duration::from_secs(1),
         Box::new(Task(fetcher)),
     )?))
 }

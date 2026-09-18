@@ -375,8 +375,11 @@ impl TurnStateFetcher {
                 .as_ref()
                 .map_or(1, |a| a.failures.saturating_add(1))
         };
+        let retry_missing_value = !outcome.success && !outcome.paused && outcome.retry_after == 0;
         let delay = if outcome.success {
             0
+        } else if retry_missing_value {
+            10
         } else {
             backoff_seconds(failures).max(outcome.retry_after)
         };
@@ -391,7 +394,11 @@ impl TurnStateFetcher {
         } else {
             finished
                 .saturating_add(i64::try_from(delay.saturating_mul(1000)).unwrap_or(i64::MAX))
-                .saturating_add(i64::from(uuid::Uuid::new_v4().as_bytes()[0]) * 20)
+                .saturating_add(if retry_missing_value {
+                    0
+                } else {
+                    i64::from(uuid::Uuid::new_v4().as_bytes()[0]) * 20
+                })
         };
         self.store
             .save_attempt(TurnStateFetchAttempt {
