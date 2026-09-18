@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
 import type { AccountGroupRef } from './account-groups'
+import type { CodexTurnStateConfig } from './settings'
 import request from '../request'
 
 export type AccountStatus
@@ -640,11 +641,13 @@ export function completeAccountOAuth(data: AccountOAuthCompleteParam) {
 }
 
 export interface ApiKeyConfiguration {
+  codex_turn_state: CodexTurnStateConfig
   base_url: string
   transport: 'http' | 'prefer_websocket'
 }
 
 export interface OAuthConfiguration {
+  codex_turn_state: CodexTurnStateConfig
   openai_base_url: string | null
 }
 
@@ -657,7 +660,7 @@ export function getAccountDetail(data: AccountIdParam, options: RequestOptions =
   })
 }
 
-export function updateAccountOpenAiBaseUrl(data: { accountId: string, openaiBaseUrl: string, settings: AccountUpdateParam }) {
+export function updateAccountOpenAiBaseUrl(data: { accountId: string, openaiBaseUrl: string, codexTurnState?: CodexTurnStateConfig, settings: AccountUpdateParam }) {
   return request<{ accountId: string }>({
     url: '/api/admin/accounts/rotate',
     method: 'POST',
@@ -665,7 +668,7 @@ export function updateAccountOpenAiBaseUrl(data: { accountId: string, openaiBase
   })
 }
 
-export function updateAccountApiKey(data: { accountId: string, baseUrl: string, transport: ApiKeyConfiguration['transport'], apiKey?: string, settings?: AccountUpdateParam }) {
+export function updateAccountApiKey(data: { accountId: string, baseUrl: string, transport: ApiKeyConfiguration['transport'], apiKey?: string, codexTurnState?: CodexTurnStateConfig, settings?: AccountUpdateParam }) {
   return request<{ accountId: string }>({
     url: '/api/admin/accounts/rotate',
     method: 'POST',

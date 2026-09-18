@@ -678,6 +678,30 @@ mod actions {
     }
 
     #[test]
+    fn account_turn_state_rotation_validates_modes_and_header_values() {
+        for connection in [
+            json!({"openaiBaseUrl":""}),
+            json!({"baseUrl":"https://example.com/v1","transport":"http"}),
+        ] {
+            for (mode, value, valid) in [
+                ("auto", "", true),
+                ("default", "", true),
+                ("manual", "account-state", true),
+                ("manual", "", false),
+                ("manual", "value\r\ninjected:yes", false),
+                ("manual", "中文", false),
+            ] {
+                let mut body = connection.clone();
+                body["provider"] = json!("openai");
+                body["accountId"] = json!("acct_1");
+                body["codexTurnState"] = json!({"mode":mode,"value":value});
+                let request: RotateAccountRequest = serde_json::from_value(body).unwrap();
+                assert_eq!(request.validate().is_ok(), valid);
+            }
+        }
+    }
+
+    #[test]
     fn oauth_base_url_rotation_accepts_reset_and_rejects_mixed_credentials() {
         for base_url in ["", "https://gateway.example/backend-api"] {
             let request: RotateAccountRequest = serde_json::from_value(json!({

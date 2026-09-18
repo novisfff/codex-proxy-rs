@@ -39,6 +39,7 @@ fn account_profile_debug_redacts_identity_fields() {
 #[test]
 fn plaintext_provider_schema_round_trips_dynamic_cookie_data() {
     let data = CodexCredentialData::OAuth(CodexOAuthCredentialData {
+        codex_turn_state: Default::default(),
         schema_version: 1,
         openai_base_url: None,
         principal: Some(CodexCredentialPrincipal {

@@ -251,6 +251,7 @@ fn codec_persists_tokens_as_plaintext_provider_json() {
         keys,
         [
             "access_token",
+            "codex_turn_state",
             "cookies",
             "installation_id",
             "principal",
@@ -271,6 +272,11 @@ fn codec_reimport_preserves_existing_installation_id_for_the_same_principal() {
     let mut existing_data = CodexCredentialCodec::decode_complete(&existing).unwrap();
     existing_data.oauth_mut().unwrap().openai_base_url =
         Some("https://gateway.example/root".to_owned());
+    existing_data.oauth_mut().unwrap().codex_turn_state =
+        gateway_core::policy::CodexTurnStateConfig {
+            mode: gateway_core::policy::CodexTurnStateMode::Manual,
+            value: "preserved-account-state".to_owned(),
+        };
     let existing = CodexCredentialCodec::encode_complete(existing_data).unwrap();
     let incoming = CodexCredentialCodec::encode_new(
         &secret("incoming-access-token"),
@@ -288,6 +294,10 @@ fn codec_reimport_preserves_existing_installation_id_for_the_same_principal() {
     let preserved = CodexCredentialCodec::decode_complete(&preserved).expect("preserved data");
 
     assert_eq!(preserved.installation_id(), existing_id);
+    assert_eq!(
+        preserved.codex_turn_state().value,
+        "preserved-account-state"
+    );
     assert_eq!(
         preserved.oauth().unwrap().openai_base_url.as_deref(),
         Some("https://gateway.example/root")

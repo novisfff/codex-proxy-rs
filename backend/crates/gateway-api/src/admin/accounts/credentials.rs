@@ -317,6 +317,7 @@ impl AccountDeletionRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateAccountRequest {
+    pub codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
     pub provider: String,
     pub account_id: String,
     pub access_token: Option<String>,
@@ -331,6 +332,14 @@ pub struct RotateAccountRequest {
 
 impl RotateAccountRequest {
     pub fn validate(&self) -> Result<(), WireValidationError> {
+        if let Some(config) = &self.codex_turn_state {
+            config
+                .validate()
+                .map_err(|_| WireValidationError::new("codexTurnState"))?;
+            if self.openai_base_url.is_none() && self.base_url.is_none() {
+                return Err(WireValidationError::new("codexTurnState"));
+            }
+        }
         if AccountProvider::parse(&self.provider)? != AccountProvider::OpenAi {
             return Err(WireValidationError::new("provider"));
         }
@@ -390,6 +399,13 @@ impl RotateAccountRequest {
     ) -> Result<RotateCredential, WireValidationError> {
         self.validate()?;
         let mut material = Map::new();
+        if let Some(config) = self.codex_turn_state {
+            material.insert(
+                "codex_turn_state".to_owned(),
+                serde_json::to_value(config)
+                    .map_err(|_| WireValidationError::new("codexTurnState"))?,
+            );
+        }
         if let Some(base_url) = self.openai_base_url {
             material.insert("openai_base_url".to_owned(), Value::String(base_url));
         } else if let Some(base_url) = self.base_url {

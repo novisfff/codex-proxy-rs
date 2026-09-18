@@ -167,6 +167,7 @@ const {
 const {
   apiKey: editingApiKey,
   openaiBaseUrl: editingOpenaiBaseUrl,
+  codexTurnState: editingCodexTurnState,
   configurationLoading,
   configurationReady,
   showEditModal,
@@ -407,6 +408,7 @@ const {
       v-model="showEditModal"
       v-model:api-key="editingApiKey"
       v-model:openai-base-url="editingOpenaiBaseUrl"
+      v-model:codex-turn-state="editingCodexTurnState"
       v-model:notes="editingNotes"
       v-model:enabled="schedulingEnabled"
       v-model:concurrency-limit="editingConcurrencyLimit"

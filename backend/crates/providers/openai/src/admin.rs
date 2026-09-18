@@ -502,11 +502,15 @@ impl ProviderAdmin for OpenAiAdminProvider {
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?
         {
             crate::credential::CodexCredentialData::ApiKey(data) => {
-                serde_json::to_value(data.configuration())
-                    .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?
+                serde_json::json!({
+                    "base_url": data.base_url,
+                    "transport": data.transport,
+                    "codex_turn_state": data.codex_turn_state,
+                })
             }
             crate::credential::CodexCredentialData::OAuth(data) => serde_json::json!({
                 "openai_base_url": data.openai_base_url,
+                "codex_turn_state": data.codex_turn_state,
             }),
         };
         let object = value

@@ -35,6 +35,8 @@ impl ApiKeyConfiguration {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiKeyCredentialData {
+    #[serde(default)]
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub schema_version: u32,
     pub installation_id: String,
     pub api_key: String,

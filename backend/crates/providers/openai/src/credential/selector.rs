@@ -718,6 +718,7 @@ impl CodexCredentialSelector {
                         }
                         return Ok(CodexCredentialLease {
                             openai_base_url: runtime.openai_base_url,
+                            codex_turn_state: runtime.codex_turn_state,
                             installation_id: runtime.installation_id,
                             account,
                             authentication: runtime.authentication,
@@ -1363,6 +1364,7 @@ impl fmt::Debug for CodexCredentialSelector {
 }
 
 pub struct CodexCredentialLease {
+    codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     openai_base_url: Option<String>,
     account: ProviderAccount,
     authentication: CodexRuntimeAuthentication,
@@ -1377,6 +1379,10 @@ pub struct CodexCredentialLease {
 }
 
 impl CodexCredentialLease {
+    pub(crate) fn codex_turn_state(&self) -> &gateway_core::policy::CodexTurnStateConfig {
+        &self.codex_turn_state
+    }
+
     pub(crate) fn openai_base_url(&self) -> Option<&str> {
         self.openai_base_url.as_deref()
     }

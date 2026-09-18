@@ -49,6 +49,48 @@ pub(crate) struct MemoryAccountStore {
 }
 
 impl MemoryAccountStore {
+    pub(crate) async fn set_turn_state(
+        &self,
+        id: &str,
+        config: gateway_core::policy::CodexTurnStateConfig,
+    ) {
+        let id = ProviderAccountId::new(id).unwrap();
+        let current = self.load_current_credential(&id).await.unwrap();
+        let mut data =
+            provider_openai::credential::CodexCredentialCodec::decode_complete(&current.credential)
+                .unwrap();
+        match &mut data {
+            provider_openai::credential::CodexCredentialData::OAuth(data) => {
+                data.codex_turn_state = config
+            }
+            provider_openai::credential::CodexCredentialData::ApiKey(data) => {
+                data.codex_turn_state = config
+            }
+        }
+        let credential =
+            provider_openai::credential::CodexCredentialCodec::encode_complete(data).unwrap();
+        let update = CredentialCasUpdate::new(
+            id.clone(),
+            current.account.revision(),
+            ProviderAccountUpdate {
+                account_id: id,
+                name: current.account.name().to_owned(),
+                email: current.account.email().map(str::to_owned),
+                plan_type: current.account.plan_type().map(str::to_owned),
+            },
+            credential,
+            current.account.has_refresh_token(),
+            current.account.access_token_expires_at(),
+            current.account.next_refresh_at(),
+        )
+        .unwrap()
+        .preserving_profile();
+        assert!(matches!(
+            self.compare_and_swap_credential(update).await.unwrap(),
+            CredentialCasOutcome::Updated(_)
+        ));
+    }
+
     pub(crate) async fn set_openai_base_url(&self, id: &str, base_url: Option<String>) {
         let id = ProviderAccountId::new(id).unwrap();
         let current = self.load_current_credential(&id).await.unwrap();
@@ -99,6 +141,7 @@ impl MemoryAccountStore {
         let credential = provider_openai::credential::CodexCredentialCodec::encode_complete(
             provider_openai::credential::CodexCredentialData::ApiKey(
                 provider_openai::credential::ApiKeyCredentialData {
+                    codex_turn_state: Default::default(),
                     schema_version: 1,
                     installation_id: uuid::Uuid::new_v4().to_string(),
                     base_url,

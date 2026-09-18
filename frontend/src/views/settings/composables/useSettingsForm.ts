@@ -1,6 +1,5 @@
 import type { rotationOptions } from '../constants'
 import type { RequestLocation } from '@/api'
-import type { CodexTurnStateConfig } from '@/api/modules/settings'
 import { computed, reactive, ref, shallowRef } from 'vue'
 
 import { getSettings, updateSettings } from '@/api'
@@ -22,7 +21,6 @@ export function useSettingsForm() {
   const mappings = ref<Array<{ requestedModel: string, upstreamModel: string }>>([])
   const savedRequestLocation = shallowRef<RequestLocation>()
   const form = reactive({
-    codexTurnState: { mode: 'default', value: '' } as CodexTurnStateConfig,
     disableFast: false,
     requestLocationEnabled: false,
     requestLocation: { country: '', region: '', city: '', timezone: '' },
@@ -53,7 +51,7 @@ export function useSettingsForm() {
 
   function snapshot() {
     return {
-      form: { ...form, codexTurnState: { ...form.codexTurnState }, requestLocation: { ...form.requestLocation } },
+      form: { ...form, requestLocation: { ...form.requestLocation } },
       mappings: mappings.value.map(row => ({ ...row })),
     }
   }
@@ -65,7 +63,7 @@ export function useSettingsForm() {
   function resetSettings() {
     if (!saved.value || saving.value)
       return
-    Object.assign(form, saved.value.form, { codexTurnState: { ...saved.value.form.codexTurnState }, requestLocation: { ...saved.value.form.requestLocation } })
+    Object.assign(form, saved.value.form, { requestLocation: { ...saved.value.form.requestLocation } })
     mappings.value = saved.value.mappings.map(row => ({ ...row }))
   }
 
@@ -104,7 +102,6 @@ export function useSettingsForm() {
   }
 
   function applySettings(data: Awaited<ReturnType<typeof getSettings>>) {
-    form.codexTurnState = { ...data.codexTurnState }
     savedRequestLocation.value = { ...data.requestLocation }
     form.disableFast = data.disableFast
     form.requestLocationEnabled = data.requestLocationEnabled
@@ -187,12 +184,6 @@ export function useSettingsForm() {
   async function saveSettings() {
     if (saving.value || loading.value || !savedRequestLocation.value)
       return
-    const turnState = form.codexTurnState
-    if (turnState.value.length > 8192 || /[^\x21-\x7E]/.test(turnState.value)
-      || (turnState.mode === 'manual' && !turnState.value)) {
-      toast.warning('Turn State 应为不含空格的 ASCII 字符串，最长 8192 字节；手动模式不能为空')
-      return
-    }
     const { refreshMarginSeconds, refreshConcurrency, maxConcurrentPerAccount, requestIntervalMs, rotationStrategy, maxWaitingPerKey, maxWaitingPerAccount, concurrencyWaitTimeoutSeconds, responsesMaxDecompressedBodyMiB, accountAutoFreezeThreshold, accountAutoFreezeWindowSeconds, accountAutoFreezeDurationSeconds } = form
     if (refreshMarginSeconds === null || refreshConcurrency === null || maxConcurrentPerAccount === null || requestIntervalMs === null || !rotationStrategy || maxWaitingPerKey === null || maxWaitingPerAccount === null || concurrencyWaitTimeoutSeconds === null) {
       toast.warning('请完整填写运行参数和调度策略')
@@ -238,7 +229,6 @@ export function useSettingsForm() {
     }
     await saveAction.run(async () => {
       const result = await updateSettings({
-        codexTurnState: { ...form.codexTurnState },
         disableFast: form.disableFast,
         requestLocationEnabled: form.requestLocationEnabled,
         requestLocation,

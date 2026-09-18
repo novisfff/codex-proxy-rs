@@ -417,6 +417,7 @@ impl CodexCredentialAdmin {
         #[serde(deny_unknown_fields)]
         struct Configuration {
             openai_base_url: String,
+            codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
         }
         let configuration: Configuration = serde_json::from_value(material)
             .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
@@ -428,6 +429,9 @@ impl CodexCredentialAdmin {
         let base_url = configuration.openai_base_url.trim();
         oauth.openai_base_url =
             (!base_url.is_empty()).then(|| base_url.trim_end_matches('/').to_owned());
+        if let Some(config) = configuration.codex_turn_state {
+            oauth.codex_turn_state = config;
+        }
         let credential = CodexCredentialCodec::encode_complete(data)
             .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
         let profile = ProviderAccountUpdate {
@@ -502,6 +506,7 @@ impl CodexCredentialAdmin {
             base_url: String,
             transport: ApiKeyTransport,
             api_key: Option<String>,
+            codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
         }
         let rotation: Rotation = serde_json::from_value(material)
             .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
@@ -513,6 +518,9 @@ impl CodexCredentialAdmin {
         };
         data.base_url = rotation.base_url;
         data.transport = rotation.transport;
+        if let Some(config) = rotation.codex_turn_state {
+            data.codex_turn_state = config;
+        }
         if let Some(api_key) = rotation.api_key {
             data.api_key = api_key;
         }
@@ -1542,6 +1550,7 @@ fn parse_api_key_import(value: &Value) -> Result<ApiKeyCredentialData, CodexCred
         }
     }
     let data = ApiKeyCredentialData {
+        codex_turn_state: Default::default(),
         schema_version: 1,
         installation_id: uuid::Uuid::new_v4().to_string(),
         base_url,

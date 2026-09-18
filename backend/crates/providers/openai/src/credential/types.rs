@@ -285,6 +285,8 @@ pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CodexOAuthCredentialData {
+    #[serde(default)]
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_base_url: Option<String>,
@@ -333,6 +335,13 @@ pub enum CodexCredentialData {
 }
 
 impl CodexCredentialData {
+    pub fn codex_turn_state(&self) -> &gateway_core::policy::CodexTurnStateConfig {
+        match self {
+            Self::OAuth(data) => &data.codex_turn_state,
+            Self::ApiKey(data) => &data.codex_turn_state,
+        }
+    }
+
     #[must_use]
     pub const fn authentication_kind(&self) -> &'static str {
         match self {

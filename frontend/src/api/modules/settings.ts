@@ -86,15 +86,16 @@ export interface AutomaticTurnState {
   acquiredAt: string
 }
 
-export function getAutomaticTurnState(options: RequestOptions = {}) {
+export function getAutomaticTurnState(options: RequestOptions = {}, accountId?: string) {
   return request<AutomaticTurnState[]>({
     url: '/api/admin/settings/turn-state',
     method: 'GET',
+    params: { accountId },
     ...options,
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt'>
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'codexTurnState'>
 
 export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({

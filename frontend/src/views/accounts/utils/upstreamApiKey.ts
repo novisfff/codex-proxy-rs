@@ -1,6 +1,6 @@
 import type { ApiKeyConfiguration } from '@/api'
 
-export interface ApiKeyAccountForm extends ApiKeyConfiguration {
+export interface ApiKeyAccountForm extends Omit<ApiKeyConfiguration, 'codex_turn_state'> {
   name: string
   apiKey: string
 }

@@ -588,7 +588,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     } = response;
     Box::pin(async_stream::try_stream! {
         let turn_state = turn_state.scope(lease.account_id().as_str(), request.model());
-        turn_state.apply(&mut request, context.codex_turn_state());
+        turn_state.apply(&mut request, lease.codex_turn_state());
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let failure_context = OpenAiFailureContext {

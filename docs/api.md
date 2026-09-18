@@ -633,15 +633,28 @@ API Key rotation 使用 `{ provider: "openai", accountId, baseUrl, transport, ap
 省略 `apiKey` 保留当前密钥，空字符串无效；账号 ID 和认证类型不能通过轮换转换。
 rotation 可选携带 `settings`，字段与 `POST /api/admin/accounts/update` 相同，其中 `accountId` 必须与外层一致。
 凭据与设置在同一事务中保存，任一校验或持久化失败均不落库；省略 `settings` 保留现有分组、调度等设置。
-`GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`，不回显密钥。
+`GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport, codex_turn_state }`，不回显密钥。
 
-OAuth 账号的详情返回 `credentialConfiguration: { openai_base_url }`，值为 `null` 时使用系统默认地址。
+OAuth 账号的详情返回 `credentialConfiguration: { openai_base_url, codex_turn_state }`，其中 `openai_base_url` 为 `null` 时使用系统默认地址。
 通过 `POST /api/admin/accounts/rotate` 发送 `{ provider: "openai", accountId, openaiBaseUrl, settings? }`
 可修改该账号的模型请求网关；空字符串恢复默认，不能同时提交 token 或 API Key 配置。
 地址须为不含认证信息、查询参数或片段的 HTTPS 前缀（HTTP 仅允许本机联调），最多 2048 字节；
 请求自动追加 `/codex/responses`、`/codex/images/...` 等路径。HTTP/SSE 与 WebSocket 共用该地址，
 OAuth 授权、令牌刷新、模型目录和额度查询继续使用既有地址。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游。
+
+账号级 `codexTurnState` 格式为 `{ "mode": "default", "value": "" }`，通过上述账号 rotation 接口连同对应的地址配置一起保存，省略或 `null` 保留该账号现值。适用于 OpenAI Responses HTTP 和 WebSocket 请求：
+
+- `default`：保持原有客户端状态及账号隔离行为。
+- `manual`：使用 `value` 覆盖请求中的 `X-Codex-Turn-State`；值必须为 1–8192 字节的可打印 ASCII 字符（不含空格）。
+- `auto`：按实际选中的账号 ID 和发送给上游的模型名分别保存最新的 292 字节 `X-Codex-Turn-State`，思考强度不参与区分。同一组合跨会话复用；其他长度或缺失值不覆盖缓存。该组合尚无有效值时不携带此头，也不沿用客户端透传值。
+
+手动配置和模式按账号持久化，凭据刷新或重新导入保留现有值；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
+
+管理员可通过 `GET /api/admin/settings/turn-state` 读取自动模式使用的缓存，可用 `?accountId=...` 仅返回指定账号：`data` 为
+`[{ "accountId": "...", "model": "gpt-5.4", "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }]`，尚未获取时为空数组。
+每次收到有效的 292 字节值都会同时更新值与获取时间，包括返回值与之前相同的情况；其他长度和缺失值保留原缓存及时间。
+该接口只读，不改变模式或手动配置，返回的原值仅供管理员查看和复制。
 
 OAuth start 使用：
 
@@ -947,7 +960,6 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 
 ```text
 disableFast
-codexTurnState
 requestLocationEnabled
 requestLocation
 modelMappings
@@ -974,18 +986,7 @@ accountAutoFreezeProbeModel
 accountAutoFreezeAdaptiveConcurrency
 ```
 
-`codexTurnState` 格式为 `{ "mode": "default", "value": "" }`，省略或 `null` 保留现值。适用于 OpenAI Responses HTTP 和 WebSocket 请求：
-
-- `default`：保持原有客户端状态及账号隔离行为。
-- `manual`：使用 `value` 覆盖请求中的 `X-Codex-Turn-State`；值必须为 1–8192 字节的可打印 ASCII 字符（不含空格）。
-- `auto`：按实际选中的账号 ID 和发送给上游的模型名分别保存最新的 292 字节 `X-Codex-Turn-State`，思考强度不参与区分。同一组合跨会话复用；其他长度或缺失值不覆盖缓存。该组合尚无有效值时不携带此头，也不沿用客户端透传值。
-
-手动配置和模式持久化；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
-
-管理员可通过 `GET /api/admin/settings/turn-state` 读取自动模式使用的缓存：`data` 为
-`[{ "accountId": "...", "model": "gpt-5.4", "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }]`，尚未获取时为空数组。
-每次收到有效的 292 字节值都会同时更新值与获取时间，包括返回值与之前相同的情况；其他长度和缺失值保留原缓存及时间。
-该接口只读，不改变模式或手动配置，返回的原值仅供管理员查看和复制。
+`codexTurnState` 已迁移到账号配置；全局更新仅兼容默认空值，其他值返回校验错误。
 
 `disableFast` 默认 `false`，更新时省略或 `null` 保留现值。全局开启时，所有 Key 的 OpenAI Responses 请求关闭 Fast；
 全局关闭时仍应用 Key 绑定分组的限制。关闭 Fast 只将顶层 `service_tier` 的 `priority`（含 `fast` 别名）

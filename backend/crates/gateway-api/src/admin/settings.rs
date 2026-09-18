@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, fmt};
 
 use axum::{
     Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -101,7 +101,7 @@ impl UpdateRuntimeSettingsRequest {
         if self
             .codex_turn_state
             .as_ref()
-            .is_some_and(|config| config.validate().is_err())
+            .is_some_and(|config| *config != gateway_core::policy::CodexTurnStateConfig::default())
         {
             return Err(WireValidationError::new("codexTurnState"));
         }
@@ -407,7 +407,17 @@ struct AutomaticTurnStateView {
     acquired_at: DateTime<Utc>,
 }
 
-async fn automatic_turn_state<S>(_auth: AdminAuth, State(state): State<S>) -> impl IntoResponse
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutomaticTurnStateQuery {
+    account_id: Option<String>,
+}
+
+async fn automatic_turn_state<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    Query(query): Query<AutomaticTurnStateQuery>,
+) -> impl IntoResponse
 where
     S: SessionState + Send + Sync,
 {
@@ -417,6 +427,12 @@ where
         AdminEnvelope::ok(
             current
                 .into_iter()
+                .filter(|current| {
+                    query
+                        .account_id
+                        .as_ref()
+                        .is_none_or(|id| id == &current.account_id)
+                })
                 .map(|current| AutomaticTurnStateView {
                     account_id: current.account_id,
                     model: current.model,

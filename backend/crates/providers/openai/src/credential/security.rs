@@ -17,6 +17,7 @@ const MAX_COOKIES: usize = 128;
 
 /// 已解析且只在 Provider 内可见的认证材料。
 pub struct CodexRuntimeCredential {
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub openai_base_url: Option<String>,
     pub authentication: CodexRuntimeAuthentication,
     pub principal: Option<CodexCredentialPrincipal>,
@@ -122,6 +123,7 @@ impl CodexCredentialCodec {
         cookies: Vec<CodexCookie>,
     ) -> Result<PlaintextCredential, CodexCredentialDataError> {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
+            codex_turn_state: Default::default(),
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
             openai_base_url: None,
             principal,
@@ -178,6 +180,7 @@ impl CodexCredentialCodec {
             CodexCredentialData::OAuth(data) => data.openai_base_url.clone(),
             CodexCredentialData::ApiKey(_) => None,
         };
+        let codex_turn_state = data.codex_turn_state().clone();
         let (authentication, principal, installation_id, cookies, oauth_client_id, oauth_scope) =
             match data {
                 CodexCredentialData::ApiKey(data) => (
@@ -205,6 +208,7 @@ impl CodexCredentialCodec {
                 ),
             };
         Ok(CodexRuntimeCredential {
+            codex_turn_state,
             openai_base_url,
             authentication,
             principal,
@@ -246,9 +250,11 @@ impl CodexCredentialCodec {
             (CodexCredentialData::OAuth(incoming), CodexCredentialData::OAuth(existing)) => {
                 incoming.installation_id = existing.installation_id;
                 incoming.openai_base_url = existing.openai_base_url;
+                incoming.codex_turn_state = existing.codex_turn_state;
             }
             (CodexCredentialData::ApiKey(incoming), CodexCredentialData::ApiKey(existing)) => {
                 incoming.installation_id = existing.installation_id;
+                incoming.codex_turn_state = existing.codex_turn_state;
             }
             _ => return Err(CodexCredentialDataError::Invalid),
         }
@@ -257,6 +263,9 @@ impl CodexCredentialCodec {
 }
 
 fn validate(data: &CodexCredentialData) -> Result<(), CodexCredentialDataError> {
+    data.codex_turn_state()
+        .validate()
+        .map_err(|_| CodexCredentialDataError::Invalid)?;
     if let CodexCredentialData::ApiKey(data) = data {
         return if data.validate() && valid_installation_id(&data.installation_id) {
             Ok(())

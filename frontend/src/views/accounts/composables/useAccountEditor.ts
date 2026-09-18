@@ -1,5 +1,6 @@
 import type { Ref } from 'vue'
 import type { AccountModelAccess, ApiKeyConfiguration, getAccounts } from '@/api'
+import type { CodexTurnStateConfig } from '@/api/modules/settings'
 
 import { computed, ref, shallowRef, watch } from 'vue'
 import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountOpenAiBaseUrl } from '@/api'
@@ -36,6 +37,8 @@ export function useAccountEditor(options: {
   const savedConfiguration = shallowRef<ApiKeyConfiguration>()
   const openaiBaseUrl = shallowRef('')
   const savedOpenaiBaseUrl = shallowRef('')
+  const codexTurnState = ref<CodexTurnStateConfig>({ mode: 'default', value: '' })
+  const savedTurnState = shallowRef('')
 
   async function loadConfiguration(accountId: string) {
     const requestId = configurationRequest.start()
@@ -45,6 +48,8 @@ export function useAccountEditor(options: {
         return
       if (!detail.credentialConfiguration)
         throw new Error('该账号没有上游设置')
+      codexTurnState.value = { ...detail.credentialConfiguration.codex_turn_state }
+      savedTurnState.value = JSON.stringify(codexTurnState.value)
       if ('base_url' in detail.credentialConfiguration) {
         apiKey.value = { ...emptyApiKeyAccountForm(), ...detail.credentialConfiguration }
         savedConfiguration.value = detail.credentialConfiguration
@@ -84,6 +89,8 @@ export function useAccountEditor(options: {
     apiKey.value = emptyApiKeyAccountForm()
     openaiBaseUrl.value = ''
     savedOpenaiBaseUrl.value = ''
+    codexTurnState.value = { mode: 'default', value: '' }
+    savedTurnState.value = ''
     savedConfiguration.value = undefined
     configurationReady.value = false
     showEditModal.value = true
@@ -99,6 +106,12 @@ export function useAccountEditor(options: {
     const isOpenAi = editingAccount.value?.provider === 'openai'
     if (isOpenAi && !configurationReady.value)
       return
+    const turnState = codexTurnState.value
+    if (isOpenAi && (turnState.value.length > 8192 || /[^\x21-\x7E]/.test(turnState.value)
+      || (turnState.mode === 'manual' && !turnState.value))) {
+      toast.warning('Turn State 应为不含空格的 ASCII 字符串，最长 8192 字节；手动模式不能为空')
+      return
+    }
     if (isOpenAi && !isApiKey && openaiBaseUrl.value.trim()) {
       const error = upstreamBaseUrlError(openaiBaseUrl.value.trim())
       if (error) {
@@ -145,12 +158,13 @@ export function useAccountEditor(options: {
         apiKey.value.apiKey !== ''
         || apiKey.value.base_url.trim() !== savedConfiguration.value?.base_url
         || apiKey.value.transport !== savedConfiguration.value?.transport
+        || JSON.stringify(codexTurnState.value) !== savedTurnState.value
       )
       if (connectionChanged) {
-        await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
+        await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, codexTurnState: { ...codexTurnState.value }, settings })
       }
-      else if (isOpenAi && !isApiKey && openaiBaseUrl.value.trim() !== savedOpenaiBaseUrl.value) {
-        await updateAccountOpenAiBaseUrl({ accountId, openaiBaseUrl: openaiBaseUrl.value.trim(), settings })
+      else if (isOpenAi && !isApiKey && (openaiBaseUrl.value.trim() !== savedOpenaiBaseUrl.value || JSON.stringify(codexTurnState.value) !== savedTurnState.value)) {
+        await updateAccountOpenAiBaseUrl({ accountId, openaiBaseUrl: openaiBaseUrl.value.trim(), codexTurnState: { ...codexTurnState.value }, settings })
       }
       else {
         await updateAccount(settings)
@@ -180,6 +194,7 @@ export function useAccountEditor(options: {
   })
 
   return {
+    codexTurnState,
     openaiBaseUrl,
     apiKey,
     configurationLoading,

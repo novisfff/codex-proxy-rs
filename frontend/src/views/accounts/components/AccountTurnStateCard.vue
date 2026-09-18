@@ -12,7 +12,7 @@ import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import { useCopyText } from '@/composables/useCopyText'
 import { formatDateTime } from '@/utils/date'
 
-defineProps<{ disabled: boolean }>()
+const props = defineProps<{ disabled: boolean, accountId: string }>()
 const model = defineModel<CodexTurnStateConfig>({ required: true })
 const current = ref<AutomaticTurnState[]>([])
 const loading = ref(false)
@@ -29,7 +29,7 @@ async function refresh() {
   controller = pending
   loading.value = true
   try {
-    const result = await getAutomaticTurnState({ silent: true, signal: pending.signal })
+    const result = await getAutomaticTurnState({ silent: true, signal: pending.signal }, props.accountId)
     if (!pending.signal.aborted) {
       current.value = result
       error.value = false
@@ -50,7 +50,7 @@ async function refresh() {
   }
 }
 
-watch(() => model.value.mode, (mode) => {
+watch(() => [model.value.mode, props.accountId], ([mode]) => {
   clearTimeout(timer)
   controller?.abort()
   current.value = []
@@ -110,7 +110,6 @@ function setMode(mode: string) {
           <div v-else-if="current.length" class="max-h-96 space-y-4 overflow-auto">
             <div v-for="entry in current" :key="JSON.stringify([entry.accountId, entry.model])" class="space-y-2 rounded-lg bg-cp-input-bg p-3">
               <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
-                <span class="break-all">账号：{{ entry.accountId }}</span>
                 <span class="break-all">模型：{{ entry.model }}</span>
                 <BaseIconButton
                   :label="`复制 ${entry.accountId} / ${entry.model} 的 X-Codex-Turn-State`"
@@ -129,7 +128,7 @@ function setMode(mode: string) {
             {{ loaded ? '尚未获取到 292 字节值，自动模式暂不携带此请求头。' : '正在读取…' }}
           </p>
           <p class="text-cp-xs text-cp-text-tertiary">
-            每个账号、每个上游模型分别使用最新的 292 字节值，不区分思考强度。未命中时不携带此头；显示每 5 秒刷新，模式修改需保存后生效。
+            此账号的每个上游模型分别使用最新的 292 字节值，不区分思考强度。未命中时不携带此头；显示每 5 秒刷新，点击“保存更改”后模式生效。
           </p>
         </div>
       </BaseFormItem>

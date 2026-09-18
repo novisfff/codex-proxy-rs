@@ -389,6 +389,10 @@ CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 ```
 
+升级到账号级 Turn State 配置时，迁移会将旧全局模式和手动值复制到已有 OpenAI 账号，新账号默认为 `default`。
+自动缓存仍只保留在当前进程内，重启后重新积累。该凭据 schema 新增了配置字段，旧版本不识别；
+回退至升级前版本需要使用升级前的完整备份，并评估备份之后的数据变更。
+
 ### 管理端在线更新
 
 Compose 提供以下在线更新运行参数：

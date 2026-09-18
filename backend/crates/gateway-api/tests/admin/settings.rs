@@ -103,6 +103,7 @@ fn settings_request_should_validate_turn_state_without_header_injection() {
         "a\r\nx-injected: yes".to_owned(),
         "中文".to_owned(),
         "x".repeat(8193),
+        "valid-but-account-only".to_owned(),
     ] {
         let mut body = update_body();
         body["codexTurnState"] = json!({"mode":"manual","value":value});
@@ -112,7 +113,7 @@ fn settings_request_should_validate_turn_state_without_header_injection() {
 }
 
 #[tokio::test]
-async fn settings_should_preserve_turn_state_when_omitted_or_null() {
+async fn settings_should_accept_legacy_default_turn_state_when_omitted_or_null() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");
     for omitted in [false, true, false] {
@@ -120,7 +121,7 @@ async fn settings_should_preserve_turn_state_when_omitted_or_null() {
         if omitted {
             body.as_object_mut().unwrap().remove("codexTurnState");
         } else {
-            body["codexTurnState"] = json!({"mode":"manual","value":"synthetic-state"});
+            body["codexTurnState"] = json!({"mode":"default","value":""});
         }
         let response = app(fixture.state())
             .oneshot(request(
@@ -133,7 +134,7 @@ async fn settings_should_preserve_turn_state_when_omitted_or_null() {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response_json(response).await["data"]["codexTurnState"],
-            json!({"mode":"manual","value":"synthetic-state"})
+            json!({"mode":"default","value":""})
         );
     }
     let mut body = update_body();
@@ -148,7 +149,7 @@ async fn settings_should_preserve_turn_state_when_omitted_or_null() {
         .unwrap();
     assert_eq!(
         response_json(response).await["data"]["codexTurnState"]["value"],
-        "synthetic-state"
+        ""
     );
 }
 

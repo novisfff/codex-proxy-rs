@@ -4634,6 +4634,15 @@ async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoni
     {
         server.reset().await;
         let before_all = provider.automatic_turn_state();
+        store
+            .set_turn_state(
+                account,
+                CodexTurnStateConfig {
+                    mode,
+                    value: "manual-state".to_owned(),
+                },
+            )
+            .await;
         let before = before_all
             .iter()
             .find(|entry| entry.account_id == account && entry.model == model)
@@ -4680,8 +4689,8 @@ async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoni
                 ClientApiKeyId::new("key_openai_contract").unwrap(),
             )
             .with_codex_turn_state(CodexTurnStateConfig {
-                mode,
-                value: "manual-state".to_owned(),
+                mode: CodexTurnStateMode::Manual,
+                value: "ignored-global-state".to_owned(),
             }),
             NonZeroU32::new(1).unwrap(),
             SystemTime::now() + Duration::from_secs(30),
@@ -4750,17 +4759,26 @@ async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoni
 }
 
 #[tokio::test]
-async fn global_turn_state_should_refresh_metadata_on_reused_websocket() {
+async fn account_turn_state_should_refresh_metadata_on_reused_websocket() {
     use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
+    store
+        .set_turn_state(
+            "acct_provider_contract",
+            CodexTurnStateConfig {
+                mode: CodexTurnStateMode::Auto,
+                value: String::new(),
+            },
+        )
+        .await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let mut websocket =
             crate::transport::accept_codex_test_websocket_with(socket, |request, response| {
-                assert_eq!(request.headers()["x-codex-turn-state"], "manual-state");
+                assert!(!request.headers().contains_key("x-codex-turn-state"));
                 response.headers_mut().insert(
                     "sec-websocket-extensions",
                     "permessage-deflate".parse().unwrap(),
@@ -4770,7 +4788,7 @@ async fn global_turn_state_should_refresh_metadata_on_reused_websocket() {
                     .insert("x-codex-turn-state", "a".repeat(292).parse().unwrap());
             })
             .await;
-        for (index, expected) in ["manual-state".to_owned(), "a".repeat(292), "b".repeat(292)]
+        for (index, expected) in [Value::Null, json!("a".repeat(292)), json!("b".repeat(292))]
             .into_iter()
             .enumerate()
         {

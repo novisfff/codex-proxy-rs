@@ -2114,7 +2114,7 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .unwrap()
         .unwrap();
     let configuration = configuration.expose_to_provider().expose_to_provider();
-    assert_eq!(configuration.len(), 2);
+    assert_eq!(configuration.len(), 3);
     assert_eq!(
         configuration.get("base_url"),
         Some(&json!("https://first.example/v1"))
@@ -2124,7 +2124,7 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .prepare_rotation(PrepareCredentialRotation {
             account: account_record(&account),
             provider_material: ProviderDocument::new(OpaqueProviderData::new(
-                json!({"base_url":"https://second.example/root", "transport":"prefer_websocket"})
+                json!({"base_url":"https://second.example/root", "transport":"prefer_websocket", "codex_turn_state":{"mode":"auto","value":""}})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -2138,6 +2138,10 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         .expose_to_provider()
         .expose_to_provider();
     assert_eq!(material.get("api_key"), Some(&json!("sk-api-test-only")));
+    assert_eq!(
+        material.get("codex_turn_state"),
+        Some(&json!({"mode":"auto","value":""}))
+    );
     assert_eq!(
         material.get("base_url"),
         Some(&json!("https://second.example/root"))
@@ -2193,14 +2197,16 @@ async fn oauth_base_url_configuration_preserves_tokens_and_validates_address() {
         .unwrap();
     assert_eq!(
         configuration.expose_to_provider().expose_to_provider(),
-        json!({"openai_base_url": null}).as_object().unwrap()
+        json!({"openai_base_url": null, "codex_turn_state":{"mode":"default","value":""}})
+            .as_object()
+            .unwrap()
     );
     for base_url in ["https://gateway.example/backend-api/", ""] {
         let prepared = admin
             .prepare_rotation(PrepareCredentialRotation {
                 account: account_record(&account),
                 provider_material: ProviderDocument::new(OpaqueProviderData::new(
-                    json!({"openai_base_url":base_url})
+                    json!({"openai_base_url":base_url,"codex_turn_state":{"mode":"manual","value":"account-state"}})
                         .as_object()
                         .unwrap()
                         .clone(),
@@ -2214,6 +2220,10 @@ async fn oauth_base_url_configuration_preserves_tokens_and_validates_address() {
             .expose_to_provider()
             .expose_to_provider();
         assert_eq!(material.get("access_token"), Some(&json!("gateway-access")));
+        assert_eq!(
+            material.get("codex_turn_state"),
+            Some(&json!({"mode":"manual","value":"account-state"}))
+        );
         assert_eq!(
             material.get("openai_base_url"),
             (!base_url.is_empty())
@@ -2265,7 +2275,7 @@ async fn oauth_base_url_configuration_preserves_tokens_and_validates_address() {
         .unwrap();
     assert_eq!(
         configuration.expose_to_provider().expose_to_provider(),
-        json!({"openai_base_url":"https://gateway.example/root"})
+        json!({"openai_base_url":"https://gateway.example/root", "codex_turn_state":{"mode":"default","value":""}})
             .as_object()
             .unwrap()
     );

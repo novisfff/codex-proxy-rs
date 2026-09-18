@@ -2,6 +2,7 @@
 import type { AccountRow } from '../constants'
 import type { ApiKeyAccountForm } from '../utils/upstreamApiKey'
 import type { AccountGroup, AccountModelAccess } from '@/api'
+import type { CodexTurnStateConfig } from '@/api/modules/settings'
 
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseFormItem from '@/components/base/BaseForm/FormItem.vue'
@@ -13,6 +14,7 @@ import AccountApiKeyFields from './AccountApiKeyFields.vue'
 import AccountIdentityCell from './AccountIdentityCell.vue'
 import AccountPlanBadge from './AccountPlanBadge.vue'
 import AccountSettingsFields from './AccountSettingsFields.vue'
+import AccountTurnStateCard from './AccountTurnStateCard.vue'
 
 defineProps<{
   account: AccountRow | null
@@ -30,6 +32,7 @@ const emit = defineEmits<{
 const open = defineModel<boolean>({ required: true })
 const apiKey = defineModel<ApiKeyAccountForm>('apiKey', { required: true })
 const openaiBaseUrl = defineModel<string>('openaiBaseUrl', { required: true })
+const codexTurnState = defineModel<CodexTurnStateConfig>('codexTurnState', { required: true })
 const notes = defineModel<string>('notes', { required: true })
 const enabled = defineModel<boolean>('enabled', { required: true })
 const concurrencyLimit = defineModel<string>('concurrencyLimit', { required: true })
@@ -83,6 +86,14 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           </p>
         </BaseFormItem>
       </section>
+
+      <AccountTurnStateCard
+        v-if="open && account.provider === 'openai' && configurationReady"
+        :key="account.id"
+        v-model="codexTurnState"
+        :account-id="account.id"
+        :disabled="saving"
+      />
 
       <AccountSettingsFields
         v-model:enabled="enabled"
