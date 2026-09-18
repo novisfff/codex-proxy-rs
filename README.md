@@ -12,15 +12,26 @@
 [![GHCR](https://img.shields.io/badge/GHCR-codex--proxy--rs-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/zyycn/codex-proxy-rs/pkgs/container/codex-proxy-rs)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 
-[快速开始](#快速开始) · [客户端接入](#客户端接入) · [文档](#文档) · [社区](#社区) · [许可证](#许可证)
+[快速预览](#快速预览) · [快速开始](#快速开始) · [客户端接入](#客户端接入) · [文档](#文档) · [社区](#社区) · [许可证](#许可证)
 
 </div>
 
 > [!NOTE]
 > 本项目提供 Responses API，不支持 `/v1/chat/completions`。接入前请确认客户端支持 Responses 协议。
 
-> Codex 降智缓解实验单独维护于[实验分支](https://github.com/zyycn/codex-proxy-rs/tree/experimental/codex-anti-degradation)，
-> 使用[独立实验构建与数据目录](https://github.com/zyycn/codex-proxy-rs/blob/experimental/codex-anti-degradation/deploy/experimental.md)，不包含在正式版中。
+## 快速预览
+
+无需部署，打开 [快速预览服务](https://codex-proxy-rs.ainz.cc) 即可体验管理端的系统概览、账号分组、代理管理与用量统计。
+
+| 登录信息 | 值 |
+| --- | --- |
+| 地址 | <https://codex-proxy-rs.ainz.cc> |
+| 登录身份 | 管理员 |
+| 账号 | `admin@cpr.local` |
+| 密码 | `039c18de2aeac46d23ead7766bb07bbbe3747233c66a128e` |
+
+预览服务运行已发布版本，展示的账号、代理与使用记录均为模拟数据，每天北京时间 `00:00` 自动生成当天数据。
+这是公开共享的功能预览环境，不提供真实模型调用；请勿导入真实账号、密钥或其他敏感信息。
 
 ## 快速开始
 
