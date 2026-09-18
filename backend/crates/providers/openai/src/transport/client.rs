@@ -673,6 +673,27 @@ pub struct CodexBackendClient {
 }
 
 impl CodexBackendClient {
+    pub(crate) fn with_base_url(mut self, base_url: Option<&str>) -> Self {
+        if let Some(base_url) = base_url {
+            self.base_url = base_url.trim_end_matches('/').to_owned();
+            self.websocket_origin_key = format!(
+                "{}:{}",
+                websocket_origin_key(&self.base_url),
+                self.egress_key
+            );
+        }
+        self
+    }
+
+    pub(crate) fn request_url(&self, path: &str) -> Result<url::Url, url::ParseError> {
+        let path = if path == super::endpoints::CODEX_RESPONSES_PATH {
+            self.protocol.responses_path()
+        } else {
+            path
+        };
+        url::Url::parse(&super::endpoints::endpoint_url(&self.base_url, path))
+    }
+
     pub(crate) fn with_authentication(
         mut self,
         authentication: &crate::credential::CodexRuntimeAuthentication,

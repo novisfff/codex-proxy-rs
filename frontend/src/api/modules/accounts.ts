@@ -644,12 +644,24 @@ export interface ApiKeyConfiguration {
   transport: 'http' | 'prefer_websocket'
 }
 
+export interface OAuthConfiguration {
+  openai_base_url: string | null
+}
+
 export function getAccountDetail(data: AccountIdParam, options: RequestOptions = {}) {
-  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration }>({
+  return request<{ account: Account, credentialConfiguration?: ApiKeyConfiguration | OAuthConfiguration }>({
     url: '/api/admin/accounts/detail',
     method: 'GET',
     params: data,
     ...options,
+  })
+}
+
+export function updateAccountOpenAiBaseUrl(data: { accountId: string, openaiBaseUrl: string, settings: AccountUpdateParam }) {
+  return request<{ accountId: string }>({
+    url: '/api/admin/accounts/rotate',
+    method: 'POST',
+    data: { provider: 'openai', ...data },
   })
 }
 

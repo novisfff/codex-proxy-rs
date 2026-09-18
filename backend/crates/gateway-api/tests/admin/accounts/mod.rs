@@ -678,6 +678,28 @@ mod actions {
     }
 
     #[test]
+    fn oauth_base_url_rotation_accepts_reset_and_rejects_mixed_credentials() {
+        for base_url in ["", "https://gateway.example/backend-api"] {
+            let request: RotateAccountRequest = serde_json::from_value(json!({
+                "provider":"openai", "accountId":"acct_1", "openaiBaseUrl":base_url,
+            }))
+            .unwrap();
+            assert!(request.validate().is_ok());
+        }
+        for (key, value) in [
+            ("accessToken", "token"),
+            ("baseUrl", "https://example.com"),
+            ("transport", "http"),
+            ("apiKey", "key"),
+        ] {
+            let mut body = json!({"provider":"openai", "accountId":"acct_1", "openaiBaseUrl":""});
+            body[key] = json!(value);
+            let request: RotateAccountRequest = serde_json::from_value(body).unwrap();
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
     fn credential_mutation_response_should_not_expose_internal_revision() {
         let response = AccountMutationData::from(CredentialMutationResult {
             config_revision: Revision::new(8).expect("config revision"),

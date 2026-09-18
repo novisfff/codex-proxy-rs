@@ -73,7 +73,7 @@ const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
-    turn_state: crate::provider::turn_state::GlobalTurnState,
+    turn_state: crate::provider::turn_state::TurnStateCache,
     provider_kind: ProviderKind,
     profile: CodexWireProfileState,
     accounts: Arc<dyn ProviderAccountStore>,
@@ -87,7 +87,7 @@ pub(crate) struct OpenAiAdminProvider {
 }
 
 pub(crate) struct OpenAiAdminServices {
-    pub(crate) turn_state: crate::provider::turn_state::GlobalTurnState,
+    pub(crate) turn_state: crate::provider::turn_state::TurnStateCache,
     pub(crate) credentials: Arc<CodexCredentialAdminService>,
     pub(crate) oauth: Arc<dyn CodexOAuthAdmin>,
     pub(crate) profile_statistics: Arc<CodexCredentialProfileService>,
@@ -166,7 +166,7 @@ impl OpenAiAdminProvider {
 
 #[async_trait]
 impl ProviderAdmin for OpenAiAdminProvider {
-    fn automatic_turn_state(&self) -> Option<gateway_admin::model::settings::AutomaticTurnState> {
+    fn automatic_turn_state(&self) -> Vec<gateway_admin::model::settings::AutomaticTurnState> {
         self.turn_state.snapshot()
     }
 
@@ -434,6 +434,16 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 .map_err(map_credential_admin_error)?;
             return prepared_rotation(prepared, command.account.provider_kind);
         }
+        let material = command
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        if material.contains_key("openai_base_url") {
+            let prepared = CodexCredentialAdmin
+                .prepare_oauth_base_url_rotation(current, Value::Object(material.clone()))
+                .map_err(map_credential_admin_error)?;
+            return prepared_rotation(prepared, command.account.provider_kind);
+        }
         let mut secret = rotation_secret(command.provider_material)?;
         if secret.id_token.is_none() {
             let runtime = CodexCredentialCodec::decode(&current.credential)
@@ -483,23 +493,22 @@ impl ProviderAdmin for OpenAiAdminProvider {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<Option<ProviderDocument>, ProviderAdminError> {
-        let account = self.account(account_id).await?;
-        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
-            return Ok(None);
-        }
         let current = self
             .accounts
             .load_current_credential(account_id)
             .await
             .map_err(map_store_error)?;
-        let crate::credential::CodexCredentialData::ApiKey(data) =
-            CodexCredentialCodec::decode_complete(&current.credential)
-                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?
-        else {
-            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+        let value = match CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?
+        {
+            crate::credential::CodexCredentialData::ApiKey(data) => {
+                serde_json::to_value(data.configuration())
+                    .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?
+            }
+            crate::credential::CodexCredentialData::OAuth(data) => serde_json::json!({
+                "openai_base_url": data.openai_base_url,
+            }),
         };
-        let value = serde_json::to_value(data.configuration())
-            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
         let object = value
             .as_object()
             .cloned()

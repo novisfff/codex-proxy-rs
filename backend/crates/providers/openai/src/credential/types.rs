@@ -287,6 +287,8 @@ pub const CODEX_AUTHENTICATION_KIND_OAUTH: &str = "oauth";
 pub struct CodexOAuthCredentialData {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,
     pub access_token: String,

@@ -17,6 +17,7 @@ const MAX_COOKIES: usize = 128;
 
 /// 已解析且只在 Provider 内可见的认证材料。
 pub struct CodexRuntimeCredential {
+    pub openai_base_url: Option<String>,
     pub authentication: CodexRuntimeAuthentication,
     pub principal: Option<CodexCredentialPrincipal>,
     pub installation_id: String,
@@ -122,6 +123,7 @@ impl CodexCredentialCodec {
     ) -> Result<PlaintextCredential, CodexCredentialDataError> {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
+            openai_base_url: None,
             principal,
             installation_id,
             access_token: secret.access_token.expose_secret().to_owned(),
@@ -172,6 +174,10 @@ impl CodexCredentialCodec {
         let data = serde_json::from_value::<CodexCredentialData>(value)
             .map_err(|_| CodexCredentialDataError::Invalid)?;
         validate(&data)?;
+        let openai_base_url = match &data {
+            CodexCredentialData::OAuth(data) => data.openai_base_url.clone(),
+            CodexCredentialData::ApiKey(_) => None,
+        };
         let (authentication, principal, installation_id, cookies, oauth_client_id, oauth_scope) =
             match data {
                 CodexCredentialData::ApiKey(data) => (
@@ -199,6 +205,7 @@ impl CodexCredentialCodec {
                 ),
             };
         Ok(CodexRuntimeCredential {
+            openai_base_url,
             authentication,
             principal,
             installation_id,
@@ -238,6 +245,7 @@ impl CodexCredentialCodec {
         match (&mut incoming, existing) {
             (CodexCredentialData::OAuth(incoming), CodexCredentialData::OAuth(existing)) => {
                 incoming.installation_id = existing.installation_id;
+                incoming.openai_base_url = existing.openai_base_url;
             }
             (CodexCredentialData::ApiKey(incoming), CodexCredentialData::ApiKey(existing)) => {
                 incoming.installation_id = existing.installation_id;
@@ -259,6 +267,13 @@ fn validate(data: &CodexCredentialData) -> Result<(), CodexCredentialDataError> 
     let (installation_id, cookies) = match data {
         CodexCredentialData::ApiKey(_) => return Err(CodexCredentialDataError::Invalid),
         CodexCredentialData::OAuth(data) => {
+            if data.openai_base_url.as_ref().is_some_and(|value| {
+                value.len() > 2048
+                    || value.chars().any(char::is_control)
+                    || !crate::transport::valid_upstream_base_url(value)
+            }) {
+                return Err(CodexCredentialDataError::Invalid);
+            }
             if data.schema_version != CODEX_CREDENTIAL_SCHEMA_VERSION {
                 return Err(CodexCredentialDataError::Invalid);
             }

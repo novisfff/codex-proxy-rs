@@ -2,13 +2,13 @@ import type { Ref } from 'vue'
 import type { AccountModelAccess, ApiKeyConfiguration, getAccounts } from '@/api'
 
 import { computed, ref, shallowRef, watch } from 'vue'
-import { getAccountDetail, updateAccount, updateAccountApiKey } from '@/api'
+import { getAccountDetail, updateAccount, updateAccountApiKey, updateAccountOpenAiBaseUrl } from '@/api'
 import { toast } from '@/components/base/BaseToast'
 import { useAsyncAction } from '@/composables/useAsyncAction'
 import { useRequestState } from '@/composables/useRequestState'
 import { accountModelAccessError } from '../utils/modelAccess'
 import { concurrencyLimitInput, parseAccountSchedulingForm } from '../utils/schedulingForm'
-import { apiKeyAccountError, emptyApiKeyAccountForm } from '../utils/upstreamApiKey'
+import { apiKeyAccountError, emptyApiKeyAccountForm, upstreamBaseUrlError } from '../utils/upstreamApiKey'
 
 type AccountRow = Awaited<ReturnType<typeof getAccounts>>['items'][number]
 
@@ -34,6 +34,8 @@ export function useAccountEditor(options: {
   const configurationLoading = configurationRequest.loading
   const configurationReady = shallowRef(false)
   const savedConfiguration = shallowRef<ApiKeyConfiguration>()
+  const openaiBaseUrl = shallowRef('')
+  const savedOpenaiBaseUrl = shallowRef('')
 
   async function loadConfiguration(accountId: string) {
     const requestId = configurationRequest.start()
@@ -42,9 +44,15 @@ export function useAccountEditor(options: {
       if (!configurationRequest.isCurrent(requestId))
         return
       if (!detail.credentialConfiguration)
-        throw new Error('该账号没有 API Key 上游设置')
-      apiKey.value = { ...emptyApiKeyAccountForm(), ...detail.credentialConfiguration }
-      savedConfiguration.value = detail.credentialConfiguration
+        throw new Error('该账号没有上游设置')
+      if ('base_url' in detail.credentialConfiguration) {
+        apiKey.value = { ...emptyApiKeyAccountForm(), ...detail.credentialConfiguration }
+        savedConfiguration.value = detail.credentialConfiguration
+      }
+      else {
+        openaiBaseUrl.value = detail.credentialConfiguration.openai_base_url ?? ''
+        savedOpenaiBaseUrl.value = openaiBaseUrl.value
+      }
       configurationReady.value = true
     }
     catch (error) {
@@ -74,10 +82,12 @@ export function useAccountEditor(options: {
     modelAccess.value = { ...account.modelAccess, models: [...account.modelAccess.models] }
     selectedGroupIds.value = account.groups.map(group => group.id)
     apiKey.value = emptyApiKeyAccountForm()
+    openaiBaseUrl.value = ''
+    savedOpenaiBaseUrl.value = ''
     savedConfiguration.value = undefined
     configurationReady.value = false
     showEditModal.value = true
-    if (account.authenticationKind === 'api_key')
+    if (account.provider === 'openai')
       void loadConfiguration(account.id)
   }
 
@@ -86,6 +96,16 @@ export function useAccountEditor(options: {
     if (!accountId || saving.value)
       return
     const isApiKey = editingAccount.value?.authenticationKind === 'api_key'
+    const isOpenAi = editingAccount.value?.provider === 'openai'
+    if (isOpenAi && !configurationReady.value)
+      return
+    if (isOpenAi && !isApiKey && openaiBaseUrl.value.trim()) {
+      const error = upstreamBaseUrlError(openaiBaseUrl.value.trim())
+      if (error) {
+        toast.warning(error)
+        return
+      }
+    }
     if (isApiKey) {
       if (!configurationReady.value)
         return
@@ -129,6 +149,9 @@ export function useAccountEditor(options: {
       if (connectionChanged) {
         await updateAccountApiKey({ accountId, baseUrl: apiKey.value.base_url.trim(), transport: apiKey.value.transport, apiKey: apiKey.value.apiKey || undefined, settings })
       }
+      else if (isOpenAi && !isApiKey && openaiBaseUrl.value.trim() !== savedOpenaiBaseUrl.value) {
+        await updateAccountOpenAiBaseUrl({ accountId, openaiBaseUrl: openaiBaseUrl.value.trim(), settings })
+      }
       else {
         await updateAccount(settings)
       }
@@ -157,6 +180,7 @@ export function useAccountEditor(options: {
   })
 
   return {
+    openaiBaseUrl,
     apiKey,
     configurationLoading,
     configurationReady,

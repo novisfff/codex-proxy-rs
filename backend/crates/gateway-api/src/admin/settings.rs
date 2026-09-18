@@ -401,6 +401,8 @@ where
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AutomaticTurnStateView {
+    account_id: String,
+    model: String,
     value: String,
     acquired_at: DateTime<Utc>,
 }
@@ -412,10 +414,17 @@ where
     let current = state.admin_services().openai().automatic_turn_state();
     AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(current.map(|current| AutomaticTurnStateView {
-            value: current.value,
-            acquired_at: current.acquired_at,
-        })),
+        AdminEnvelope::ok(
+            current
+                .into_iter()
+                .map(|current| AutomaticTurnStateView {
+                    account_id: current.account_id,
+                    model: current.model,
+                    value: current.value,
+                    acquired_at: current.acquired_at,
+                })
+                .collect::<Vec<_>>(),
+        ),
     )
 }
 

@@ -80,12 +80,14 @@ export function getSettings(options: RequestOptions = {}) {
 }
 
 export interface AutomaticTurnState {
+  accountId: string
+  model: string
   value: string
   acquiredAt: string
 }
 
 export function getAutomaticTurnState(options: RequestOptions = {}) {
-  return request<AutomaticTurnState | null>({
+  return request<AutomaticTurnState[]>({
     url: '/api/admin/settings/turn-state',
     method: 'GET',
     ...options,

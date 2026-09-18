@@ -14,6 +14,8 @@ pub type ModelMappings = BTreeMap<PublicModelId, UpstreamModelId>;
 /// Provider 当前用于自动覆盖的状态；只允许管理员读取，不进入日志。
 #[derive(Clone, PartialEq, Eq)]
 pub struct AutomaticTurnState {
+    pub account_id: String,
+    pub model: String,
     pub value: String,
     pub acquired_at: DateTime<Utc>,
 }
@@ -22,6 +24,8 @@ impl fmt::Debug for AutomaticTurnState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AutomaticTurnState")
+            .field("account_id", &self.account_id)
+            .field("model", &self.model)
             .field("value", &"[REDACTED]")
             .field("acquired_at", &self.acquired_at)
             .finish()

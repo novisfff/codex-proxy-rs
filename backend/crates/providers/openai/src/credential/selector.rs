@@ -676,6 +676,15 @@ impl CodexCredentialSelector {
                             "OpenAI account selected"
                         );
                         let runtime = self.repository.load_runtime_credential(&account).await?;
+                        let request_url = runtime.openai_base_url.as_ref().and_then(|base_url| {
+                            let (_, resource) =
+                                request.request_url.path().rsplit_once("/codex/")?;
+                            Url::parse(&crate::transport::endpoint_url(
+                                base_url,
+                                &format!("/codex/{resource}"),
+                            ))
+                            .ok()
+                        });
                         let cookies = runtime
                             .cookies
                             .into_iter()
@@ -684,7 +693,7 @@ impl CodexCredentialSelector {
                                     .expires_at
                                     .is_none_or(|expires| expires > chrono::Utc::now())
                                     && self.cookie_policy.may_replay(
-                                        request.request_url,
+                                        request_url.as_ref().unwrap_or(request.request_url),
                                         &cookie.domain,
                                         &cookie.path,
                                         cookie.host_only,
@@ -708,6 +717,7 @@ impl CodexCredentialSelector {
                             );
                         }
                         return Ok(CodexCredentialLease {
+                            openai_base_url: runtime.openai_base_url,
                             installation_id: runtime.installation_id,
                             account,
                             authentication: runtime.authentication,
@@ -1353,6 +1363,7 @@ impl fmt::Debug for CodexCredentialSelector {
 }
 
 pub struct CodexCredentialLease {
+    openai_base_url: Option<String>,
     account: ProviderAccount,
     authentication: CodexRuntimeAuthentication,
     cookies: Vec<RuntimeCodexCookie>,
@@ -1366,6 +1377,10 @@ pub struct CodexCredentialLease {
 }
 
 impl CodexCredentialLease {
+    pub(crate) fn openai_base_url(&self) -> Option<&str> {
+        self.openai_base_url.as_deref()
+    }
+
     #[must_use]
     pub const fn account(&self) -> &ProviderAccount {
         &self.account

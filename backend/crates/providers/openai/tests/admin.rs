@@ -2163,3 +2163,132 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
         ProviderAdminErrorKind::Unsupported
     );
 }
+
+#[tokio::test]
+async fn oauth_base_url_configuration_preserves_tokens_and_validates_address() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_gateway".to_owned(),
+            name: "gateway".to_owned(),
+            secret: secret("gateway-access"),
+            verified_account: profile("gateway-account"),
+            next_refresh_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let account = store.account("acct_gateway").unwrap();
+    let config = valid_config();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .unwrap();
+    let admin = bundle.admin_provider();
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        configuration.expose_to_provider().expose_to_provider(),
+        json!({"openai_base_url": null}).as_object().unwrap()
+    );
+    for base_url in ["https://gateway.example/backend-api/", ""] {
+        let prepared = admin
+            .prepare_rotation(PrepareCredentialRotation {
+                account: account_record(&account),
+                provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                    json!({"openai_base_url":base_url})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                )),
+            })
+            .await
+            .unwrap();
+        let material = prepared
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider();
+        assert_eq!(material.get("access_token"), Some(&json!("gateway-access")));
+        assert_eq!(
+            material.get("openai_base_url"),
+            (!base_url.is_empty())
+                .then(|| json!(base_url.trim_end_matches('/')))
+                .as_ref()
+        );
+        assert_eq!(
+            prepared.facts().next_refresh_at,
+            account
+                .next_refresh_at()
+                .map(chrono::DateTime::<chrono::Utc>::from)
+        );
+        assert!(prepared.facts().preserve_profile);
+    }
+    for base_url in [
+        "https://user:password@example.com",
+        "https://example.com?key=value",
+        "ftp://example.com",
+        "http://example.com",
+        "invalid",
+        "/",
+    ] {
+        assert!(
+            admin
+                .prepare_rotation(PrepareCredentialRotation {
+                    account: account_record(&account),
+                    provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                        json!({"openai_base_url":base_url})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    )),
+                })
+                .await
+                .is_err(),
+            "{base_url}"
+        );
+    }
+    store
+        .set_openai_base_url(
+            "acct_gateway",
+            Some("https://gateway.example/root".to_owned()),
+        )
+        .await;
+    let configuration = admin
+        .account_configuration(account.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        configuration.expose_to_provider().expose_to_provider(),
+        json!({"openai_base_url":"https://gateway.example/root"})
+            .as_object()
+            .unwrap()
+    );
+    let account = store.account("acct_gateway").unwrap();
+    let refreshed = admin
+        .prepare_rotation(PrepareCredentialRotation {
+            account: account_record(&account),
+            provider_material: ProviderDocument::new(OpaqueProviderData::new(
+                json!({"access_token":"new-access", "refresh_token":"new-refresh"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed
+            .facts()
+            .provider_material
+            .expose_to_provider()
+            .expose_to_provider()
+            .get("openai_base_url"),
+        Some(&json!("https://gateway.example/root"))
+    );
+}

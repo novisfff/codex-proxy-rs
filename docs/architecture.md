@@ -142,7 +142,8 @@ WS 路由提示属于握手，连接复用时不重发；档位变化不重建�
 
 管理员的 Codex Turn State 覆盖配置通过同一快照链路冻结，OpenAI Provider 在账号状态隔离完成后应用。
 默认仍遵循客户端状态的账号归属；显式手动或自动模式允许覆盖该状态。自动模式的最新 292 字节值由
-OpenAI Provider 在进程内跨账号、会话共享，响应头与 WS 元数据共同更新，重启清空。
+OpenAI Provider 按实际账号 ID 与发送的上游模型名在进程内隔离，同一组合跨会话复用，不区分思考强度。
+响应头与 WS 元数据仅更新本次请求的组合；自动模式未命中时清除原始透传状态，重启清空缓存。
 
 `engine::observation` 统一维护单次响应的用量、费用、时间和响应 ID，并负责重试前清理；协调器继续
 独占发送、提交、重试和终结顺序。Provider 上报费用优先于本地估算，丢弃的 attempt 不得污染最终计量。
@@ -210,6 +211,8 @@ OpenAI 的 OAuth 与 API Key 共用现有账号和事务。API Key 的 Base URL�
 上游用户 ID 推断可用性；OAuth 未完成身份投影时由 Provider 保持 `unknown`。状态恢复和未补齐身份的凭据轮换保留 `unknown`。
 API Key 默认 HTTP/SSE，可选 WS 优先；选号先验证传输资格，WS pool 与 continuation 按凭据版本隔离。
 OAuth 与 API Key 共用业务请求、响应和能力透传链路，差异限定在上游地址、认证与传输配置。
+OAuth 账号可在凭据 JSON 中保存 `openai_base_url`，覆盖模型请求的默认网关；令牌刷新和重新授权保留此配置。
+WebSocket 连接池按实际 Base URL 隔离，修改地址后的 continuation 要求重放，Cookie 按实际请求地址校验作用域。
 OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配置的模型权限仍由 Core 与选号链路执行。
 
 - OpenAI 是透明边界。Responses 请求保留未知字段和字段顺序；SSE、WebSocket、Images 与 standalone

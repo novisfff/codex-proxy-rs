@@ -323,6 +323,7 @@ pub struct RotateAccountRequest {
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
     pub base_url: Option<String>,
+    pub openai_base_url: Option<String>,
     pub api_key: Option<String>,
     pub transport: Option<String>,
     pub settings: Option<UpdateAccountRequest>,
@@ -340,7 +341,20 @@ impl RotateAccountRequest {
                 return Err(WireValidationError::new("settings.accountId"));
             }
         }
-        if let Some(base_url) = &self.base_url {
+        if let Some(base_url) = &self.openai_base_url {
+            if self.base_url.is_some()
+                || self.api_key.is_some()
+                || self.transport.is_some()
+                || self.access_token.is_some()
+                || self.refresh_token.is_some()
+                || self.id_token.is_some()
+                || base_url.len() > 2048
+                || base_url.chars().any(char::is_control)
+            {
+                return Err(WireValidationError::new("openaiBaseUrl"));
+            }
+            Ok(())
+        } else if let Some(base_url) = &self.base_url {
             if self.access_token.is_some()
                 || self.refresh_token.is_some()
                 || self.id_token.is_some()
@@ -376,7 +390,9 @@ impl RotateAccountRequest {
     ) -> Result<RotateCredential, WireValidationError> {
         self.validate()?;
         let mut material = Map::new();
-        if let Some(base_url) = self.base_url {
+        if let Some(base_url) = self.openai_base_url {
+            material.insert("openai_base_url".to_owned(), Value::String(base_url));
+        } else if let Some(base_url) = self.base_url {
             material.insert("base_url".to_owned(), Value::String(base_url));
             material.insert(
                 "transport".to_owned(),

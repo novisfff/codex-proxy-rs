@@ -83,7 +83,7 @@ async fn automatic_turn_state_should_require_admin_and_report_empty_cache() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response_json(response).await["data"].is_null());
+    assert_eq!(response_json(response).await["data"], json!([]));
 }
 
 #[test]

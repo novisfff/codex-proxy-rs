@@ -49,6 +49,34 @@ pub(crate) struct MemoryAccountStore {
 }
 
 impl MemoryAccountStore {
+    pub(crate) async fn set_openai_base_url(&self, id: &str, base_url: Option<String>) {
+        let id = ProviderAccountId::new(id).unwrap();
+        let current = self.load_current_credential(&id).await.unwrap();
+        let mut data =
+            provider_openai::credential::CodexCredentialCodec::decode_complete(&current.credential)
+                .unwrap();
+        data.oauth_mut().unwrap().openai_base_url = base_url;
+        let credential =
+            provider_openai::credential::CodexCredentialCodec::encode_complete(data).unwrap();
+        let update = CredentialCasUpdate::new(
+            id.clone(),
+            current.account.revision(),
+            ProviderAccountUpdate {
+                account_id: id,
+                name: current.account.name().to_owned(),
+                email: current.account.email().map(str::to_owned),
+                plan_type: current.account.plan_type().map(str::to_owned),
+            },
+            credential,
+            current.account.has_refresh_token(),
+            current.account.access_token_expires_at(),
+            current.account.next_refresh_at(),
+        )
+        .unwrap()
+        .preserving_profile();
+        self.compare_and_swap_credential(update).await.unwrap();
+    }
+
     pub(crate) fn repository(self: &Arc<Self>) -> CodexCredentialRepository {
         CodexCredentialRepository::new(self.clone())
     }

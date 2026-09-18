@@ -14,7 +14,7 @@ import { formatDateTime } from '@/utils/date'
 
 defineProps<{ disabled: boolean }>()
 const model = defineModel<CodexTurnStateConfig>({ required: true })
-const current = ref<AutomaticTurnState | null>(null)
+const current = ref<AutomaticTurnState[]>([])
 const loading = ref(false)
 const error = ref(false)
 const loaded = ref(false)
@@ -39,7 +39,7 @@ async function refresh() {
   catch {
     if (!pending.signal.aborted) {
       error.value = true
-      current.value = null
+      current.value = []
     }
   }
   finally {
@@ -53,7 +53,7 @@ async function refresh() {
 watch(() => model.value.mode, (mode) => {
   clearTimeout(timer)
   controller?.abort()
-  current.value = null
+  current.value = []
   loaded.value = false
   error.value = false
   if (mode === 'auto')
@@ -100,29 +100,36 @@ function setMode(mode: string) {
       <BaseFormItem v-if="model.mode === 'auto'" label="自动模式使用值">
         <div class="min-w-0 space-y-2">
           <div class="flex flex-wrap items-center gap-2">
-            <span v-if="current" class="text-cp-sm text-cp-text-secondary">
-              292 字节 · 获取时间：{{ formatDateTime(current.acquiredAt) }}
-            </span>
             <BaseIconButton label="刷新自动请求头" :disabled="loading" @click="refresh">
               <RefreshCw class="size-4" />
-            </BaseIconButton>
-            <BaseIconButton
-              label="复制自动 X-Codex-Turn-State"
-              :disabled="!current"
-              @click="copyText(current?.value ?? '', { successText: 'X-Codex-Turn-State 已复制' })"
-            >
-              <Copy class="size-4" />
             </BaseIconButton>
           </div>
           <p v-if="error" role="status" class="text-cp-sm text-cp-text-secondary">
             读取失败，正在重试；也可点击刷新。
           </p>
-          <pre v-else-if="current" class="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-cp-sm text-cp-text">{{ current.value }}</pre>
+          <div v-else-if="current.length" class="max-h-96 space-y-4 overflow-auto">
+            <div v-for="entry in current" :key="JSON.stringify([entry.accountId, entry.model])" class="space-y-2 rounded-lg bg-cp-input-bg p-3">
+              <div class="flex flex-wrap items-center gap-2 text-cp-sm text-cp-text-secondary">
+                <span class="break-all">账号：{{ entry.accountId }}</span>
+                <span class="break-all">模型：{{ entry.model }}</span>
+                <BaseIconButton
+                  :label="`复制 ${entry.accountId} / ${entry.model} 的 X-Codex-Turn-State`"
+                  @click="copyText(entry.value, { successText: 'X-Codex-Turn-State 已复制' })"
+                >
+                  <Copy class="size-4" />
+                </BaseIconButton>
+              </div>
+              <p class="text-cp-xs text-cp-text-secondary">
+                292 字节 · 获取时间：{{ formatDateTime(entry.acquiredAt) }}
+              </p>
+              <pre class="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-cp-sm text-cp-text">{{ entry.value }}</pre>
+            </div>
+          </div>
           <p v-else class="text-cp-sm text-cp-text-secondary">
-            {{ loaded ? '尚未获取到 292 字节值，暂时沿用默认请求头。' : '正在读取…' }}
+            {{ loaded ? '尚未获取到 292 字节值，自动模式暂不携带此请求头。' : '正在读取…' }}
           </p>
           <p class="text-cp-xs text-cp-text-tertiary">
-            全站共用最新返回的 292 字节值，显示每 5 秒刷新。模式修改需保存后生效。
+            每个账号、每个上游模型分别使用最新的 292 字节值，不区分思考强度。未命中时不携带此头；显示每 5 秒刷新，模式修改需保存后生效。
           </p>
         </div>
       </BaseFormItem>

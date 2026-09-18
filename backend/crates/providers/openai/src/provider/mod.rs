@@ -101,7 +101,7 @@ mod observation;
 pub(crate) mod turn_state;
 mod workers;
 
-use turn_state::GlobalTurnState;
+use turn_state::TurnStateCache;
 
 use execution::*;
 #[doc(hidden)]
@@ -140,7 +140,7 @@ pub enum CodexProviderConfigError {
 }
 
 pub struct CodexProvider {
-    turn_state: GlobalTurnState,
+    turn_state: TurnStateCache,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -156,14 +156,12 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    pub(crate) fn turn_state_cache(&self) -> GlobalTurnState {
+    pub(crate) fn turn_state_cache(&self) -> TurnStateCache {
         self.turn_state.clone()
     }
 
     /// 管理端与请求发送读取同一份自动状态快照。
-    pub fn automatic_turn_state(
-        &self,
-    ) -> Option<gateway_admin::model::settings::AutomaticTurnState> {
+    pub fn automatic_turn_state(&self) -> Vec<gateway_admin::model::settings::AutomaticTurnState> {
         self.turn_state.snapshot()
     }
 
@@ -192,7 +190,7 @@ impl CodexProvider {
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
-            turn_state: GlobalTurnState::default(),
+            turn_state: TurnStateCache::default(),
             selector,
             catalog,
             quota,
@@ -433,9 +431,10 @@ impl Provider for CodexProvider {
         let lease = Arc::new(lease);
         // 首字计时的起点：账号选择完成之后、上游建立之前。
         if previous_session.as_ref().is_some_and(|state| {
-            state
-                .credential_revision
-                .is_some_and(|revision| revision != lease.account().revision().get())
+            state.openai_base_url.as_deref() != lease.openai_base_url()
+                || state
+                    .credential_revision
+                    .is_some_and(|revision| revision != lease.account().revision().get())
         }) {
             return Err(continuation_replay_required_error("scope_unavailable"));
         }
@@ -583,6 +582,7 @@ impl Provider for CodexProvider {
         let session_capture =
             (!continuation_requested || previous_session.is_some()).then(|| OpenAiSessionCapture {
                 account_id: lease.account_id().as_str().to_owned(),
+                openai_base_url: lease.openai_base_url().map(str::to_owned),
                 credential_revision: matches!(
                     lease.authentication(),
                     crate::credential::CodexRuntimeAuthentication::ApiKey(_)
@@ -603,16 +603,21 @@ impl Provider for CodexProvider {
             AttemptTransport::Retry(retry_index) => retry_index.get(),
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
+        let client = self
+            .client
+            .for_account(lease.account())
+            .map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+            .with_base_url(lease.openai_base_url())
+            .with_authentication(lease.authentication());
+        let response_origin = client.request_url(CODEX_RESPONSES_PATH).map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
         let events = cold_response_stream(ColdResponse {
             turn_state: self.turn_state.clone(),
-            client: self
-                .client
-                .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication()),
-            response_origin: self.responses_url.clone(),
+            client,
+            response_origin,
             request: upstream_request,
             upstream_model: upstream_model.clone(),
             transport_policy: transport,

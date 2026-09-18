@@ -363,7 +363,7 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `POST` | `/api/admin/accounts/import-tasks/stop` | `{ taskId }` | 跳过未开始的条目，已开始的条目继续完成 |
 | `POST` | `/api/admin/accounts/refresh` | `{ accountId }` | 手工刷新 OAuth credential（`idToken` / `accessToken` / `refreshToken`），不刷新额度 |
 | `POST` | `/api/admin/accounts/recover` | `{ accountId }` | 管理员显式清除该账号的本地错误/额度/cooldown 事实并重新启用，不访问上游 |
-| `POST` | `/api/admin/accounts/rotate` | OpenAI rotation 字段 | 更新指定 OpenAI 账号的 OAuth token 或 API Key 上游设置 |
+| `POST` | `/api/admin/accounts/rotate` | OpenAI rotation 字段 | 更新指定 OpenAI 账号的 OAuth token 或上游连接设置 |
 | `POST` | `/api/admin/accounts/update` | `{ accountId, enabled, concurrencyLimit, weight, groupIds, notes?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次更新账号备注、调度状态、并发上限（`null` 表示继承运行参数）、权重（1–100）、所属分组与出站代理 |
 | `POST` | `/api/admin/accounts/batch-update` | `{ accountIds, enabled?, concurrencyLimit?, weight?, groupIds?, modelAccess?, outboundProxyId?, outboundProxyUrl? }` | 一次事务更新所选账号；仅修改提供的字段，至少提供一项修改 |
 | `POST` | `/api/admin/accounts/delete` | `{ provider, accountIds }` | 批量删除 1–200 个账号 |
@@ -634,6 +634,13 @@ API Key rotation 使用 `{ provider: "openai", accountId, baseUrl, transport, ap
 rotation 可选携带 `settings`，字段与 `POST /api/admin/accounts/update` 相同，其中 `accountId` 必须与外层一致。
 凭据与设置在同一事务中保存，任一校验或持久化失败均不落库；省略 `settings` 保留现有分组、调度等设置。
 `GET /api/admin/accounts/detail` 对 API Key 账号额外返回 `credentialConfiguration: { base_url, transport }`，不回显密钥。
+
+OAuth 账号的详情返回 `credentialConfiguration: { openai_base_url }`，值为 `null` 时使用系统默认地址。
+通过 `POST /api/admin/accounts/rotate` 发送 `{ provider: "openai", accountId, openaiBaseUrl, settings? }`
+可修改该账号的模型请求网关；空字符串恢复默认，不能同时提交 token 或 API Key 配置。
+地址须为不含认证信息、查询参数或片段的 HTTPS 前缀（HTTP 仅允许本机联调），最多 2048 字节；
+请求自动追加 `/codex/responses`、`/codex/images/...` 等路径。HTTP/SSE 与 WebSocket 共用该地址，
+OAuth 授权、令牌刷新、模型目录和额度查询继续使用既有地址。
 更新会推进凭据 revision 并失效目录与连接；旧版本会话不可静默续接到新上游。
 
 OAuth start 使用：
@@ -971,12 +978,12 @@ accountAutoFreezeAdaptiveConcurrency
 
 - `default`：保持原有客户端状态及账号隔离行为。
 - `manual`：使用 `value` 覆盖请求中的 `X-Codex-Turn-State`；值必须为 1–8192 字节的可打印 ASCII 字符（不含空格）。
-- `auto`：全站共用最近收到的、恰好 292 字节的上游 `X-Codex-Turn-State`，跨账号和会话使用；其他长度或缺失值不覆盖缓存。首次获得有效值前保持默认行为。
+- `auto`：按实际选中的账号 ID 和发送给上游的模型名分别保存最新的 292 字节 `X-Codex-Turn-State`，思考强度不参与区分。同一组合跨会话复用；其他长度或缺失值不覆盖缓存。该组合尚无有效值时不携带此头，也不沿用客户端透传值。
 
 手动配置和模式持久化；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
 
 管理员可通过 `GET /api/admin/settings/turn-state` 读取自动模式使用的缓存：`data` 为
-`{ "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }`，尚未获取时为 `null`。
+`[{ "accountId": "...", "model": "gpt-5.4", "value": "...", "acquiredAt": "2026-09-18T08:00:00Z" }]`，尚未获取时为空数组。
 每次收到有效的 292 字节值都会同时更新值与获取时间，包括返回值与之前相同的情况；其他长度和缺失值保留原缓存及时间。
 该接口只读，不改变模式或手动配置，返回的原值仅供管理员查看和复制。
 

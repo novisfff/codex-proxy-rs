@@ -67,6 +67,91 @@ use crate::support::{
 use crate::transport::accept_codex_test_websocket;
 
 #[tokio::test]
+async fn oauth_base_url_routes_http_per_account_and_restores_default() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_gateway_a").await;
+    create_account(&store, "acct_gateway_b").await;
+    let default = MockServer::start().await;
+    let custom = MockServer::start().await;
+    for (server, endpoint, calls) in [
+        (&default, "/codex/responses", 2),
+        (&custom, "/prefix/codex/responses", 1),
+    ] {
+        Mock::given(method("POST")).and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_gateway\",\"status\":\"completed\",\"output\":[]}}\n\n",
+                "text/event-stream",
+            )).expect(calls).mount(server).await;
+    }
+    store
+        .set_openai_base_url("acct_gateway_a", Some(format!("{}/prefix", custom.uri())))
+        .await;
+    let provider = provider_with_base_url(&store, default.uri());
+    for (index, account) in ["acct_gateway_a", "acct_gateway_b", "acct_gateway_a"]
+        .into_iter()
+        .enumerate()
+    {
+        if index == 2 {
+            store.set_openai_base_url(account, None).await;
+        }
+        let mut stream = provider
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                diagnostic_context(&format!("req_gateway_{index}"), account),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+    default.verify().await;
+    custom.verify().await;
+}
+
+#[tokio::test]
+async fn oauth_base_url_routes_websocket_to_custom_gateway() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let default = MockServer::start().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/prefix", listener.local_addr().unwrap());
+    store
+        .set_openai_base_url("acct_provider_contract", Some(base_url))
+        .await;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut websocket =
+            crate::transport::accept_codex_test_websocket_with(socket, |request, response| {
+                assert_eq!(request.uri().path(), "/prefix/codex/responses");
+                response.headers_mut().insert(
+                    "sec-websocket-extensions",
+                    "permessage-deflate".parse().unwrap(),
+                );
+            })
+            .await;
+        websocket.next().await.unwrap().unwrap();
+        websocket.send(Message::Text(json!({"type":"response.completed","response":{"id":"resp_gateway_ws","status":"completed","output":[]}}).to_string().into())).await.unwrap();
+    });
+    let mut stream = provider_with_base_url(&store, default.uri())
+        .execute(
+            planned_request("openai", generate_operation()),
+            context("req_gateway_ws", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(default.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn responses_bill_sent_model_and_observe_unpriced_response_without_rewriting_it() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
@@ -582,8 +667,16 @@ fn http_generate_operation() -> Operation {
 }
 
 fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
+    planned_request_for_model(provider_name, operation, "gpt-5.4")
+}
+
+fn planned_request_for_model(
+    provider_name: &str,
+    operation: Operation,
+    model: &str,
+) -> ProviderRequest {
     let provider = ProviderKind::new(provider_name).expect("provider");
-    let upstream_model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
+    let upstream_model = UpstreamModelId::new(model).expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
     let account_scope = Arc::new(FrozenAccountScope::new(
         Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([(
@@ -4425,7 +4518,7 @@ async fn matching_turn_id_should_restore_previous_turn_state() {
 }
 
 #[tokio::test]
-async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
+async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoning() {
     use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
 
     let store = Arc::new(MemoryAccountStore::default());
@@ -4435,37 +4528,116 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
     let provider = provider_with_base_url(&store, server.uri());
     let first = "a".repeat(292);
     let latest = "b".repeat(292);
-    assert!(provider.automatic_turn_state().is_none());
-    for (index, (mode, returned, expected)) in [
-        (CodexTurnStateMode::Auto, Some(first.clone()), None),
+    assert!(provider.automatic_turn_state().is_empty());
+    let account_a = "acct_provider_contract";
+    let account_b = "acct_affinity_switch_b";
+    for (index, (account, model, effort, mode, returned, expected)) in [
         (
+            account_a,
+            "gpt-5.4",
+            "low",
+            CodexTurnStateMode::Auto,
+            Some(first.clone()),
+            None,
+        ),
+        (
+            account_b,
+            "gpt-5.4",
+            "low",
+            CodexTurnStateMode::Auto,
+            Some(latest.clone()),
+            None,
+        ),
+        (
+            account_a,
+            "gpt-5.5",
+            "low",
+            CodexTurnStateMode::Auto,
+            Some("c".repeat(292)),
+            None,
+        ),
+        (
+            account_a,
+            "gpt-5.4",
+            "high",
             CodexTurnStateMode::Auto,
             Some("x".repeat(291)),
             Some(first.clone()),
         ),
         (
+            account_a,
+            "gpt-5.4",
+            "low",
             CodexTurnStateMode::Auto,
             Some("x".repeat(293)),
             Some(first.clone()),
         ),
         (
-            CodexTurnStateMode::Manual,
+            account_a,
+            "gpt-5.4",
+            "high",
+            CodexTurnStateMode::Auto,
             Some(latest.clone()),
-            Some("manual-state".to_owned()),
+            Some(first.clone()),
         ),
-        (CodexTurnStateMode::Auto, None, Some(latest.clone())),
         (
+            account_a,
+            "gpt-5.4",
+            "low",
             CodexTurnStateMode::Auto,
             Some(latest.clone()),
             Some(latest.clone()),
         ),
-        (CodexTurnStateMode::Default, None, None),
+        (
+            account_b,
+            "gpt-5.4",
+            "high",
+            CodexTurnStateMode::Auto,
+            None,
+            Some(latest.clone()),
+        ),
+        (
+            account_a,
+            "gpt-5.5",
+            "high",
+            CodexTurnStateMode::Auto,
+            None,
+            Some("c".repeat(292)),
+        ),
+        (
+            account_b,
+            "gpt-5.5",
+            "low",
+            CodexTurnStateMode::Auto,
+            None,
+            None,
+        ),
+        (
+            account_a,
+            "gpt-5.4",
+            "low",
+            CodexTurnStateMode::Manual,
+            None,
+            Some("manual-state".to_owned()),
+        ),
+        (
+            account_a,
+            "gpt-5.4",
+            "low",
+            CodexTurnStateMode::Default,
+            None,
+            None,
+        ),
     ]
     .into_iter()
     .enumerate()
     {
         server.reset().await;
-        let before = provider.automatic_turn_state();
+        let before_all = provider.automatic_turn_state();
+        let before = before_all
+            .iter()
+            .find(|entry| entry.account_id == account && entry.model == model)
+            .cloned();
         let started = Utc::now();
         let returned_value = returned.clone();
         let mut response = ResponseTemplate::new(200)
@@ -4483,7 +4655,7 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
         let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
             ProtocolPayload::json_object(
                 "openai",
-                json!({"model":"gpt-5.4","input":"hello"})
+                json!({"model":model,"input":"hello","reasoning":{"effort":effort}})
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -4502,11 +4674,6 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
                 ),
             ])),
         ));
-        let account = if index % 2 == 0 {
-            "acct_provider_contract"
-        } else {
-            "acct_affinity_switch_b"
-        };
         let context = AttemptContext::new(
             RequestAttemptContext::new(
                 ModelRequestId::new(format!("req_global_state_{index}")).unwrap(),
@@ -4522,7 +4689,7 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
             AccountAttemptContext::diagnostic(
                 BTreeSet::new(),
                 ProviderAccountId::new(account).unwrap(),
-                (mode == CodexTurnStateMode::Manual).then(|| {
+                (mode != CodexTurnStateMode::Default).then(|| {
                     ProviderAccountStateOwner::new(
                         ProviderKind::new("openai").unwrap(),
                         ProviderAccountId::new(account).unwrap(),
@@ -4533,14 +4700,29 @@ async fn global_turn_state_should_override_and_only_learn_292_byte_values() {
             CancellationToken::new(),
         );
         let mut stream = provider
-            .execute(planned_request("openai", operation), context)
+            .execute(
+                planned_request_for_model("openai", operation, model),
+                context,
+            )
             .await
             .unwrap();
         assert_eq!(stream.metadata().provider_account_id().as_str(), account);
         while let Some(event) = stream.next().await {
             event.unwrap();
         }
-        let current = provider.automatic_turn_state();
+        let after_all = provider.automatic_turn_state();
+        for previous in before_all
+            .iter()
+            .filter(|entry| entry.account_id != account || entry.model != model)
+        {
+            assert!(
+                after_all.contains(previous),
+                "other account/model entries must not change"
+            );
+        }
+        let current = after_all
+            .into_iter()
+            .find(|entry| entry.account_id == account && entry.model == model);
         if let Some(value) = returned_value.filter(|value| value.len() == 292) {
             let current = current.expect("valid response should be visible to administrators");
             assert_eq!(current.value, value);

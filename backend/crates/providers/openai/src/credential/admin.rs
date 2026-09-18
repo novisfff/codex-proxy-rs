@@ -408,6 +408,53 @@ impl CodexCredentialAdminError {
 pub struct CodexCredentialAdmin;
 
 impl CodexCredentialAdmin {
+    pub(crate) fn prepare_oauth_base_url_rotation(
+        &self,
+        current: LoadedCredential,
+        material: Value,
+    ) -> Result<PreparedCodexCredentialRotation, CodexCredentialAdminError> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Configuration {
+            openai_base_url: String,
+        }
+        let configuration: Configuration = serde_json::from_value(material)
+            .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
+        let mut data = CodexCredentialCodec::decode_complete(&current.credential)
+            .map_err(|_| CodexCredentialAdminError::InvalidCredential)?;
+        let oauth = data
+            .oauth_mut()
+            .ok_or(CodexCredentialAdminError::InvalidCredential)?;
+        let base_url = configuration.openai_base_url.trim();
+        oauth.openai_base_url =
+            (!base_url.is_empty()).then(|| base_url.trim_end_matches('/').to_owned());
+        let credential = CodexCredentialCodec::encode_complete(data)
+            .map_err(|_| CodexCredentialAdminError::InvalidInput)?;
+        let profile = ProviderAccountUpdate {
+            account_id: current.account.id().clone(),
+            name: current.account.name().to_owned(),
+            email: current.account.email().map(str::to_owned),
+            plan_type: current.account.plan_type().map(str::to_owned),
+        };
+        let credential = CredentialCasUpdate::new(
+            current.account.id().clone(),
+            current.account.revision(),
+            profile.clone(),
+            credential,
+            current.account.has_refresh_token(),
+            current.account.access_token_expires_at(),
+            current.account.next_refresh_at(),
+        )
+        .map_err(|_| CodexCredentialAdminError::InvalidCredential)?
+        .preserving_profile();
+        Ok(PreparedCodexCredentialRotation {
+            profile,
+            credential,
+            replacement_identity: None,
+            refresh_guards: None,
+        })
+    }
+
     fn prepare_api_key(
         &self,
         account_id: String,

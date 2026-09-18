@@ -123,15 +123,20 @@ impl CodexProvider {
         let turn_metadata = request.turn_metadata.as_deref().and_then(|metadata| {
             crate::transport::request::scope_turn_metadata(metadata, lease.installation_id(), true)
         });
+        let client = self
+            .client
+            .for_account(lease.account())
+            .map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+            .with_base_url(lease.openai_base_url())
+            .with_authentication(lease.authentication());
+        let response_origin = client.request_url(request.endpoint_path).map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
         let events = cold_json_response_stream(ColdJsonResponse {
-            client: self
-                .client
-                .for_account(lease.account())
-                .map_err(|_| {
-                    provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-                })?
-                .with_authentication(lease.authentication()),
-            response_origin: request.response_origin,
+            client,
+            response_origin,
             endpoint_path: request.endpoint_path,
             body: request.body,
             image_turn_id: request.image_turn_id,
@@ -165,7 +170,7 @@ struct RawJsonEndpointRequest {
 }
 
 pub(super) struct ColdResponse {
-    pub(super) turn_state: GlobalTurnState,
+    pub(super) turn_state: TurnStateCache,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -204,6 +209,8 @@ pub(super) struct ColdJsonResponse {
 pub(super) struct OpenAiSessionState {
     pub(super) account_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) openai_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) credential_revision: Option<u64>,
     pub(super) conversation_id: Option<String>,
     #[serde(default)]
@@ -223,6 +230,7 @@ pub(super) enum OpenAiContinuationScope {
 
 pub(super) struct OpenAiSessionCapture {
     pub(super) account_id: String,
+    pub(super) openai_base_url: Option<String>,
     pub(super) credential_revision: Option<u64>,
     pub(super) conversation_id: Option<String>,
     pub(super) turn_state: Option<String>,
@@ -269,6 +277,7 @@ fn encode_openai_session_capture(
     };
     encode_openai_session_state(OpenAiSessionState {
         account_id: capture.account_id.clone(),
+        openai_base_url: capture.openai_base_url.clone(),
         credential_revision: capture.credential_revision,
         conversation_id: capture.conversation_id.clone(),
         turn_state: capture.turn_state.clone(),
@@ -578,6 +587,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         mut session_capture,
     } = response;
     Box::pin(async_stream::try_stream! {
+        let turn_state = turn_state.scope(lease.account_id().as_str(), request.model());
         turn_state.apply(&mut request, context.codex_turn_state());
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
@@ -1148,7 +1158,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
 
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
-    global_turn_state: &GlobalTurnState,
+    scoped_turn_state: &turn_state::ScopedTurnState,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
     decoder: &mut CodexCanonicalDecoder,
@@ -1163,7 +1173,7 @@ async fn merge_response_metadata_updates(
     }
     let mut changed = false;
     if let Some(turn_state) = turn_state {
-        global_turn_state.observe(&turn_state);
+        scoped_turn_state.observe(&turn_state);
         if let Some(capture) = session_capture.as_mut() {
             capture.turn_state = Some(turn_state.clone());
         }
