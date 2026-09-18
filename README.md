@@ -109,6 +109,13 @@ curl http://127.0.0.1:8080/v1/models \
 
 ## 社区
 
+欢迎到 [Discussions 讨论区](https://github.com/zyycn/codex-proxy-rs/discussions)交流：
+[使用问答](https://github.com/zyycn/codex-proxy-rs/discussions/categories/使用问答)、
+[想法讨论](https://github.com/zyycn/codex-proxy-rs/discussions/categories/想法讨论)、
+[实验反馈](https://github.com/zyycn/codex-proxy-rs/discussions/categories/实验反馈)与
+[经验分享](https://github.com/zyycn/codex-proxy-rs/discussions/categories/经验分享)。
+明确的 Bug 或功能需求请使用 [Issue 模板](https://github.com/zyycn/codex-proxy-rs/issues/new/choose)，无需先发讨论。
+
 感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
 
 ## 许可证
