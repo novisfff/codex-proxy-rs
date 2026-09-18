@@ -42,6 +42,14 @@ class Journal:
                 confirmed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS settings(id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL, revision INTEGER NOT NULL);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(resources)")}
+        if "confirmed" not in columns:
+            with self.db:
+                self.db.execute("ALTER TABLE resources ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
+        settings_columns = {row[1] for row in self.db.execute("PRAGMA table_info(settings)")}
+        if settings_columns and "revision" not in settings_columns:
+            with self.db:
+                self.db.execute("ALTER TABLE settings ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
 
     def execute(self, sql, args=()):
         with self.db:
