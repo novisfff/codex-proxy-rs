@@ -21,6 +21,7 @@ import ResponseBodyLimitCard from './components/ResponseBodyLimitCard.vue'
 import RotationStrategyCard from './components/RotationStrategyCard.vue'
 import RuntimeSettingsCard from './components/RuntimeSettingsCard.vue'
 import TokenRefreshCard from './components/TokenRefreshCard.vue'
+import TurnStateCard from './components/TurnStateCard.vue'
 import { useAdminApiKey } from './composables/useAdminApiKey'
 import { useSettingsForm } from './composables/useSettingsForm'
 import { rotationOptions } from './constants'
@@ -149,6 +150,7 @@ onMounted(() => {
           v-model:concurrency-wait-timeout-seconds="concurrencyWaitTimeoutSecondsValue"
         />
         <FastPolicyCard v-model="form.disableFast" :disabled="saving || loading || !!error" />
+        <TurnStateCard v-model="form.codexTurnState" :disabled="saving || loading || !!error" />
 
         <RequestLocationCard v-model="form.requestLocation" v-model:enabled="form.requestLocationEnabled" :disabled="saving || loading || !!error" />
         <AccountAutoFreezeCard

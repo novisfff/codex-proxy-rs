@@ -4,7 +4,13 @@ import request from '../request'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
 
+export interface CodexTurnStateConfig {
+  mode: 'default' | 'manual' | 'auto'
+  value: string
+}
+
 export interface RuntimeSettings {
+  codexTurnState: CodexTurnStateConfig
   disableFast: boolean
   requestLocationEnabled: boolean
   requestLocation: RequestLocation

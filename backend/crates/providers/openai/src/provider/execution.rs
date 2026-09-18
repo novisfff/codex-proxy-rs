@@ -165,6 +165,7 @@ struct RawJsonEndpointRequest {
 }
 
 pub(super) struct ColdResponse {
+    pub(super) turn_state: GlobalTurnState,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -465,7 +466,7 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
         metrics.first_event_ms = Some(
             i64::try_from(request.output_started_at.elapsed().as_millis()).unwrap_or(i64::MAX),
         );
-        if let Some(observation) = codex_response_observation(
+        if let Some(mut observation) = codex_response_observation(
             CodexBackendTransport::HttpJson,
             &response.diagnostics,
             &response.response_metadata,
@@ -473,6 +474,9 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             None,
             openai_response_timings(&metrics, &response.response_metadata),
         ) {
+            if let Some(metadata) = turn_state_metadata(&response.response_metadata.client_headers) {
+                observation = observation.with_provider_metadata(metadata);
+            }
             yield ProviderEvent::observation(observation);
         }
         if allows_account_state_mutation {
@@ -554,9 +558,10 @@ fn image_response_metering(
 
 pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     let ColdResponse {
+        turn_state,
         client,
         response_origin,
-        request,
+        mut request,
         upstream_model,
         transport_policy,
         context,
@@ -573,6 +578,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         mut session_capture,
     } = response;
     Box::pin(async_stream::try_stream! {
+        turn_state.apply(&mut request, context.codex_turn_state());
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let failure_context = OpenAiFailureContext {
@@ -639,6 +645,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let response = match response {
             Ok(response) => response,
             Err(mut failure) => {
+                if let Some(response) = failure.error.client_visible_upstream_response() {
+                    for header in response.headers() {
+                        if header.name().eq_ignore_ascii_case("x-codex-turn-state")
+                            && let Ok(value) = std::str::from_utf8(header.value())
+                        {
+                            turn_state.observe(value);
+                        }
+                    }
+                }
                 if let Some(policy) = websocket_failure_policy {
                     apply_websocket_recovery_policy(
                         &mut failure,
@@ -669,6 +684,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 return;
             }
         };
+        turn_state.observe_headers(&response.response_metadata.client_headers);
         if !accepts_backend_transport(transport_policy, response.transport) {
             let failure = MappedProviderFailure::plain(provider_error(
                 ProviderErrorKind::Protocol,
@@ -805,6 +821,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     };
                     let metadata_merge = merge_response_metadata_updates(
                         response_metadata_updates.as_ref(),
+                        &turn_state,
                         &mut session_capture,
                         &mut observation_state,
                         &mut decoder,
@@ -879,6 +896,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             };
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
+                &turn_state,
                 &mut session_capture,
                 &mut observation_state,
                 &mut decoder,
@@ -1056,6 +1074,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         }
         let metadata_changed = merge_response_metadata_updates(
             response_metadata_updates.as_ref(),
+            &turn_state,
             &mut session_capture,
             &mut observation_state,
             &mut decoder,
@@ -1129,6 +1148,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
 
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
+    global_turn_state: &GlobalTurnState,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
     decoder: &mut CodexCanonicalDecoder,
@@ -1143,6 +1163,7 @@ async fn merge_response_metadata_updates(
     }
     let mut changed = false;
     if let Some(turn_state) = turn_state {
+        global_turn_state.observe(&turn_state);
         if let Some(capture) = session_capture.as_mut() {
             capture.turn_state = Some(turn_state.clone());
         }

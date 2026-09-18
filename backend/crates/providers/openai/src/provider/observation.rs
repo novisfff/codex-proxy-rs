@@ -234,6 +234,10 @@ impl OpenAiResponseObservationState {
     pub(super) fn provider_metadata(&self) -> Option<ProviderResponseMetadata> {
         let mut metadata = Map::new();
         metadata.insert("schemaVersion".to_owned(), json!(2));
+        metadata.insert(
+            "responseTurnState".to_owned(),
+            response_turn_state(&self.response_metadata.client_headers),
+        );
         if self.transport == CodexBackendTransport::WebSocket
             && let Some(request_id) = &self.diagnostics.request_id
         {
@@ -349,6 +353,25 @@ pub(super) fn codex_response_observation(
     Some(observation)
 }
 
+// 原值仅供管理员详情读取，不进入 trace 或请求摘要；保留原始长度，不截断后冒充完整值。
+fn response_turn_state(headers: &[(String, Bytes)]) -> Value {
+    let value = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-codex-turn-state"))
+        .map(|(_, value)| value);
+    let text = value
+        .filter(|value| value.len() <= 4096)
+        .and_then(|value| std::str::from_utf8(value).ok());
+    json!({ "byteLength": value.map(|value| value.len()), "value": text })
+}
+
+pub(super) fn turn_state_metadata(headers: &[(String, Bytes)]) -> Option<ProviderResponseMetadata> {
+    ProviderResponseMetadata::new(
+        json!({ "schemaVersion": 2, "responseTurnState": response_turn_state(headers) })
+            .to_string(),
+    )
+}
+
 pub(super) fn codex_error_observation(
     error: &CodexClientError,
 ) -> Option<ProviderResponseObservation> {
@@ -401,6 +424,22 @@ pub(super) fn codex_error_observation(
             }
         }
         _ => {}
+    }
+    // 错误响应的原始头独立于脱敏诊断；读取失败时不能把缺失数据标为“未返回”。
+    let response = match error {
+        CodexClientError::Upstream {
+            client_response, ..
+        } => client_response.as_deref(),
+        CodexClientError::WebSocket(error) => match error.classified() {
+            CodexWebSocketExchangeError::Upstream(upstream) => upstream.client_response.as_deref(),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(response) = response
+        && let Some(metadata) = turn_state_metadata(response.client_headers())
+    {
+        observation = observation.with_provider_metadata(metadata);
     }
     Some(observation)
 }

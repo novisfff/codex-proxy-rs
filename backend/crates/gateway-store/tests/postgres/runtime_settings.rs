@@ -9,6 +9,7 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
+        codex_turn_state: None,
         disable_fast: None,
         request_location_enabled: false,
         request_location: Default::default(),
@@ -45,6 +46,41 @@ fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
 fn runtime_settings_keep_account_rotation_global() {
     let settings = settings_with_margin(3_600);
     assert!(settings.validate().is_ok());
+}
+
+#[tokio::test]
+async fn turn_state_should_round_trip_and_reach_runtime_snapshot() {
+    use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+    use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
+    let Some(database) = TestDatabase::create("turn_state_settings").await else {
+        return;
+    };
+    let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
+    let config = CodexTurnStateConfig {
+        mode: CodexTurnStateMode::Manual,
+        value: "synthetic-state".to_owned(),
+    };
+    let mut update = settings_with_margin(3_600);
+    update.codex_turn_state = Some(config.clone());
+    repository.update_runtime_settings(update).await.unwrap();
+    repository
+        .update_runtime_settings(settings_with_margin(1_800))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .codex_turn_state,
+        config
+    );
+    let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
+        .load_runtime_snapshot()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.settings.codex_turn_state, config);
+    database.close().await;
 }
 
 #[test]

@@ -114,6 +114,13 @@ impl SettingsService for DefaultSettingsService {
 }
 
 fn validate_settings(command: &ReplaceRuntimeSettings) -> Result<(), AdminError> {
+    if command
+        .codex_turn_state
+        .as_ref()
+        .is_some_and(|config| config.validate().is_err())
+    {
+        return Err(AdminError::invalid("Codex Turn State 配置不合法"));
+    }
     let valid = command.request_location.validate().is_ok()
         && command.responses_max_decompressed_body_bytes > 0
         && isize::try_from(command.responses_max_decompressed_body_bytes).is_ok()

@@ -3,6 +3,9 @@
 //! Client API Key 冻结账号分组权限；模型名称不参与权限判断。
 
 mod client_version;
+mod turn_state;
+
+pub use turn_state::{CodexTurnStateConfig, CodexTurnStateMode};
 
 pub use client_version::{
     ClientVersionRejection, CodexClientKind, CodexClientMinVersions, CodexClientVersion,

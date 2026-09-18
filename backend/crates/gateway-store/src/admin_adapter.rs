@@ -39,6 +39,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
             .map_err(|error| admin_store_error("runtime settings", error))?;
         let replacement = postgres::ControlPlaneReplacement {
             settings: postgres::RuntimeSettingsUpdate {
+                codex_turn_state: command.codex_turn_state,
                 admin_api_key: current.settings.admin_api_key,
                 refresh_margin_seconds: command.refresh_margin_seconds,
                 refresh_concurrency: command.refresh_concurrency,
@@ -74,6 +75,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 "runtime_settings",
                 "1",
                 vec![
+                    "codex_turn_state_json".to_owned(),
                     "disable_fast".to_owned(),
                     "request_location_enabled".to_owned(),
                     "request_location_json".to_owned(),
@@ -184,6 +186,7 @@ pub(crate) fn admin_runtime_settings(
         })
         .collect::<AdminStoreResult<ModelMappings>>()?;
     Ok(AdminRuntimeSettings {
+        codex_turn_state: settings.codex_turn_state,
         config_revision: admin_revision(settings.config_revision)?,
         disable_fast: settings.disable_fast,
         request_location_enabled: settings.request_location_enabled,

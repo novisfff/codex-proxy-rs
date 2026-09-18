@@ -34,6 +34,7 @@ pub type ModelMappings = BTreeMap<String, String>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsView {
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub disable_fast: bool,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -66,6 +67,7 @@ pub struct RuntimeSettingsView {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRuntimeSettingsRequest {
+    pub codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
     pub disable_fast: Option<bool>,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -96,6 +98,13 @@ pub struct UpdateRuntimeSettingsRequest {
 impl UpdateRuntimeSettingsRequest {
     /// 校验公共运行参数。
     pub fn validate(&self) -> Result<(), WireValidationError> {
+        if self
+            .codex_turn_state
+            .as_ref()
+            .is_some_and(|config| config.validate().is_err())
+        {
+            return Err(WireValidationError::new("codexTurnState"));
+        }
         self.request_location
             .validate()
             .map_err(|_| WireValidationError::new("requestLocation"))?;
@@ -177,6 +186,7 @@ impl UpdateRuntimeSettingsRequest {
     fn into_command(self) -> Result<ReplaceRuntimeSettings, WireValidationError> {
         self.validate()?;
         Ok(ReplaceRuntimeSettings {
+            codex_turn_state: self.codex_turn_state,
             disable_fast: self.disable_fast,
             request_location_enabled: self.request_location_enabled,
             request_location: self
@@ -219,6 +229,7 @@ impl UpdateRuntimeSettingsRequest {
 impl From<RuntimeSettings> for RuntimeSettingsView {
     fn from(settings: RuntimeSettings) -> Self {
         Self {
+            codex_turn_state: settings.codex_turn_state,
             disable_fast: settings.disable_fast,
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,

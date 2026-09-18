@@ -973,6 +973,7 @@ struct StaticSettingsStore;
 impl SettingsStore for StaticSettingsStore {
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
+            codex_turn_state: Default::default(),
             disable_fast: false,
             request_location_enabled: false,
             request_location: Default::default(),

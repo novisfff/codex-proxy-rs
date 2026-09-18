@@ -98,7 +98,10 @@ use crate::transport::{
 mod execution;
 mod failure;
 mod observation;
+mod turn_state;
 mod workers;
+
+use turn_state::GlobalTurnState;
 
 use execution::*;
 #[doc(hidden)]
@@ -137,6 +140,7 @@ pub enum CodexProviderConfigError {
 }
 
 pub struct CodexProvider {
+    turn_state: GlobalTurnState,
     selector: Arc<CodexCredentialSelector>,
     catalog: Arc<CodexCredentialCatalogService>,
     quota: Arc<CodexCredentialQuotaService>,
@@ -177,6 +181,7 @@ impl CodexProvider {
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
+            turn_state: GlobalTurnState::default(),
             selector,
             catalog,
             quota,
@@ -588,6 +593,7 @@ impl Provider for CodexProvider {
             AttemptTransport::Default | AttemptTransport::Fallback => 0,
         };
         let events = cold_response_stream(ColdResponse {
+            turn_state: self.turn_state.clone(),
             client: self
                 .client
                 .for_account(lease.account())

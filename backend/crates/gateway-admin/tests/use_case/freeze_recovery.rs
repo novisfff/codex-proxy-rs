@@ -25,6 +25,7 @@ use super::accounts::{FakeAccountStore, FakeProviderAdmin, account_record, event
 
 fn runtime_settings(enabled: bool, probe_enabled: bool, adaptive: bool) -> RuntimeSettings {
     RuntimeSettings {
+        codex_turn_state: Default::default(),
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),

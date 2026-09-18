@@ -61,6 +61,7 @@ async fn settings_should_reject_zero_refresh_margin_before_store_call() {
                 request_id: "request-settings".to_owned(),
             },
             ReplaceRuntimeSettings {
+                codex_turn_state: None,
                 disable_fast: None,
                 request_location_enabled: false,
                 request_location: Default::default(),

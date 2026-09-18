@@ -19,6 +19,7 @@ use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub disable_fast: bool,
     pub config_revision: Revision,
     pub admin_api_key: Option<String>,
@@ -110,6 +111,7 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
+    pub codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
     pub disable_fast: Option<bool>,
     pub admin_api_key: Option<String>,
     pub refresh_margin_seconds: u64,
@@ -157,6 +159,13 @@ impl fmt::Debug for RuntimeSettingsUpdate {
 
 impl RuntimeSettingsUpdate {
     pub fn validate(&self) -> StoreResult<()> {
+        if self
+            .codex_turn_state
+            .as_ref()
+            .is_some_and(|config| config.validate().is_err())
+        {
+            return Err(invalid_numeric());
+        }
         if self.request_location.validate().is_err()
             || self.responses_max_decompressed_body_bytes == 0
             || isize::try_from(self.responses_max_decompressed_body_bytes).is_err()
@@ -233,7 +242,7 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
 
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-            "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast,
+            "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
                     refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                     rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
@@ -295,7 +304,7 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-        "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast,
+        "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
                 refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                 rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
@@ -352,6 +361,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      request_location_enabled = $24,
                      responses_max_decompressed_body_bytes = $25,
                      disable_fast = coalesce($26, disable_fast),
+                     codex_turn_state_json = coalesce($27, codex_turn_state_json),
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -394,6 +404,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
             .map_err(|_| invalid_numeric())?,
     )
     .bind(update.disable_fast)
+    .bind(update.codex_turn_state.as_ref().map(sqlx::types::Json))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -443,6 +454,7 @@ pub(crate) async fn update_admin_api_key_in_transaction(
 
 #[derive(sqlx::FromRow)]
 struct RuntimeSettingsRow {
+    codex_turn_state_json: sqlx::types::Json<gateway_core::policy::CodexTurnStateConfig>,
     disable_fast: bool,
     config_revision: i64,
     admin_api_key: Option<String>,
@@ -474,7 +486,12 @@ struct RuntimeSettingsRow {
 }
 
 fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSettings> {
+    row.codex_turn_state_json
+        .0
+        .validate()
+        .map_err(|_| invalid_numeric())?;
     Ok(RuntimeSettings {
+        codex_turn_state: row.codex_turn_state_json.0,
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,
         refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,

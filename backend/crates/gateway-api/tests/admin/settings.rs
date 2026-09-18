@@ -37,6 +37,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 fn update_body() -> Value {
     json!({
+        "codexTurnState": {"mode":"default","value":""},
         "disableFast": false,
         "requestLocationEnabled": false,
         "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
@@ -79,6 +80,62 @@ fn settings_request_should_reject_unknown_rotation_strategy() {
 }
 
 #[test]
+fn settings_request_should_validate_turn_state_without_header_injection() {
+    for value in [
+        String::new(),
+        "a\r\nx-injected: yes".to_owned(),
+        "中文".to_owned(),
+        "x".repeat(8193),
+    ] {
+        let mut body = update_body();
+        body["codexTurnState"] = json!({"mode":"manual","value":value});
+        let request: UpdateRuntimeSettingsRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(request.validate().unwrap_err().field(), "codexTurnState");
+    }
+}
+
+#[tokio::test]
+async fn settings_should_preserve_turn_state_when_omitted_or_null() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    for omitted in [false, true, false] {
+        let mut body = update_body();
+        if omitted {
+            body.as_object_mut().unwrap().remove("codexTurnState");
+        } else {
+            body["codexTurnState"] = json!({"mode":"manual","value":"synthetic-state"});
+        }
+        let response = app(fixture.state())
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/update",
+                Some(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["data"]["codexTurnState"],
+            json!({"mode":"manual","value":"synthetic-state"})
+        );
+    }
+    let mut body = update_body();
+    body["codexTurnState"] = Value::Null;
+    let response = app(fixture.state())
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/update",
+            Some(body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response_json(response).await["data"]["codexTurnState"]["value"],
+        "synthetic-state"
+    );
+}
+
+#[test]
 fn settings_request_should_reject_non_semver_client_min() {
     let mut body = update_body();
     body["minCodexCliVersion"] = json!("v0.40.0");
@@ -103,6 +160,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     use gateway_core::routing::{PublicModelId, UpstreamModelId};
 
     let settings = RuntimeSettings {
+        codex_turn_state: Default::default(),
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),
@@ -148,6 +206,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "codexTurnState": {"mode":"default","value":""},
             "disableFast": false,
         "requestLocationEnabled": false,
         "requestLocation": {"country":"US", "region":"Ohio", "city":"Piketon", "timezone":"America/New_York"},
@@ -202,6 +261,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .cloned()
         .collect();
     let settings = RuntimeSettings {
+        codex_turn_state: Default::default(),
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),

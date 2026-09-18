@@ -20,6 +20,7 @@ use super::ClientApiKeySnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRuntimeSettings {
+    pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub disable_fast: bool,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
@@ -161,6 +162,7 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                 data.settings.responses_max_decompressed_body_bytes,
             )
             .with_disable_fast(data.settings.disable_fast)
+            .with_codex_turn_state(data.settings.codex_turn_state)
             .with_request_location(
                 data.settings.request_location,
                 data.settings.request_location_enabled,
@@ -241,32 +243,35 @@ fn core_revision(revision: Revision) -> Result<ConfigRevision, SnapshotStoreErro
     ConfigRevision::new(revision.get()).map_err(|_| SnapshotStoreError::unavailable())
 }
 
+#[derive(sqlx::FromRow)]
+struct SnapshotSettingsRow {
+    config_revision: i64,
+    refresh_margin_seconds: i64,
+    refresh_concurrency: i64,
+    max_concurrent_per_account: i64,
+    request_interval_ms: i64,
+    rotation_strategy: String,
+    model_mappings_json: sqlx::types::Json<BTreeMap<String, String>>,
+    min_codex_desktop_version: Option<String>,
+    min_codex_cli_version: Option<String>,
+    max_waiting_per_key: i64,
+    max_waiting_per_account: i64,
+    concurrency_wait_timeout_seconds: i64,
+    request_location_json: sqlx::types::Json<gateway_core::account::RequestLocation>,
+    request_location_enabled: bool,
+    responses_max_decompressed_body_bytes: i64,
+    disable_fast: bool,
+    codex_turn_state_json: sqlx::types::Json<gateway_core::policy::CodexTurnStateConfig>,
+}
+
 async fn load_settings(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<(Revision, SnapshotRuntimeSettings)> {
-    let row = sqlx::query_as::<
-        _,
-        (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            String,
-            sqlx::types::Json<BTreeMap<String, String>>,
-            Option<String>,
-            Option<String>,
-            i64, i64, i64,
-            sqlx::types::Json<gateway_core::account::RequestLocation>,
-            bool,
-            i64,
-            bool,
-        ),
-    >(
+    let row = sqlx::query_as::<_, SnapshotSettingsRow>(
         "select config_revision, refresh_margin_seconds, refresh_concurrency,
                 max_concurrent_per_account, request_interval_ms, rotation_strategy,
                 model_mappings_json, min_codex_desktop_version,
-                min_codex_cli_version, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, request_location_json, request_location_enabled, responses_max_decompressed_body_bytes, disable_fast
+                min_codex_cli_version, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, request_location_json, request_location_enabled, responses_max_decompressed_body_bytes, disable_fast, codex_turn_state_json
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
@@ -276,24 +281,31 @@ async fn load_settings(
         entity: "runtime settings",
         id: "1".to_owned(),
     })?;
+    row.codex_turn_state_json
+        .0
+        .validate()
+        .map_err(|_| invalid("invalid codex turn state settings"))?;
     Ok((
-        revision_from_i64(row.0)?,
+        revision_from_i64(row.config_revision)?,
         SnapshotRuntimeSettings {
-            disable_fast: row.15,
-            responses_max_decompressed_body_bytes: to_u64(row.14)?,
-            request_location_enabled: row.13,
-            request_location: row.12.0,
-            refresh_margin_seconds: to_u64(row.1)?,
-            refresh_concurrency: to_u32(row.2)?,
-            max_concurrent_per_account: to_u32(row.3)?,
-            request_interval_ms: to_u64(row.4)?,
-            rotation_strategy: row.5,
-            model_mappings: row.6.0,
-            min_codex_desktop_version: row.7,
-            min_codex_cli_version: row.8,
-            max_waiting_per_key: to_u32(row.9)?,
-            max_waiting_per_account: to_u32(row.10)?,
-            concurrency_wait_timeout_seconds: to_u32(row.11)?,
+            codex_turn_state: row.codex_turn_state_json.0,
+            disable_fast: row.disable_fast,
+            responses_max_decompressed_body_bytes: to_u64(
+                row.responses_max_decompressed_body_bytes,
+            )?,
+            request_location_enabled: row.request_location_enabled,
+            request_location: row.request_location_json.0,
+            refresh_margin_seconds: to_u64(row.refresh_margin_seconds)?,
+            refresh_concurrency: to_u32(row.refresh_concurrency)?,
+            max_concurrent_per_account: to_u32(row.max_concurrent_per_account)?,
+            request_interval_ms: to_u64(row.request_interval_ms)?,
+            rotation_strategy: row.rotation_strategy,
+            model_mappings: row.model_mappings_json.0,
+            min_codex_desktop_version: row.min_codex_desktop_version,
+            min_codex_cli_version: row.min_codex_cli_version,
+            max_waiting_per_key: to_u32(row.max_waiting_per_key)?,
+            max_waiting_per_account: to_u32(row.max_waiting_per_account)?,
+            concurrency_wait_timeout_seconds: to_u32(row.concurrency_wait_timeout_seconds)?,
         },
     ))
 }

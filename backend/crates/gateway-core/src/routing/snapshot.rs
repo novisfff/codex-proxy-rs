@@ -28,6 +28,7 @@ const MAXIMUM_CATALOG_STABILITY_ATTEMPTS: usize = 4;
 /// Store 在一个一致性读取中提供的调度设置事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSettingsFacts {
+    codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     request_location_enabled: bool,
     request_location: crate::account::RequestLocation,
@@ -44,6 +45,12 @@ pub struct SnapshotSettingsFacts {
 }
 
 impl SnapshotSettingsFacts {
+    #[must_use]
+    pub fn with_codex_turn_state(mut self, config: crate::policy::CodexTurnStateConfig) -> Self {
+        self.codex_turn_state = config;
+        self
+    }
+
     #[must_use]
     pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
         self.disable_fast = disable_fast;
@@ -91,6 +98,7 @@ impl SnapshotSettingsFacts {
     ) -> Self {
         Self {
             disable_fast: false,
+            codex_turn_state: crate::policy::CodexTurnStateConfig::default(),
             request_location_enabled: false,
             request_location: crate::account::RequestLocation::default(),
             max_concurrent_per_account,
@@ -528,6 +536,7 @@ async fn compile_runtime_snapshot(
     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)
     .map(|snapshot| {
         snapshot
+            .with_codex_turn_state(facts.settings.codex_turn_state)
             .with_disable_fast(facts.settings.disable_fast)
             .with_request_location(request_location)
             .with_responses_max_decompressed_body_bytes(decompressed_body_limit)
@@ -542,6 +551,7 @@ async fn compile_runtime_snapshot(
 /// 数据面使用的不可变配置快照。
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
+    codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
     request_location: Option<crate::account::RequestLocation>,
@@ -561,6 +571,12 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    #[must_use]
+    pub fn with_codex_turn_state(mut self, config: crate::policy::CodexTurnStateConfig) -> Self {
+        self.codex_turn_state = config;
+        self
+    }
+
     #[must_use]
     pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
         self.disable_fast = disable_fast;
@@ -671,6 +687,7 @@ impl RuntimeSnapshot {
         Ok(Self {
             responses_max_decompressed_body_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
                 .expect("positive default limit"),
+            codex_turn_state: crate::policy::CodexTurnStateConfig::default(),
             disable_fast: false,
             request_location: None,
             revision,
@@ -983,6 +1000,7 @@ impl RuntimeSnapshot {
 
         Ok(RoutingPlan {
             config_revision: self.revision,
+            codex_turn_state: self.codex_turn_state.clone(),
             disable_fast: self.disable_fast || account_scope.disable_fast(),
             request_location: self.request_location.clone(),
             account_selection_policy: self.account_selection_policy,
@@ -1026,6 +1044,7 @@ impl RuntimeSnapshot {
         };
         Ok(RoutingPlan {
             config_revision: self.revision,
+            codex_turn_state: self.codex_turn_state.clone(),
             disable_fast: self.disable_fast || account_scope.disable_fast(),
             request_location: self.request_location.clone(),
             account_selection_policy: self.account_selection_policy,

@@ -246,8 +246,9 @@ impl AccountAttemptContext {
 
 /// 请求中 Provider 账号绑定状态的唯一归属。
 ///
-/// `turn_state` 等 opaque 状态只能发送给创建它的 Provider 与账号；
+/// 客户端携带的 `turn_state` 等 opaque 状态只能发送给创建它的 Provider 与账号；
 /// Core 在首次真实选号后冻结该事实，Provider 据此决定是否清理跨账号状态。
+/// 管理员显式配置的全局覆盖由 Provider 在隔离完成后应用，不改变客户端状态的归属。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderAccountStateOwner {
     provider: ProviderKind,
@@ -314,6 +315,7 @@ impl ContinuationAttempt {
 /// Provider 每次执行可见的 request-local context。
 #[derive(Debug, Clone)]
 pub struct RequestAttemptContext {
+    codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     request_location: Option<crate::account::RequestLocation>,
     request_id: ModelRequestId,
@@ -324,6 +326,12 @@ pub struct RequestAttemptContext {
 }
 
 impl RequestAttemptContext {
+    #[must_use]
+    pub fn with_codex_turn_state(mut self, config: crate::policy::CodexTurnStateConfig) -> Self {
+        self.codex_turn_state = config;
+        self
+    }
+
     #[must_use]
     pub const fn with_disable_fast(mut self, disable_fast: bool) -> Self {
         self.disable_fast = disable_fast;
@@ -345,6 +353,7 @@ impl RequestAttemptContext {
             request_id,
             client_api_key_ref,
             disable_fast: false,
+            codex_turn_state: crate::policy::CodexTurnStateConfig::default(),
             request_location: None,
             timing_started_at: Instant::now(),
             trace: crate::diagnostics::TraceContext::default(),
@@ -410,6 +419,11 @@ impl AttemptContext {
     #[must_use]
     pub const fn disable_fast(&self) -> bool {
         self.request.disable_fast
+    }
+
+    #[must_use]
+    pub const fn codex_turn_state(&self) -> &crate::policy::CodexTurnStateConfig {
+        &self.request.codex_turn_state
     }
 
     #[must_use]

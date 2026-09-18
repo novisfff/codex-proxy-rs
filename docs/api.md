@@ -940,6 +940,7 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 
 ```text
 disableFast
+codexTurnState
 requestLocationEnabled
 requestLocation
 modelMappings
@@ -965,6 +966,14 @@ accountAutoFreezeProbeEnabled
 accountAutoFreezeProbeModel
 accountAutoFreezeAdaptiveConcurrency
 ```
+
+`codexTurnState` 格式为 `{ "mode": "default", "value": "" }`，省略或 `null` 保留现值。适用于 OpenAI Responses HTTP 和 WebSocket 请求：
+
+- `default`：保持原有客户端状态及账号隔离行为。
+- `manual`：使用 `value` 覆盖请求中的 `X-Codex-Turn-State`；值必须为 1–8192 字节的可打印 ASCII 字符（不含空格）。
+- `auto`：全站共用最近收到的、恰好 292 字节的上游 `X-Codex-Turn-State`，跨账号和会话使用；其他长度或缺失值不覆盖缓存。首次获得有效值前保持默认行为。
+
+手动配置和模式持久化；自动缓存仅在当前服务进程内共享，重启后清空，多实例之间不共享。WebSocket 复用连接时通过每帧 `client_metadata` 传递更新值。
 
 `disableFast` 默认 `false`，更新时省略或 `null` 保留现值。全局开启时，所有 Key 的 OpenAI Responses 请求关闭 Fast；
 全局关闭时仍应用 Key 绑定分组的限制。关闭 Fast 只将顶层 `service_tier` 的 `priority`（含 `fast` 别名）
@@ -1165,6 +1174,12 @@ OpenAI 优先采用服务端 `openai-model` / `x-openai-model` 报告（流内�
 新采集的未知 JSON 键名与值只保留结构和摘要；事件摘要中的 `eventType` 为已知事件名称字符串、
 未知名称的 `{ bytes, sha256 }` 摘要，或缺失时的 `null`。旧 trace 不做清理或回填，
 其中的 `sanitized` 标记不能作为可直接公开的保证。
+
+OpenAI 请求详情的 `metadata.responseTurnState` 保存最终尝试所观测到的 `X-Codex-Turn-State`：
+`byteLength` 为原始头值的字节数，`value` 为可复制的 UTF-8 原值。未返回该头时两者均为 `null`；
+字段缺失表示历史记录或该路径未采集，不能解释为未返回。超过 4096 字节或不是有效 UTF-8 的值
+只保存长度，`value` 为 `null`。该字段随请求记录保留，仅供管理员详情读取，不进入普通列表、
+客户端用量查询、脱敏时间线或诊断包。它不作为自动重放的数据源；请求状态的覆盖行为由 `codexTurnState` 配置控制。
 
 管理端下载的诊断包 `schemaVersion: 2` 用于人工反馈，不是备份或导入格式。它包含关联 ID、错误分类摘要、
 请求与错误事件各自的状态、attempt、时间线阶段和计时；不自动导出 message/raw error、任意 metadata、

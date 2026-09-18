@@ -73,6 +73,7 @@ export interface UsageViewModel {
   latencyMsDisplay: string
   logicalOutcome: string
   providerMetadata: Record<string, unknown>
+  responseTurnState?: { byteLength: number | null, value: string | null }
   requestBody?: unknown
   responseBody?: unknown
   attempts?: UsageAttempt[]
@@ -140,7 +141,8 @@ export function normalizeUsageRecord(record: UsageRecordDetail): UsageViewModel 
     firstTokenLatencyMsDisplay: record.firstTokenLatencyMsDisplay,
     latencyMsDisplay: record.latencyMsDisplay,
     logicalOutcome: record.logicalOutcome,
-    providerMetadata: metadata,
+    providerMetadata: Object.fromEntries(Object.entries(metadata).filter(([key]) => key !== 'responseTurnState')),
+    responseTurnState: metadata.responseTurnState,
     requestBody: metadata.requestBody,
     responseBody: metadata.responseBody,
     attempts: record.attempts,

@@ -402,6 +402,9 @@ impl SettingsStore for MemorySettingsStore {
     ) -> AdminStoreResult<RuntimeSettings> {
         let mut settings = self.settings.lock().expect("settings");
         let updated = RuntimeSettings {
+            codex_turn_state: command
+                .codex_turn_state
+                .unwrap_or_else(|| settings.codex_turn_state.clone()),
             disable_fast: command.disable_fast.unwrap_or(settings.disable_fast),
             request_location_enabled: command.request_location_enabled,
             request_location: command.request_location,
@@ -1278,6 +1281,7 @@ fn test_runtime_settings() -> RuntimeSettings {
         ),
     ]);
     RuntimeSettings {
+        codex_turn_state: Default::default(),
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),

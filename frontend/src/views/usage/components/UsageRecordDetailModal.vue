@@ -2,14 +2,17 @@
 import type { EChartsOption } from 'echarts'
 import type { UsageViewModel } from '../utils/records'
 
+import { Copy } from '@lucide/vue'
 import { computed } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
+import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import { defineTableColumns } from '@/components/base/BaseTable/columns'
 import BaseTable from '@/components/base/BaseTable/index.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
+import { useCopyText } from '@/composables/useCopyText'
 import { displayValue, fieldLabelClass, fieldValueBaseClass, fieldValueClass } from '../utils/detail'
 import { formatDuration } from '../utils/format'
 import {
@@ -38,6 +41,17 @@ const props = defineProps<{
 const open = defineModel<boolean>({ default: false })
 
 const { palette } = useChartPalette()
+const copyText = useCopyText()
+const turnState = computed(() => props.record?.responseTurnState)
+const turnStateStatus = computed(() => {
+  if (!turnState.value)
+    return '未采集'
+  if (turnState.value.byteLength === null)
+    return '未返回'
+  if (turnState.value.value === null)
+    return '原值未保存'
+  return turnState.value.value === '' ? '空值' : ''
+})
 
 const requestText = computed(() => props.record ? visibleRequestText(props.record) : '')
 const responseText = computed(() => props.record ? visibleResponseText(props.record) : '')
@@ -359,6 +373,30 @@ const tokenDonutOption = computed<EChartsOption>(() => {
           请求标识
         </h3>
         <UsageDetailFieldGrid :items="identifierItems" />
+      </section>
+
+      <section v-if="record.provider === 'openai' || turnState" :class="panelClass">
+        <div class="flex min-w-0 flex-wrap items-center gap-2">
+          <h3 class="break-all" :class="panelTitleClass">
+            X-Codex-Turn-State
+          </h3>
+          <span v-if="turnState?.byteLength != null" class="font-mono text-cp-xs text-cp-text-secondary">
+            {{ turnState.byteLength }} 字节
+          </span>
+          <BaseIconButton
+            class="ml-auto"
+            size="sm"
+            label="复制 X-Codex-Turn-State"
+            :disabled="!turnState?.value"
+            @click="copyText(turnState?.value ?? '', { successText: 'X-Codex-Turn-State 已复制' })"
+          >
+            <Copy class="size-3.5" />
+          </BaseIconButton>
+        </div>
+        <p v-if="turnStateStatus" class="mt-2 mb-0 text-cp-sm text-cp-text-tertiary">
+          {{ turnStateStatus }}
+        </p>
+        <pre v-else class="mt-2 mb-0 max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-cp-sm text-cp-text">{{ turnState?.value }}</pre>
       </section>
 
       <section class="grid min-w-0 gap-3 lg:grid-cols-2">

@@ -64,6 +64,10 @@ export interface UsageLatencyDetails {
 
 // Provider 私有观测字段；Core 字段由顶层 UsageRecord 提供，不再复制进 metadata。
 export interface UsageRecordMetadata {
+  responseTurnState?: {
+    byteLength: number | null
+    value: string | null
+  }
   [key: string]: unknown
 }
 
