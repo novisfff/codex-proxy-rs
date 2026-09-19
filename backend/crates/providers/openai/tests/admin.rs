@@ -164,6 +164,7 @@ mod turn_state_fetcher {
             models: vec![MODEL.to_owned()],
             proxy_id: None,
             dynamic_egress: None,
+            schedule: None,
             revision: 0,
         }
     }
@@ -358,96 +359,123 @@ mod turn_state_fetcher {
 
     #[tokio::test]
     async fn dynamic_egress_cancellation_releases_provisioning_lease() {
-        let control = MockServer::start().await;
-        let upstream = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"available":true,"instances":[{"id":"azure","families":["ipv6"]}]}),
-            ))
-            .mount(&control)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/leases"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state":"provisioning"})))
-            .mount(&control)
-            .await;
-        Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&control)
-            .await;
-        let token = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            token.path(),
-            "test-control-secret-with-at-least-32-characters",
-        )
-        .unwrap();
-        let mut config = valid_config();
-        config.config.dynamic_egress = Some(provider_openai::config::DynamicEgressConfig {
-            url: control.uri(),
-            token_file: token.path().to_owned(),
-        });
-        let accounts = fetch_accounts(&upstream).await;
-        let store = Arc::new(MemoryTurnStateStore::default());
-        let scheduling = Arc::new(TestLeaseCoordinator::default());
-        let ports = ProviderStorePorts::new(
-            accounts,
-            scheduling.clone(),
-            Arc::new(MemorySessionAffinity::default()),
-            Arc::new(MemorySessionExclusions::default()),
-            Arc::new(TestCatalogCache::default()),
-            Arc::new(TestArtifactProfiles),
-            Arc::new(TestCredentialState),
-            Arc::new(TestCooldown),
-            Arc::new(TestRuntimePolicy),
-            Arc::new(TestOAuthPending::default()),
-        )
-        .with_turn_state(store);
-        let mut bundle = provider_openai::initialize(config.config.clone(), ports)
-            .await
+        for schedule_end in [false, true] {
+            let control = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/status"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"available":true,"instances":[{"id":"azure","families":["ipv6"]}]}),
+                ))
+                .mount(&control)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/leases"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"state":"provisioning"})),
+                )
+                .mount(&control)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&control)
+                .await;
+            let token = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                token.path(),
+                "test-control-secret-with-at-least-32-characters",
+            )
             .unwrap();
-        let admin = bundle.admin_provider();
-        let mut selected = fetch_config();
-        selected.dynamic_egress = Some(DynamicEgressSelection {
-            instance: "azure".to_owned(),
-            family: "ipv6".to_owned(),
-        });
-        admin.configure_turn_state_fetcher(selected).await.unwrap();
-        let worker = fetch_worker(&mut bundle);
-        let cancellation = CancellationToken::new();
-        let context = WorkerCycleContext::new(worker.0, None, cancellation.clone());
-        let task = tokio::spawn(async move { worker.1.run_cycle(context).await });
-        for _ in 0..100 {
-            if control
-                .received_requests()
+            let mut config = valid_config();
+            config.config.dynamic_egress = Some(provider_openai::config::DynamicEgressConfig {
+                url: control.uri(),
+                token_file: token.path().to_owned(),
+            });
+            let accounts = fetch_accounts(&upstream).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let scheduling = Arc::new(TestLeaseCoordinator::default());
+            let ports = ProviderStorePorts::new(
+                accounts,
+                scheduling.clone(),
+                Arc::new(MemorySessionAffinity::default()),
+                Arc::new(MemorySessionExclusions::default()),
+                Arc::new(TestCatalogCache::default()),
+                Arc::new(TestArtifactProfiles),
+                Arc::new(TestCredentialState),
+                Arc::new(TestCooldown),
+                Arc::new(TestRuntimePolicy),
+                Arc::new(TestOAuthPending::default()),
+            )
+            .with_turn_state(store);
+            let mut bundle = provider_openai::initialize(config.config.clone(), ports)
                 .await
-                .unwrap()
-                .iter()
-                .any(|r| r.method.as_str() == "POST")
-            {
-                break;
+                .unwrap();
+            let admin = bundle.admin_provider();
+            let mut selected = fetch_config();
+            if schedule_end {
+                let minute = ((chrono::Utc::now().timestamp_millis() + 8 * 3_600_000)
+                    .rem_euclid(86_400_000)
+                    / 60_000) as u16;
+                selected.schedule = Some(TurnStateFetcherSchedule {
+                    start_minute: (minute + 1439) % 1440,
+                    end_minute: (minute + 1) % 1440,
+                });
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(
-            scheduling.requests.lock().unwrap().is_empty(),
-            "IP provisioning must not occupy account concurrency"
-        );
-        cancellation.cancel();
-        task.await.unwrap().unwrap();
-        for _ in 0..100 {
-            if control
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .any(|r| r.method.as_str() == "DELETE")
-            {
-                return;
+            selected.dynamic_egress = Some(DynamicEgressSelection {
+                instance: "azure".to_owned(),
+                family: "ipv6".to_owned(),
+            });
+            admin.configure_turn_state_fetcher(selected).await.unwrap();
+            let worker = fetch_worker(&mut bundle);
+            let cancellation = CancellationToken::new();
+            let context = WorkerCycleContext::new(worker.0, None, cancellation.clone());
+            let task = tokio::spawn(async move { worker.1.run_cycle(context).await });
+            for _ in 0..100 {
+                if control
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "POST")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert!(
+                scheduling.requests.lock().unwrap().is_empty(),
+                "IP provisioning must not occupy account concurrency"
+            );
+            if schedule_end {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(121)).await;
+                tokio::time::resume();
+            } else {
+                cancellation.cancel();
+            }
+            task.await.unwrap().unwrap();
+            for _ in 0..100 {
+                if control
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "DELETE")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                control
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.method.as_str() == "DELETE"),
+                "cancelled provisioning must release its attempt ID"
+            );
         }
-        panic!("cancelled provisioning must release its attempt ID");
     }
 
     #[tokio::test]
@@ -793,6 +821,43 @@ mod turn_state_fetcher {
                     && h.value() == expected.unwrap().to_string().as_bytes()));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fetcher_schedule_blocks_queued_probes_until_all_day_is_restored() {
+        let server = MockServer::start().await;
+        mount(&server, &"a".repeat(292), 200).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let mut bundle = provider_openai::initialize(
+            valid_config().config,
+            provider_ports_with(
+                fetch_accounts(&server).await,
+                Arc::new(TestOAuthPending::default()),
+            )
+            .with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        let admin = bundle.admin_provider();
+        let minute = ((chrono::Utc::now().timestamp_millis() + 8 * 3_600_000)
+            .rem_euclid(86_400_000)
+            / 60_000) as u16;
+        let mut config = fetch_config();
+        config.schedule = Some(TurnStateFetcherSchedule {
+            start_minute: (minute + 120) % 1440,
+            end_minute: (minute + 180) % 1440,
+        });
+        admin.configure_turn_state_fetcher(config).await.unwrap();
+        admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.unwrap();
+        let worker = fetch_worker(&mut bundle);
+        cycle(&worker).await;
+        assert!(server.received_requests().await.unwrap().is_empty());
+        let mut config = admin.turn_state_fetcher().await.unwrap().configs[0].clone();
+        config.schedule = None;
+        admin.configure_turn_state_fetcher(config).await.unwrap();
+        cycle(&worker).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(admin.turn_state_fetcher().await.unwrap().values.len(), 1);
     }
 
     #[tokio::test]

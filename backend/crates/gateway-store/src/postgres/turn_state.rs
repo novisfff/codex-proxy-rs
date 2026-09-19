@@ -21,13 +21,14 @@ fn invalid() -> ProviderStoreError {
 impl TurnStateStore for PgTurnStateStore {
     fn configs(&self) -> BoxFuture<'_, Result<Vec<TurnStateFetcherConfig>, ProviderStoreError>> {
         Box::pin(async move {
-            sqlx::query("SELECT account_id, enabled, models, proxy_id, dynamic_egress, revision FROM turn_state_fetcher_configs ORDER BY account_id")
+            sqlx::query("SELECT account_id, enabled, models, proxy_id, dynamic_egress, schedule, revision FROM turn_state_fetcher_configs ORDER BY account_id")
                 .fetch_all(&self.0).await.map_err(unavailable)?.into_iter().map(|row| Ok(TurnStateFetcherConfig {
                     account_id: row.try_get("account_id").map_err(unavailable)?,
                     enabled: row.try_get("enabled").map_err(unavailable)?,
                     models: row.try_get::<sqlx::types::Json<Vec<String>>, _>("models").map_err(unavailable)?.0,
                     proxy_id: row.try_get("proxy_id").map_err(unavailable)?,
                     dynamic_egress: row.try_get::<Option<sqlx::types::Json<DynamicEgressSelection>>, _>("dynamic_egress").map_err(unavailable)?.map(|v| v.0),
+                    schedule: row.try_get::<Option<sqlx::types::Json<TurnStateFetcherSchedule>>, _>("schedule").map_err(unavailable)?.map(|v| v.0),
                     revision: row.try_get("revision").map_err(unavailable)?,
                 })).collect()
         })
@@ -38,7 +39,12 @@ impl TurnStateStore for PgTurnStateStore {
         config: TurnStateFetcherConfig,
     ) -> BoxFuture<'_, Result<(), ProviderStoreError>> {
         Box::pin(async move {
-            if config.dynamic_egress.is_some() && config.proxy_id.is_some() {
+            if (config.dynamic_egress.is_some() && config.proxy_id.is_some())
+                || config
+                    .schedule
+                    .as_ref()
+                    .is_some_and(|schedule| !schedule.is_valid())
+            {
                 return Err(invalid());
             }
             let mut tx = self.0.begin().await.map_err(unavailable)?;
@@ -65,14 +71,16 @@ impl TurnStateStore for PgTurnStateStore {
                     return Err(invalid());
                 }
             }
-            let updated = sqlx::query("INSERT INTO turn_state_fetcher_configs(account_id,enabled,models,proxy_id,dynamic_egress) SELECT $1,$2,$3,$4,$6 WHERE $5=0 ON CONFLICT DO NOTHING")
+            let updated = sqlx::query("INSERT INTO turn_state_fetcher_configs(account_id,enabled,models,proxy_id,dynamic_egress,schedule) SELECT $1,$2,$3,$4,$6,$7 WHERE $5=0 ON CONFLICT DO NOTHING")
                 .bind(&config.account_id).bind(config.enabled).bind(sqlx::types::Json(&config.models)).bind(&config.proxy_id).bind(config.revision)
                 .bind(config.dynamic_egress.as_ref().map(sqlx::types::Json))
+                .bind(config.schedule.as_ref().map(sqlx::types::Json))
                 .execute(&mut *tx).await.map_err(unavailable)?.rows_affected();
             if updated == 0 {
-                let updated = sqlx::query("UPDATE turn_state_fetcher_configs SET enabled=$2,models=$3,proxy_id=$4,dynamic_egress=$6,revision=revision+1 WHERE account_id=$1 AND revision=$5")
+                let updated = sqlx::query("UPDATE turn_state_fetcher_configs SET enabled=$2,models=$3,proxy_id=$4,dynamic_egress=$6,schedule=$7,revision=revision+1 WHERE account_id=$1 AND revision=$5")
                     .bind(&config.account_id).bind(config.enabled).bind(sqlx::types::Json(&config.models)).bind(&config.proxy_id).bind(config.revision)
                     .bind(config.dynamic_egress.as_ref().map(sqlx::types::Json))
+                    .bind(config.schedule.as_ref().map(sqlx::types::Json))
                     .execute(&mut *tx).await.map_err(unavailable)?.rows_affected();
                 if updated == 0 {
                     return Err(ProviderStoreError::new(

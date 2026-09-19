@@ -5,6 +5,45 @@ use gateway_store::postgres::{
 };
 
 #[tokio::test]
+async fn turn_state_schedule_roundtrip_update_clear_and_validation() {
+    let Some(database) = TestDatabase::create("turn_state_schedule").await else {
+        return;
+    };
+    PgProviderAccountRepository::new(database.pool.clone())
+        .insert_provider_account(account("acct_schedule", "user_schedule"))
+        .await
+        .unwrap();
+    let store = PgTurnStateStore::new(database.pool.clone());
+    let mut config = TurnStateFetcherConfig {
+        account_id: "acct_schedule".to_owned(),
+        enabled: true,
+        models: vec!["gpt-test".to_owned()],
+        proxy_id: None,
+        dynamic_egress: None,
+        schedule: Some(TurnStateFetcherSchedule {
+            start_minute: 540,
+            end_minute: 60,
+        }),
+        revision: 0,
+    };
+    store.save_config(config.clone()).await.unwrap();
+    config.revision = 1;
+    assert_eq!(store.configs().await.unwrap(), vec![config.clone()]);
+    config.schedule = Some(TurnStateFetcherSchedule {
+        start_minute: 0,
+        end_minute: 0,
+    });
+    assert_eq!(
+        store.save_config(config.clone()).await.unwrap_err().kind(),
+        ProviderStoreErrorKind::InvalidData
+    );
+    config.schedule = None;
+    store.save_config(config.clone()).await.unwrap();
+    config.revision = 2;
+    assert_eq!(store.configs().await.unwrap(), vec![config]);
+}
+
+#[tokio::test]
 async fn turn_state_dynamic_egress_roundtrip_and_exclusive_static_proxy() {
     let Some(database) = TestDatabase::create("turn_state_dynamic").await else {
         return;
@@ -23,6 +62,7 @@ async fn turn_state_dynamic_egress_roundtrip_and_exclusive_static_proxy() {
             instance: "azure".to_owned(),
             family: "ipv6".to_owned(),
         }),
+        schedule: None,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -58,6 +98,7 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         models: vec!["gpt-5.4".to_owned()],
         proxy_id: None,
         dynamic_egress: None,
+        schedule: None,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -160,6 +201,7 @@ async fn turn_state_proxy_must_be_tested_and_cannot_be_deleted_while_bound() {
         models: vec!["gpt-5.4".to_owned()],
         proxy_id: Some(saved.id.clone()),
         dynamic_egress: None,
+        schedule: None,
         revision: 0,
     };
     assert!(

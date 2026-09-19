@@ -330,6 +330,13 @@ impl TurnStateFetcher {
         config: TurnStateFetcherConfig,
     ) -> Result<(), ProviderStoreError> {
         ProviderAccountId::new(config.account_id.clone()).map_err(|_| invalid())?;
+        if config
+            .schedule
+            .as_ref()
+            .is_some_and(|schedule| !schedule.is_valid())
+        {
+            return Err(invalid());
+        }
         if let Some(selection) = &config.dynamic_egress
             && config.enabled
         {
@@ -524,7 +531,10 @@ impl TurnStateFetcher {
         let values = self.cache.values();
         let now = Utc::now().timestamp_millis();
         let mut due = Vec::new();
-        for config in configs.iter().filter(|c| c.enabled) {
+        for config in configs
+            .iter()
+            .filter(|c| c.enabled && c.allows_probe_at(now))
+        {
             for model in &config.models {
                 let previous = attempts.iter().find(|a| {
                     a.account_id == config.account_id
@@ -613,6 +623,17 @@ impl TurnStateFetcher {
         cancellation: &CancellationToken,
     ) -> Result<(), ProviderStoreError> {
         let now = Utc::now().timestamp_millis();
+        if !config.allows_probe_at(now) {
+            return Ok(());
+        }
+        // 覆盖整个尝试（包括等待动态 IP）；时段结束后 Drop 负责释放在途租约。
+        let window_end = async {
+            if let Some(schedule) = &config.schedule {
+                tokio::time::sleep(Duration::from_millis(schedule.remaining_ms(now))).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         let initial_value = self
             .cache
             .values()
@@ -621,8 +642,10 @@ impl TurnStateFetcher {
             .map(|v| v.value.clone());
         let started = Instant::now();
         let mut outcome = tokio::select! {
+            biased;
             () = cancellation.cancelled() => return Ok(()),
             () = stop.cancelled() => return Ok(()),
+            () = window_end => return Ok(()),
             result = self.fetch_with_egress(&config, &model) => result,
         };
         let _update = self.updates.lock().await;

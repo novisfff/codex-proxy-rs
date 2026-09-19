@@ -693,13 +693,17 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 | 方法 | 路径 | 请求 / 响应 |
 | --- | --- | --- |
 | GET | `/api/admin/turn-state-fetcher` | `configs`、`values`、`attempts`、`running`、`dynamicEgress` |
-| POST | `/api/admin/turn-state-fetcher/configure` | `{accountId, enabled, models, proxyId, dynamicEgress, revision}` |
+| POST | `/api/admin/turn-state-fetcher/configure` | `{accountId, enabled, models, proxyId, dynamicEgress, schedule, revision}` |
 | POST | `/api/admin/turn-state-fetcher/run` | `{accountId, model}`，为已启用模型排队 |
 | POST | `/api/admin/turn-state-fetcher/egress` | `{revision, instances}`，instances 以实例 ID 为键，暂停动态获取后更新 |
 
 `models` 为最多 32 个不同的上游模型名，开启时不能为空；两个出口字段均为 null 时明确选择直连。
 `dynamicEgress` 为 `{instance, family}`，family 只能是 `ipv4` 或 `ipv6`，与非空 `proxyId` 互斥。
 旧请求省略 `dynamicEgress` 等同 null。动态出口严格使用所选地址类型，不回退到其他出口。
+`schedule` 省略或为 null 表示全天；指定 `{startMinute, endMinute}` 表示每天北京时间的探测窗口。
+两个值均为 0–1439 的整数且不能相等；例如 `{startMinute:540,endMinute:60}` 表示 09:00–次日 01:00。
+开始时间包含、结束时间不包含；时段外不发起探测，结束时取消在途探测及动态 IP 申请。
+手动排队也遵守时段限制，已有有效 292 缓存仍可供普通请求使用。
 
 动态出口实例除 Azure 外支持 `novaproxy`：配置为
 `{provider:"novaproxy",name:"名称",host:"residential-gateway.novaproxy.io",port:1111,username:"YOUR_USERNAME",password:"YOUR_PASSWORD",bindings:{ipv4:{}}}`。

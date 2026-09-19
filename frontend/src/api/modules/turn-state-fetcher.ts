@@ -30,6 +30,7 @@ export interface FetcherConfig {
   models: string[]
   proxyId: string | null
   dynamicEgress?: { instance: string, family: string } | null
+  schedule?: { startMinute: number, endMinute: number } | null
   revision: number
 }
 export interface FetcherValue {

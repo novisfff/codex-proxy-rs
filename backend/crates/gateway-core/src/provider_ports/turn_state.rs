@@ -15,7 +15,52 @@ pub struct TurnStateFetcherConfig {
     pub proxy_id: Option<String>,
     #[serde(default)]
     pub dynamic_egress: Option<DynamicEgressSelection>,
+    #[serde(default)]
+    pub schedule: Option<TurnStateFetcherSchedule>,
     pub revision: i64,
+}
+
+/// 每日北京时间探测窗口；空配置表示全天，起止分钟使用半开区间并允许跨午夜。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateFetcherSchedule {
+    pub start_minute: u16,
+    pub end_minute: u16,
+}
+
+impl TurnStateFetcherSchedule {
+    pub fn is_valid(&self) -> bool {
+        self.start_minute < 1440 && self.end_minute < 1440 && self.start_minute != self.end_minute
+    }
+
+    /// 返回当前窗口剩余毫秒；时段外或配置非法时返回零。
+    pub fn remaining_ms(&self, now_ms: i64) -> u64 {
+        if !self.is_valid() {
+            return 0;
+        }
+        let day_ms = 86_400_000;
+        let current = (now_ms.rem_euclid(day_ms) + 8 * 3_600_000) % day_ms;
+        let start = i64::from(self.start_minute) * 60_000;
+        let end = i64::from(self.end_minute) * 60_000;
+        let active = if start < end {
+            current >= start && current < end
+        } else {
+            current >= start || current < end
+        };
+        if active {
+            (end - current).rem_euclid(day_ms).unsigned_abs()
+        } else {
+            0
+        }
+    }
+}
+
+impl TurnStateFetcherConfig {
+    pub fn allows_probe_at(&self, now_ms: i64) -> bool {
+        self.schedule
+            .as_ref()
+            .is_none_or(|schedule| schedule.remaining_ms(now_ms) > 0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

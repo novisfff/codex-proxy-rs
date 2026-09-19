@@ -12,6 +12,51 @@ use gateway_core::provider_ports::{
 use gateway_core::routing::ProviderKind;
 
 #[test]
+fn turn_state_schedule_supports_beijing_time_boundaries_and_midnight() {
+    use gateway_core::provider_ports::turn_state::TurnStateFetcherSchedule;
+    let timestamp = |minute: i64| (minute - 480) * 60_000;
+    let daytime = TurnStateFetcherSchedule {
+        start_minute: 540,
+        end_minute: 1020,
+    };
+    assert_eq!(daytime.remaining_ms(timestamp(539)), 0);
+    assert_eq!(daytime.remaining_ms(timestamp(540)), 8 * 3_600_000);
+    assert_eq!(daytime.remaining_ms(timestamp(1020) - 1), 1);
+    assert_eq!(daytime.remaining_ms(timestamp(1020)), 0);
+    let overnight = TurnStateFetcherSchedule {
+        start_minute: 540,
+        end_minute: 60,
+    };
+    assert_eq!(overnight.remaining_ms(timestamp(540)), 16 * 3_600_000);
+    assert_eq!(overnight.remaining_ms(timestamp(0)), 3_600_000);
+    assert_eq!(overnight.remaining_ms(timestamp(60)), 0);
+    assert_eq!(overnight.remaining_ms(timestamp(539)), 0);
+    assert_eq!(
+        overnight.remaining_ms(timestamp(540) + 86_400_000),
+        16 * 3_600_000
+    );
+    for (start_minute, end_minute) in [(0, 0), (1440, 60), (540, 1440)] {
+        let invalid = TurnStateFetcherSchedule {
+            start_minute,
+            end_minute,
+        };
+        assert!(!invalid.is_valid());
+        assert_eq!(invalid.remaining_ms(timestamp(600)), 0);
+    }
+}
+
+#[test]
+fn turn_state_schedule_defaults_to_all_day_for_existing_configs() {
+    use gateway_core::provider_ports::turn_state::TurnStateFetcherConfig;
+    let config: TurnStateFetcherConfig = serde_json::from_value(serde_json::json!({
+        "accountId":"test", "enabled":true, "models":["test"], "proxyId":null, "revision":0
+    }))
+    .unwrap();
+    assert!(config.schedule.is_none());
+    assert!(config.allows_probe_at(0));
+}
+
+#[test]
 fn oauth_pending_binding_debug_redacts_raw_value() {
     let binding = OAuthPendingBinding::try_new("must-not-appear").expect("valid binding");
 

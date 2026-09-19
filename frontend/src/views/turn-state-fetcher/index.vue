@@ -54,6 +54,9 @@ const dynamicOptions = computed(() => snapshot.value.dynamicEgress?.instances.ma
 const familyOptions = computed(() => (snapshot.value.dynamicEgress?.instances.find(instance => instance.id === dynamicInstance.value)?.families ?? []).map(family => ({ label: family === 'ipv4' ? 'IPv4' : 'IPv6', value: family })))
 const editOpen = ref(false)
 const form = ref<FetcherConfig>({ accountId: '', enabled: false, models: [], proxyId: null, revision: 0 })
+const scheduleMode = ref('all')
+const scheduleStart = ref('09:00')
+const scheduleEnd = ref('01:00')
 const proxyChoice = ref('')
 const catalog = ref<Array<{ id: string, label: string }>>([])
 const customModel = ref('')
@@ -132,6 +135,28 @@ async function saveInstance(remove = false) {
 function config(accountId: string): FetcherConfig {
   return snapshot.value.configs.find(c => c.accountId === accountId) ?? { accountId, enabled: false, models: [], proxyId: null, revision: 0 }
 }
+function timeLabel(minute: number) {
+  return `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`
+}
+function timeMinute(value: string) {
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value))
+    return null
+  const [hour, minute] = value.split(':').map(Number)
+  return hour! * 60 + minute!
+}
+function scheduleLabel(selected: FetcherConfig) {
+  const schedule = selected.schedule
+  return schedule ? `${timeLabel(schedule.startMinute)}–${schedule.startMinute > schedule.endMinute ? '次日 ' : ''}${timeLabel(schedule.endMinute)}（北京时间）` : '全天'
+}
+function inSchedule(selected: FetcherConfig) {
+  const schedule = selected.schedule
+  if (!schedule)
+    return true
+  const minute = Math.floor((now.value + 8 * 3600000) % 86400000 / 60000)
+  return schedule.startMinute < schedule.endMinute
+    ? minute >= schedule.startMinute && minute < schedule.endMinute
+    : minute >= schedule.startMinute || minute < schedule.endMinute
+}
 function rows(accountId: string) {
   const selected = config(accountId)
   return selected.models.map((model) => {
@@ -139,7 +164,7 @@ function rows(accountId: string) {
     const attempt = snapshot.value.attempts.find(a => a.accountId === accountId && a.model === model && a.configRevision === selected.revision)
     const running = runningRequests.value.filter(([account, currentModel]) => account === accountId && currentModel === model).length
     const expired = !!value && value.expiresAt <= now.value
-    const status = !selected.enabled ? '已暂停' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
+    const status = !selected.enabled ? '已暂停' : !inSchedule(selected) ? '时段外 · 等待开启' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
     return { model, value, attempt, running, expired, status }
   })
 }
@@ -204,6 +229,9 @@ async function load() {
 async function edit(account: Account) {
   const generation = ++formGeneration
   form.value = { ...config(account.id), models: [...config(account.id).models] }
+  scheduleMode.value = form.value.schedule ? 'custom' : 'all'
+  scheduleStart.value = timeLabel(form.value.schedule?.startMinute ?? 540)
+  scheduleEnd.value = timeLabel(form.value.schedule?.endMinute ?? 60)
   proxyChoice.value = form.value.revision ? form.value.proxyId ?? 'direct' : ''
   if (form.value.dynamicEgress)
     proxyChoice.value = 'dynamic'
@@ -243,6 +271,13 @@ function addModel() {
   }
 }
 async function save() {
+  const startMinute = timeMinute(scheduleStart.value)
+  const endMinute = timeMinute(scheduleEnd.value)
+  if (scheduleMode.value === 'custom' && (startMinute === null || endMinute === null || startMinute === endMinute)) {
+    toast.warning('请填写有效且不同的开始、结束时间；全天探测请选择“全天”')
+    return
+  }
+  form.value.schedule = scheduleMode.value === 'custom' ? { startMinute: startMinute!, endMinute: endMinute! } : null
   if (!formReady.value || !proxyChoice.value) {
     toast.warning('请选择获取专用代理或直连')
     return
@@ -305,7 +340,7 @@ onBeforeUnmount(() => {
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
       </p>
       <p class="text-cp-sm text-cp-text-secondary">
-        Azure 出口校验并保持 24 小时不重复。NovaProxy 每次通过 SOCKS5 新建连接，实际出口未验证，可能重复。连接失败不会回退到其他出口。
+        Azure 获取到 292 时保留 IP 并优先复用，未获取到时换 IP，新申请避免连续重复。NovaProxy 每次通过 SOCKS5 新建连接，实际出口未验证，可能重复。
       </p>
       <BaseButton :disabled="!instancesEditable || saving" @click="editInstance()">
         添加出口实例
@@ -361,13 +396,16 @@ onBeforeUnmount(() => {
         <p v-if="!config(account.id).models.length" class="text-cp-sm text-cp-text-tertiary">
           尚未选择模型。配置后可自动获取，也可手动触发一次。
         </p>
+        <p class="text-cp-sm text-cp-text-secondary">
+          探测时段：{{ scheduleLabel(config(account.id)) }}
+        </p>
         <div class="mt-4 grid gap-4">
           <section v-for="row in rows(account.id)" :key="row.model" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-4">
             <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="flex min-w-0 flex-wrap items-center gap-3">
                 <strong class="break-all text-cp-text">{{ row.model }}</strong><span :class="row.status === '有效' ? 'text-cp-success' : row.expired || row.attempt?.paused ? 'text-cp-error' : 'text-cp-text-secondary'">{{ row.status }}</span>
               </div>
-              <BaseButton size="sm" :disabled="saving || error || !!row.running || !config(account.id).enabled || row.attempt?.paused || (!!row.attempt?.failures && row.attempt.nextAttemptAt > now)" @click="run(account.id, row.model)">
+              <BaseButton size="sm" :disabled="saving || error || !!row.running || !config(account.id).enabled || !inSchedule(config(account.id)) || row.attempt?.paused || (!!row.attempt?.failures && row.attempt.nextAttemptAt > now)" @click="run(account.id, row.model)">
                 立即获取
               </BaseButton>
             </div>
@@ -475,6 +513,20 @@ onBeforeUnmount(() => {
         <div class="flex items-center justify-between">
           <span class="text-cp-text">自动获取</span><BaseSwitch v-model="form.enabled" label="开启自动获取" :disabled="saving" />
         </div>
+        <BaseFormItem label="探测时段">
+          <BaseSelect v-model="scheduleMode" :options="[{ label: '全天', value: 'all' }, { label: '固定时段', value: 'custom' }]" :disabled="saving" />
+        </BaseFormItem>
+        <div v-if="scheduleMode === 'custom'" class="grid gap-3 sm:grid-cols-2">
+          <BaseFormItem label="开始时间（北京时间）">
+            <BaseInput v-model="scheduleStart" type="time" aria-label="探测开始时间" :disabled="saving" />
+          </BaseFormItem>
+          <BaseFormItem label="结束时间（北京时间）">
+            <BaseInput v-model="scheduleEnd" type="time" aria-label="探测结束时间" :disabled="saving" />
+          </BaseFormItem>
+        </div>
+        <p class="text-cp-xs text-cp-text-secondary">
+          每天按北京时间执行，支持跨午夜（如 09:00–次日 01:00）。时段外停止探测，已有有效 Turn State 仍可正常使用。
+        </p>
         <BaseFormItem label="获取专用代理">
           <BaseSelect v-model="proxyChoice" :options="proxyOptions" placeholder="请选择代理或直连" :disabled="saving" /><p class="text-cp-xs text-cp-text-secondary">
             只用于获取任务，不修改账号的业务代理。代理失败时不会回退到直连。
