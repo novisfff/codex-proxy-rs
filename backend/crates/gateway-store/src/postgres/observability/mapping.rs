@@ -432,6 +432,7 @@ pub(crate) fn admin_usage_list_record(
         }
     };
     Ok(admin_observability::UsageListRecord {
+        request_kind: record.request_kind,
         response_turn_state_byte_length: record.response_turn_state_byte_length,
         id: record.id,
         endpoint: record.endpoint,
@@ -760,6 +761,7 @@ pub(crate) fn usage_list_record_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<UsageListRecord> {
     Ok(UsageListRecord {
+        request_kind: get(row, "request_kind")?,
         response_turn_state_byte_length: optional_unsigned(row, "response_turn_state_byte_length")?,
         id: get(row, "id")?,
         endpoint: get(row, "endpoint")?,

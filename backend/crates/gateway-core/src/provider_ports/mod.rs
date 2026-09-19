@@ -1244,6 +1244,7 @@ pub trait OAuthPendingFlowPort: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderStorePorts {
     turn_state: Option<Arc<dyn turn_state::TurnStateStore>>,
+    execution: Option<Arc<dyn crate::engine::ExecutionStore>>,
     accounts: Arc<dyn ProviderAccountStore>,
     leases: Arc<dyn ProviderLeasePort>,
     session_affinity: Arc<dyn ProviderSessionAffinityPort>,
@@ -1276,6 +1277,7 @@ impl ProviderStorePorts {
         Self {
             accounts,
             turn_state: None,
+            execution: None,
             leases,
             session_affinity,
             session_exclusions,
@@ -1303,6 +1305,18 @@ impl ProviderStorePorts {
     #[must_use]
     pub fn turn_state(&self) -> Option<Arc<dyn turn_state::TurnStateStore>> {
         self.turn_state.clone()
+    }
+
+    /// Provider 内部辅助请求使用的执行观测端口；未注入时不记录辅助用量。
+    #[must_use]
+    pub fn with_execution(mut self, store: Arc<dyn crate::engine::ExecutionStore>) -> Self {
+        self.execution = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn execution(&self) -> Option<Arc<dyn crate::engine::ExecutionStore>> {
+        self.execution.clone()
     }
 
     #[must_use]

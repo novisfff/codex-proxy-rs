@@ -62,7 +62,7 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
 迁移成功后不再依赖原文件，`EGRESS_NOVAPROXY_CREDENTIALS_DIR` 仅供旧文件迁移使用。
 账号获取器选择此动态出口实例和 IPv4。仅使用 Rotating 用户名，不添加 sticky/session 参数。
 
-服务仅接受 `*.novaproxy.io` 的单级子域名，每次尝试新建一个 CONNECT 隧道，
+服务仅接受 `*.novaproxy.io` 的单级子域名，每次尝试通过 SOCKS5 用户名/密码认证新建一个 CONNECT 隧道，
 只访问官方 OpenAI；TLS 端到端校验证书，失败不会直连或改用业务代理。
 当前 Residential Premium 仅支持 IPv4。供应商负责轮换，**不保证最近 24 小时不重复**；
 独立 IP 探测与 OpenAI 连接可能走不同出口，因此不探测、不声明实际 OpenAI 出口 IP，页面显示未验证。
@@ -83,7 +83,8 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
   被清理的地址计入最近 24 小时排除记录。
   重复分配最多尝试 5 次。Azure CLI 等待 ARM 完成，单次命令上限 10 分钟；网关等待上限 15 分钟，
   超时发出释放请求，服务完成正在进行的 ARM 操作后清理。
-- 租约就绪后最长保留 90 秒，CONNECT 限一次，隧道最长 60 秒。网关上游请求最长 45 秒。
+- 租约就绪后最长保留 90 秒，网关到出口服务的 CONNECT 限一次；出口服务到 NovaProxy 使用 SOCKS5 CONNECT，隧道最长 60 秒。
+  网关上游请求最长 45 秒。
   失败、取消和到期均关闭隧道；Azure 还会解绑并删除自己的公网 IP，下一请求不会复用旧地址。
 - IPv4/IPv6 是严格选择，DNS、绑定或探测失败不改用另一协议、旧 IP、业务代理或默认出口。
 - Azure IP 历史按规范化地址持久化，连接和清理时延后最后使用时间。没有 24 小时外的可用 IP 时失败重试。
@@ -103,5 +104,5 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
 python -m unittest discover -s deploy/dynamic-egress -v
 ```
 
-测试使用替身 Azure 和本地真实 CONNECT 隧道，不申请云资源、不调用付费 OpenAI。
+测试使用替身 Azure、本地真实 SOCKS5 上游和 CONNECT 隧道，不申请云资源、不调用付费 OpenAI。
 部署验收仍需对真实 Azure 双栈分配、出站映射、Managed Identity 权限和 OpenAI 响应分别验证。

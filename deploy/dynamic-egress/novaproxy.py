@@ -1,14 +1,12 @@
-"""NovaProxy Rotating：每个租约只建立一个上游 CONNECT，不探测或猜测出口 IP。"""
+"""NovaProxy Rotating：每个租约只建立一个上游 SOCKS5 CONNECT，不探测或猜测出口 IP。"""
 
 import asyncio
-import base64
 import contextlib
+import ipaddress
 import json
 import os
 import re
 from pathlib import Path
-
-import h11
 
 
 class NovaProxy:
@@ -21,7 +19,10 @@ class NovaProxy:
             raise ValueError("Invalid proxy port")
         for field in ("username", "password"):
             value = config.get(field)
-            if not isinstance(value, str) or not 1 <= len(value) <= 1024 or any(ord(c) < 33 or ord(c) > 126 for c in value):
+            # RFC 1929 的用户名和密码长度字段各占一个字节；NovaProxy 凭据只允许
+            # 可打印 ASCII，避免 URL/握手编码产生歧义。
+            if (not isinstance(value, str) or not 1 <= len(value) <= 255
+                    or any(ord(c) < 33 or ord(c) > 126 for c in value)):
                 raise ValueError("Invalid credentials")
         if ":" in config["username"]:
             raise ValueError("Invalid username")
@@ -45,28 +46,92 @@ class NovaProxy:
         self.validate(credentials)
         reader, writer = await asyncio.open_connection(credentials["host"], credentials["port"])
         try:
-            connection = h11.Connection(h11.CLIENT, max_incomplete_event_size=16384)
-            auth = base64.b64encode(f"{credentials['username']}:{credentials['password']}".encode())
-            writer.write(connection.send(h11.Request(method=b"CONNECT", target=target,
-                headers=[(b"host", target), (b"proxy-authorization", b"Basic " + auth)])))
-            writer.write(connection.send(h11.EndOfMessage()))
+            host, port = _target_parts(target)
+            username = credentials["username"].encode("ascii")
+            password = credentials["password"].encode("ascii")
+
+            # NovaProxy 网关使用 RFC 1928 的 SOCKS5 握手和 RFC 1929 用户名/密码认证。
+            writer.write(b"\x05\x01\x02")
             await writer.drain()
-            while True:
-                event = connection.next_event()
-                if event is h11.NEED_DATA:
-                    data = await reader.read(8192)
-                    if not data:
-                        raise ConnectionError("Proxy closed before CONNECT response")
-                    connection.receive_data(data)
-                elif isinstance(event, h11.InformationalResponse):
-                    continue
-                elif isinstance(event, h11.Response) and event.status_code == 200:
-                    return reader, writer, connection.trailing_data[0]
-                else:
-                    # 不透传供应商错误正文或认证上下文。
-                    raise ConnectionError("NovaProxy CONNECT rejected")
+            version, method = await _read_exactly(reader, 2)
+            if version != 5 or method != 2:
+                raise ConnectionError("NovaProxy SOCKS5 authentication rejected")
+
+            writer.write(
+                b"\x01" + bytes((len(username),)) + username + bytes((len(password),)) + password
+            )
+            await writer.drain()
+            auth_version, auth_status = await _read_exactly(reader, 2)
+            if auth_version != 1 or auth_status != 0:
+                raise ConnectionError("NovaProxy SOCKS5 authentication rejected")
+
+            address_type, address = _socks5_address(host)
+            writer.write(b"\x05\x01\x00" + address_type + address + port.to_bytes(2, "big"))
+            await writer.drain()
+            response = await _read_exactly(reader, 4)
+            response_version, reply, reserved, response_type = response
+            if response_version != 5 or reserved != 0:
+                raise ConnectionError("NovaProxy SOCKS5 handshake failed")
+            await _discard_bound_address(reader, response_type)
+            await _read_exactly(reader, 2)  # BND.PORT
+            if reply != 0:
+                # 不透传供应商错误正文或认证上下文。
+                raise ConnectionError("NovaProxy SOCKS5 CONNECT rejected")
+            return reader, writer, b""
         except BaseException:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
             raise
+
+
+async def _read_exactly(reader, size):
+    try:
+        return await reader.readexactly(size)
+    except (asyncio.IncompleteReadError, ConnectionError) as error:
+        raise ConnectionError("NovaProxy SOCKS5 handshake failed") from error
+
+
+def _target_parts(target):
+    try:
+        value = target.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ConnectionError("Invalid SOCKS5 target") from error
+    if value.startswith("["):
+        host, separator, port_text = value[1:].partition("]:")
+    else:
+        host, separator, port_text = value.rpartition(":")
+    if not separator or not host or not port_text:
+        raise ConnectionError("Invalid SOCKS5 target")
+    try:
+        port = int(port_text)
+    except ValueError as error:
+        raise ConnectionError("Invalid SOCKS5 target") from error
+    if not 1 <= port <= 65535:
+        raise ConnectionError("Invalid SOCKS5 target")
+    return host, port
+
+
+def _socks5_address(host):
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        encoded = host.encode("idna")
+        if not 1 <= len(encoded) <= 255:
+            raise ConnectionError("Invalid SOCKS5 target")
+        return b"\x03", bytes((len(encoded),)) + encoded
+    if address.version == 4:
+        return b"\x01", address.packed
+    return b"\x04", address.packed
+
+
+async def _discard_bound_address(reader, address_type):
+    if address_type == 1:
+        await _read_exactly(reader, 4)
+    elif address_type == 3:
+        length = (await _read_exactly(reader, 1))[0]
+        await _read_exactly(reader, length)
+    elif address_type == 4:
+        await _read_exactly(reader, 16)
+    else:
+        raise ConnectionError("NovaProxy SOCKS5 handshake failed")

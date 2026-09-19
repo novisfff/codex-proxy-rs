@@ -4,6 +4,69 @@ mod turn_state_fetcher {
     use gateway_core::provider_ports::{ProviderStoreErrorKind, turn_state::*};
     use gateway_core::task::{ScheduledTask, WorkerCycleContext, WorkerId};
 
+    use gateway_core::engine::{
+        AttemptRecord, ExecutionOutcome, ExecutionStore, IntermediateFailure,
+        ModelRequestFinalization, ModelRequestId, NewModelRequest, RecoveryReport,
+    };
+    use gateway_core::error::StoreError;
+    use gateway_core::upstream::UpstreamSendState;
+
+    #[derive(Default)]
+    struct ProbeExecutionStore {
+        requests: Mutex<Vec<NewModelRequest>>,
+        attempts: Mutex<Vec<AttemptRecord>>,
+        finals: Mutex<Vec<ModelRequestFinalization>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionStore for ProbeExecutionStore {
+        async fn create_model_request(&self, request: NewModelRequest) -> Result<(), StoreError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(())
+        }
+        async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), StoreError> {
+            self.attempts.lock().unwrap().push(attempt);
+            Ok(())
+        }
+        async fn mark_send_state(
+            &self,
+            _: &ModelRequestId,
+            _: UpstreamSendState,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn mark_downstream_committed(
+            &self,
+            _: &ModelRequestId,
+            _: std::time::SystemTime,
+            _: Option<u16>,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn record_client_status(&self, _: &ModelRequestId, _: u16) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn record_intermediate_failure(
+            &self,
+            _: IntermediateFailure,
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+        async fn finalize_model_request(
+            &self,
+            record: ModelRequestFinalization,
+        ) -> Result<(), StoreError> {
+            self.finals.lock().unwrap().push(record);
+            Ok(())
+        }
+        async fn recover_expired(
+            &self,
+            _: std::time::SystemTime,
+        ) -> Result<RecoveryReport, StoreError> {
+            Ok(RecoveryReport::default())
+        }
+    }
+
     #[derive(Default)]
     struct MemoryTurnStateStore {
         configs: Mutex<Vec<TurnStateFetcherConfig>>,
@@ -83,6 +146,7 @@ mod turn_state_fetcher {
         ) -> BoxFuture<'_, Result<TurnStateFetchEgress, ProviderStoreError>> {
             Box::pin(async {
                 Ok(TurnStateFetchEgress {
+                    config_revision: gateway_core::routing::ConfigRevision::new(7).unwrap(),
                     proxy: self.proxy.lock().unwrap().clone(),
                     max_concurrent: 1,
                     request_interval_ms: 0,
@@ -215,9 +279,29 @@ mod turn_state_fetcher {
         });
         admin.configure_turn_state_fetcher(selected).await.unwrap();
         let worker = fetch_worker(&mut bundle);
-        cycle(&worker).await;
-        store.attempts.lock().unwrap()[0].next_attempt_at = 0;
-        cycle(&worker).await;
+        let cancellation = CancellationToken::new();
+        let context = WorkerCycleContext::new(worker.0.clone(), None, cancellation.clone());
+        let stop = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if store
+                        .attempts
+                        .lock()
+                        .unwrap()
+                        .first()
+                        .is_some_and(|a| a.failures >= 2)
+                    {
+                        cancellation.cancel();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("two failed leases should retry without backoff");
+        };
+        let (result, ()) = tokio::join!(worker.1.run_cycle(context), stop);
+        result.unwrap();
         let snapshot = admin.turn_state_fetcher().await.unwrap();
         assert_eq!(
             snapshot.attempts[0].exit_ip.as_deref(),
@@ -236,8 +320,11 @@ mod turn_state_fetcher {
                     .to_owned()
             })
             .collect();
-        assert_eq!(ids.len(), 2);
-        assert_ne!(ids[0], ids[1]);
+        assert!(ids.len() >= 2);
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            ids.len()
+        );
         store.configs.lock().unwrap()[0].enabled = false;
         Mock::given(method("PUT"))
             .and(path("/v1/instances"))
@@ -260,13 +347,13 @@ mod turn_state_fetcher {
                 .iter()
                 .filter(|r| r.method.as_str() == "DELETE")
                 .count()
-                == 2
+                == ids.len()
             {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("both dynamic leases must be released");
+        panic!("all dynamic leases must be released");
     }
 
     #[tokio::test]
@@ -756,17 +843,20 @@ mod turn_state_fetcher {
         let body = zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["model"], MODEL);
-        let probe_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        let message = body["input"].as_array().unwrap().last().unwrap();
+        let probe_text = message["content"][0]["text"].as_str().unwrap();
         let (nonce, prompt) = probe_text.split_once('\n').unwrap();
         assert!(!nonce.is_empty() && nonce.chars().all(|c| c.is_ascii_digit()));
         assert_eq!(prompt, "Reply only OK.");
-        assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(body["instructions"], "You are Codex, an AI coding agent.");
-        assert_eq!(body["tools"], json!([]));
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "user");
+        assert_eq!(message["content"][0]["type"], "input_text");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
         for key in ["session_id", "thread_id", "x-codex-window-id", "turn_id"] {
@@ -803,6 +893,96 @@ mod turn_state_fetcher {
                 .values,
             snapshot.values
         );
+    }
+
+    #[tokio::test]
+    async fn probe_usage_records_completed_non_292_and_failed_streams() {
+        for (length, status, body, succeeded) in [
+            (292, 200, COMPLETED_SESSION_SSE, true),
+            (312, 200, COMPLETED_SESSION_SSE, true),
+            (
+                0,
+                200,
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_partial\",\"model\":\"gpt-5.4\"}}\n\n",
+                false,
+            ),
+            (0, 429, "{}", false),
+        ] {
+            let server = MockServer::start().await;
+            let mut template = ResponseTemplate::new(status)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body.replace(
+                    r#""input_tokens":1,"output_tokens":1,"total_tokens":2"#,
+                    r#""input_tokens":100,"input_tokens_details":{"cached_tokens":40},"output_tokens":10,"output_tokens_details":{"reasoning_tokens":3},"total_tokens":110"#,
+                ));
+            if length > 0 {
+                template = template.insert_header("x-codex-turn-state", "a".repeat(length));
+            }
+            Mock::given(method("POST"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let accounts = fetch_accounts(&server).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let execution = Arc::new(ProbeExecutionStore::default());
+            let config = valid_config();
+            let mut bundle = provider_openai::initialize(
+                config.config.clone(),
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                    .with_turn_state(store)
+                    .with_execution(execution.clone()),
+            )
+            .await
+            .unwrap();
+            bundle
+                .admin_provider()
+                .configure_turn_state_fetcher(fetch_config())
+                .await
+                .unwrap();
+            cycle(&fetch_worker(&mut bundle)).await;
+            let requests = execution.requests.lock().unwrap();
+            let attempts = execution.attempts.lock().unwrap();
+            let finals = execution.finals.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(finals.len(), 1);
+            let request = &requests[0];
+            let record = &finals[0];
+            assert_eq!(request.id, record.request_id);
+            assert_eq!(request.request_kind.as_deref(), Some("turn_state_fetcher"));
+            assert_eq!(request.client_transport, "internal");
+            assert!(request.client_api_key_id.is_none());
+            assert_eq!(
+                request.config_revision,
+                gateway_core::routing::ConfigRevision::new(7).unwrap()
+            );
+            assert_eq!(
+                attempts[0].provider_account_id.as_ref().unwrap().as_str(),
+                ACCOUNT
+            );
+            assert_eq!(record.outcome == ExecutionOutcome::Succeeded, succeeded);
+            assert_eq!(record.downstream_committed_at.is_some(), succeeded);
+            if succeeded {
+                assert_eq!(record.usage.input_tokens, Some(100));
+                assert_eq!(record.usage.output_tokens, Some(10));
+                assert_eq!(record.usage.total_tokens, Some(110));
+                assert_eq!(record.usage.cached_tokens, Some(40));
+                assert_eq!(record.usage.reasoning_tokens, Some(3));
+                assert_ne!(
+                    record.cost,
+                    gateway_core::metering::CostEstimate::unavailable()
+                );
+                assert_eq!(record.upstream_response_model.as_deref(), Some(MODEL));
+                assert_eq!(record.send_state, UpstreamSendState::Sent);
+                assert!(
+                    record
+                        .provider_metadata_json
+                        .as_ref()
+                        .unwrap()
+                        .contains(&"a".repeat(length))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -905,11 +1085,13 @@ mod turn_state_fetcher {
             .await;
         let accounts = fetch_accounts(&server).await;
         let store = Arc::new(MemoryTurnStateStore::default());
+        let execution = Arc::new(ProbeExecutionStore::default());
         let config = valid_config();
         let mut bundle = provider_openai::initialize(
             config.config.clone(),
             provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
-                .with_turn_state(store),
+                .with_turn_state(store)
+                .with_execution(execution.clone()),
         )
         .await
         .unwrap();
@@ -958,6 +1140,20 @@ mod turn_state_fetcher {
         assert!(state.values.is_empty());
         assert!(state.attempts.is_empty());
         assert!(state.running.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if execution.finals.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled probe must finalize");
+        let finals = execution.finals.lock().unwrap();
+        assert_eq!(finals[0].outcome, ExecutionOutcome::Failed);
+        assert_eq!(finals[1].outcome, ExecutionOutcome::Cancelled);
+        assert!(finals[1].downstream_committed_at.is_none());
     }
 
     #[tokio::test]
@@ -1056,6 +1252,8 @@ use crate::support::{
 };
 
 const COMPLETED_SESSION_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\"}}\n\n",
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 );

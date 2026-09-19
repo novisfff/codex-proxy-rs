@@ -228,6 +228,7 @@ pub async fn initialize(
                 Arc::clone(&accounts),
                 Arc::clone(&leases),
                 ports.cooldowns(),
+                ports.execution(),
                 Arc::clone(&catalog),
                 cache,
                 profile.clone(),

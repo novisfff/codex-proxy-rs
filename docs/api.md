@@ -1359,6 +1359,8 @@ OpenAI 优先采用服务端 `openai-model` / `x-openai-model` 报告（流内�
 请求 ID 读取审计详情，响应中的额度观测仍可用于预测配对。此分类以实际 `generate` 字段为准，
 不能仅凭客户端的同名 metadata 或输出 Token 为零排除普通推理；其他 Provider 不套用该规则。
 
+292 获取器完成的探测同样进入使用统计，列表的 `requestKind` 为 `turn_state_fetcher`，`clientTransport` 为 `internal`；不关联客户 API Key。
+
 详情接口按 `id` 可读取成功、失败或未完成请求，返回 `trace`（未采集记录为 `null`）和
 `relatedRequests[]`（`requestId / relation / outcome / completedAt`）；`relation` 为 `recovered_by` 或
 `recovers`。`trace` 是执行终态时的有界脱敏时间线，包含 request、attempt 和 exchange 关联、阶段、

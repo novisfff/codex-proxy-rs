@@ -155,6 +155,8 @@ export type UsageDisplayRecord = UsageListRecord
 type UsageCommonRecord = UsageDisplayRecord | UsageViewModel
 
 export function usageTransportType(transport?: string | null) {
+  if (transport === 'internal')
+    return '内部'
   if (transport === 'websocket')
     return 'WS'
 

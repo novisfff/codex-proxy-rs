@@ -564,3 +564,97 @@ async fn zero_attempt_postgres_write_failures_are_not_retried_and_do_not_stop_th
     assert_eq!(recovered.trace, None);
     database.close().await;
 }
+
+#[tokio::test]
+async fn internal_probe_usage_is_visible_in_usage_and_dashboard_after_buffer_flush() {
+    use gateway_core::{
+        engine::{AttemptTrigger, ExecutionOutcome},
+        policy::ClientApiKeyId,
+    };
+    use gateway_store::postgres::{
+        ObservabilityPageSize, ObservabilityRange, UsageRecordFilter, UsageRecordQuery,
+    };
+    let Some(database) = TestDatabase::create("internal_probe_usage").await else {
+        return;
+    };
+    let (store, writer) = BufferedExecutionStore::with_capacity(
+        Arc::new(PgExecutionStore::new(database.pool.clone())),
+        NonZeroUsize::new(16).unwrap(),
+    );
+    let now = chrono::Utc::now();
+    for (id, probe, success) in [
+        ("req_probe_complete", true, true),
+        ("req_probe_failed", true, false),
+        ("req_regular_complete", false, true),
+    ] {
+        let mut request = accepted_request(id);
+        if probe {
+            request.client_api_key_ref = ClientApiKeyId::new("system:turn-state-fetcher").unwrap();
+            request.client_transport = "internal".to_owned();
+            request.request_kind = Some("turn_state_fetcher".to_owned());
+        }
+        let mut finalization = early_failure(&request);
+        finalization.attempt_count = 1;
+        finalization.send_state = UpstreamSendState::Sent;
+        finalization.upstream_status_code = Some(if success { 200 } else { 429 });
+        if success {
+            finalization.outcome = ExecutionOutcome::Succeeded;
+            finalization.error = None;
+            finalization.downstream_committed_at = Some(SystemTime::now());
+            finalization.client_status_code = Some(200);
+            finalization.usage.input_tokens = Some(10);
+            finalization.usage.output_tokens = Some(2);
+            finalization.usage.total_tokens = Some(12);
+        }
+        let attempt = AttemptRecord {
+            request_id: request.id.clone(),
+            attempt_count: std::num::NonZeroU32::MIN,
+            trigger: AttemptTrigger::Initial,
+            provider_kind: ProviderKind::new("openai").unwrap(),
+            provider_account_id: None,
+            provider_account_ref: Some(ProviderAccountId::new("acct_probe").unwrap()),
+            upstream_model_id: Some(UpstreamModelId::new("gpt-5.4").unwrap()),
+            upstream_transport: "http_sse".to_owned(),
+            http_version: None,
+            account_selection_wait_ms: None,
+            capacity_used_slots: None,
+            capacity_total_slots: None,
+        };
+        store
+            .create_model_request_with_attempt(request, attempt)
+            .await
+            .unwrap();
+        store.finalize_model_request(finalization).await.unwrap();
+    }
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    writer.run(cancellation).await.unwrap();
+    assert_eq!(store.stats().write_failure_total, 0);
+    let range = ObservabilityRange::new(
+        now - chrono::TimeDelta::hours(1),
+        now + chrono::TimeDelta::hours(1),
+    )
+    .unwrap();
+    let repository = observability_repository(&database.pool);
+    let page = repository
+        .list_usage_records(UsageRecordQuery {
+            range,
+            filter: UsageRecordFilter::default(),
+            current_page: 1,
+            page_size: ObservabilityPageSize::new(10).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2);
+    let probe = page
+        .items
+        .iter()
+        .find(|r| r.id == "req_probe_complete")
+        .unwrap();
+    assert_eq!(probe.request_kind.as_deref(), Some("turn_state_fetcher"));
+    assert_eq!(probe.client_transport, "internal");
+    let dashboard = repository.dashboard_summary(range, now).await.unwrap();
+    assert_eq!(dashboard.totals.input_tokens, 20);
+    assert_eq!(dashboard.totals.total_tokens, 24);
+    database.close().await;
+}

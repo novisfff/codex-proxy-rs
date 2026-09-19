@@ -22,7 +22,8 @@ class NovaTests(unittest.IsolatedAsyncioTestCase):
     def test_configuration_rejects_ipv6_credentials_and_paths(self):
         validate_instances({"nova": instance()})
         for change in ({"bindings": {"ipv6": {}}}, {"password": ""}, {"credentialRef": "../secret"},
-                       {"host": "novaproxy.io.evil.example"}, {"port": True}, {"port": 0}, {"username": "bad\r\nuser"}):
+                       {"host": "novaproxy.io.evil.example"}, {"port": True}, {"port": 0},
+                       {"username": "bad\r\nuser"}, {"password": "x" * 256}):
             with self.assertRaises(web.HTTPBadRequest):
                 validate_instances({"nova": dict(instance(), **change)})
 
@@ -40,13 +41,32 @@ class NovaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_connect_auth_tunnel_and_rejection(self):
         requests = []
-        response = b"HTTP/1.1 200 Connection established\r\n\r\nhello"
         async def gateway(reader, writer):
-            requests.append(await reader.readuntil(b"\r\n\r\n"))
-            writer.write(response)
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            try:
+                self.assertEqual(await reader.readexactly(3), b"\x05\x01\x02")
+                writer.write(b"\x05\x02")
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(1), b"\x01")
+                username = await reader.readexactly((await reader.readexactly(1))[0])
+                password_length = (await reader.readexactly(1))[0]
+                password = await reader.readexactly(password_length)
+                writer.write(b"\x01\x00")
+                await writer.drain()
+                # 第一次请求成功，第二次验证 SOCKS5 CONNECT 被供应商拒绝时的处理。
+                request = await reader.readexactly(4)
+                self.assertEqual(request, b"\x05\x01\x00\x03")
+                host_length = (await reader.readexactly(1))[0]
+                host = await reader.readexactly(host_length)
+                port = await reader.readexactly(2)
+                requests.append((username, password, host, port))
+                if len(requests) == 1:
+                    writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00hello")
+                else:
+                    writer.write(b"\x05\x02\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
         server = await asyncio.start_server(gateway, "127.0.0.1", 0)
         original = asyncio.open_connection
         async def dial(host, port):
@@ -58,10 +78,8 @@ class NovaTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(trailing + await reader.read(), b"hello")
                 writer.close()
                 await writer.wait_closed()
-                self.assertIn(b"CONNECT api.openai.com:443 HTTP/1.1", requests[0])
-                self.assertIn(base64.b64encode(b"test:secret"), requests[0])
-                response = b"HTTP/1.1 407 Auth required\r\nContent-Length: 0\r\n\r\n"
-                with self.assertRaisesRegex(ConnectionError, "^NovaProxy CONNECT rejected$"):
+                self.assertEqual(requests[0], (b"test", b"secret", b"api.openai.com", b"\x01\xbb"))
+                with self.assertRaisesRegex(ConnectionError, "^NovaProxy SOCKS5 CONNECT rejected$"):
                     await NovaProxy().connect(dict(instance(), username="test", password="secret"), b"api.openai.com:443")
                 self.assertEqual(len(requests), 2)
         finally:
@@ -205,13 +223,31 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.ready()
         connections = []
         async def gateway(reader, writer):
-            connections.append(await reader.readuntil(b"\r\n\r\n"))
-            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            await writer.drain()
-            writer.write(await reader.readexactly(4))
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            try:
+                greeting = await reader.readexactly(3)
+                self.assertEqual(greeting, b"\x05\x01\x02")
+                writer.write(b"\x05\x02")
+                await writer.drain()
+                self.assertEqual(await reader.readexactly(1), b"\x01")
+                username_length = (await reader.readexactly(1))[0]
+                username = await reader.readexactly(username_length)
+                password_length = (await reader.readexactly(1))[0]
+                password = await reader.readexactly(password_length)
+                writer.write(b"\x01\x00")
+                await writer.drain()
+                request = await reader.readexactly(4)
+                self.assertEqual(request, b"\x05\x01\x00\x03")
+                host_length = (await reader.readexactly(1))[0]
+                connections.append(
+                    username + b":" + password + await reader.readexactly(host_length) + await reader.readexactly(2)
+                )
+                writer.write(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                await writer.drain()
+                writer.write(await reader.readexactly(4))
+                await writer.drain()
+            finally:
+                writer.close()
+                await writer.wait_closed()
         upstream = await asyncio.start_server(gateway, "127.0.0.1", 0)
         proxy = await asyncio.start_server(self.service.connect, "127.0.0.1", 0)
         original = asyncio.open_connection
@@ -241,7 +277,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
                 await writer.wait_closed()
             self.assertEqual(len(connections), 1)
             self.assertEqual(self.provider.allocations, 0)
-            self.assertNotIn(auth.encode(), connections[0])
+            self.assertNotIn(auth.encode(), b"".join(connections))
         finally:
             proxy.close()
             upstream.close()

@@ -80,6 +80,7 @@ pub struct TurnStateFetcherSnapshot {
 
 #[derive(Debug)]
 pub struct TurnStateFetchEgress {
+    pub config_revision: crate::routing::ConfigRevision,
     pub proxy: Option<OutboundProxy>,
     pub max_concurrent: u32,
     pub request_interval_ms: u64,

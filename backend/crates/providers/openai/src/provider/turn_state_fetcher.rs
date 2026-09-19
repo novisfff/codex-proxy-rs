@@ -1,6 +1,8 @@
 //! 独立低并发获取任务。凭据、账号额度与业务共用；连接池、出站代理与用量记录独立。
 
 use super::turn_state::{REFRESH_AFTER_MS, REFRESH_BEFORE_MS, TurnStateCache};
+use super::turn_state_probe_usage::ProbeUsage;
+use crate::transport::canonical::{CodexCanonicalDecoder, CodexCanonicalOutcome};
 use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
@@ -15,6 +17,7 @@ use chrono::Utc;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use gateway_core::{
     account::{CredentialState, ProviderAccountId, ProviderAccountStore},
+    engine::ExecutionStore,
     lifecycle::CancellationToken,
     operation::{GenerateRequest, ProtocolPayload},
     provider_ports::{
@@ -25,9 +28,8 @@ use gateway_core::{
     routing::{ProviderKind, UpstreamModelId},
     task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
-use gateway_protocol::openai::sse::SseEventDecoder;
 use secrecy::ExposeSecret;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroU32,
@@ -49,6 +51,106 @@ fn next_probe_nonce() -> Result<u64, ()> {
         .as_ref()
         .map_err(|_| ())?;
     Ok(counter.fetch_add(1, Ordering::Relaxed))
+}
+
+/// 构造与 Codex Core 相同的 Responses 请求骨架。
+///
+/// 获取器没有真实对话历史，不能复制某个用户的 prompt；这里保留 Core 当前使用的
+/// `additional_tools`、developer/user 消息、会话元数据和环境上下文形状，同时把正文
+/// 控制在很小的范围内。随机数仍位于最后一条 user 消息最前面，确保每次探测都是新 turn。
+fn build_probe_body(
+    model: &str,
+    nonce: u64,
+    client_metadata: Value,
+    responses_lite: bool,
+) -> Value {
+    let message_id = || format!("msg_{}", uuid::Uuid::new_v4());
+    let namespace_tool = json!({
+        "type": "namespace",
+        "name": "functions",
+        "description": "",
+        "tools": [{
+            "type": "function",
+            "name": "probe_noop",
+            "description": "Return a short acknowledgement.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "strict": true
+        }]
+    });
+    let input = json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "id": format!("at_{}", uuid::Uuid::new_v4()),
+            "tools": [namespace_tool]
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "id": message_id(),
+            "content": [{
+                "type": "input_text",
+                "text": "You are Codex, an AI coding agent."
+            }]
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "id": message_id(),
+            "content": [{
+                "type": "input_text",
+                "text": "Keep this probe response short and do not call tools."
+            }]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "id": message_id(),
+            "content": [{
+                "type": "input_text",
+                "text": "<environment_context><timezone>UTC</timezone></environment_context>"
+            }]
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "id": message_id(),
+            "content": [{
+                "type": "input_text",
+                "text": format!("{}\nReply only OK.", nonce)
+            }]
+        }
+    ]);
+    let mut body = json!({
+        "model": model,
+        "input": input,
+        "tool_choice": "auto",
+        "parallel_tool_calls": !responses_lite,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": client_metadata["session_id"],
+        "client_metadata": client_metadata,
+        "stream": true,
+        "store": false
+    });
+    if !responses_lite {
+        // API Key 走公开 Responses 接口，保留其兼容的 instructions/tools 形状；
+        // OAuth 走 Codex Responses Lite，上面构造的 input 才是官方 Core 形状。
+        body["instructions"] = json!("You are Codex, an AI coding agent.");
+        body["tools"] = json!([]);
+        body["input"] = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("{}\nReply only OK.", nonce)
+            }]
+        }]);
+    }
+    body
 }
 
 struct Running {
@@ -116,6 +218,7 @@ pub(crate) struct TurnStateFetcher {
     accounts: Arc<dyn ProviderAccountStore>,
     leases: Arc<dyn ProviderLeasePort>,
     cooldowns: Arc<dyn ProviderCooldownPort>,
+    execution: Option<Arc<dyn ExecutionStore>>,
     catalog: Arc<CodexCredentialCatalogService>,
     cache: TurnStateCache,
     profile: CodexWireProfileState,
@@ -139,6 +242,7 @@ impl TurnStateFetcher {
         accounts: Arc<dyn ProviderAccountStore>,
         leases: Arc<dyn ProviderLeasePort>,
         cooldowns: Arc<dyn ProviderCooldownPort>,
+        execution: Option<Arc<dyn ExecutionStore>>,
         catalog: Arc<CodexCredentialCatalogService>,
         cache: TurnStateCache,
         profile: CodexWireProfileState,
@@ -150,6 +254,7 @@ impl TurnStateFetcher {
             accounts,
             leases,
             cooldowns,
+            execution,
             catalog,
             cache,
             profile,
@@ -593,9 +698,7 @@ impl TurnStateFetcher {
         };
         // 获取器失败后不使用指数退避、上游 Retry-After 或随机抖动。静态出口仍以
         // 10 秒为固定重试间隔；动态出口由对应实例的 intervalSeconds 控制实际间隔。
-        let delay: u64 = if outcome.success {
-            0
-        } else if outcome.paused || config.dynamic_egress.is_some() {
+        let delay: u64 = if outcome.success || outcome.paused || config.dynamic_egress.is_some() {
             0
         } else {
             10
@@ -812,49 +915,41 @@ impl TurnStateFetcher {
         let Ok(nonce) = next_probe_nonce() else {
             return FetchOutcome::retry("探测请求随机数生成失败", 60);
         };
-        // Codex Core 每个 turn 都会带独立的会话、线程和窗口身份。获取器不复用真实
-        // 对话，但保留同样的身份形状，避免被上游按公开 Responses API 的简化请求处理。
+        // Codex Core 每个 turn 都会带独立的会话、线程、窗口和根 turn 身份。获取器不
+        // 复用真实对话，但保留同样的请求骨架，避免被上游按公开 Responses API 的简化
+        // 请求处理。
+        let root_turn_id = uuid::Uuid::new_v4().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
         let thread_id = uuid::Uuid::new_v4().to_string();
         let window_id = uuid::Uuid::new_v4().to_string();
         let turn_id = uuid::Uuid::new_v4().to_string();
+        let turn_started_at_unix_ms = Utc::now().timestamp_millis();
         let turn_metadata = json!({
             "installation_id": runtime.installation_id.clone(),
+            "root_turn_id": root_turn_id.clone(),
             "session_id": session_id.clone(),
             "thread_id": thread_id.clone(),
             "window_id": window_id.clone(),
             "turn_id": turn_id.clone(),
-            "request_kind": "turn"
+            "request_kind": "turn",
+            "turn_started_at_unix_ms": turn_started_at_unix_ms
         })
         .to_string();
-        let mut body = json!({
-            "model": model,
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": format!("{}\nReply only OK.", nonce)}],
-                "internal_chat_message_metadata_passthrough": {
-                    "content_item_kinds": ["user.text"],
-                    "create_time": Utc::now().timestamp_millis() as f64 / 1000.0
-                }
-            }],
-            "instructions": "You are Codex, an AI coding agent.",
-            "tools": [],
-            "tool_choice": "auto",
-            "parallel_tool_calls": true,
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": session_id.clone(),
-            "client_metadata": {
-                "x-codex-installation-id": runtime.installation_id.clone(),
-                "session_id": session_id.clone(),
-                "thread_id": thread_id.clone(),
-                "x-codex-window-id": window_id.clone(),
-                "turn_id": turn_id.clone(),
-                "x-codex-turn-metadata": turn_metadata.clone()
-            },
-            "stream": true,
-            "store": false
-        });
+        let responses_lite = runtime.authentication.oauth().is_some();
+        let mut body = build_probe_body(
+            model,
+            nonce,
+            json!({
+                "root_turn_id": root_turn_id,
+                "x-codex-installation-id": runtime.installation_id,
+                "session_id": session_id,
+                "thread_id": thread_id,
+                "x-codex-window-id": window_id,
+                "turn_id": turn_id,
+                "x-codex-turn-metadata": turn_metadata
+            }),
+            responses_lite,
+        );
         if let Ok(Some(catalog)) = self.catalog.cached()
             && let Some(entry) = catalog
                 .models()
@@ -866,7 +961,11 @@ impl TurnStateFetcher {
                 .into_iter()
                 .find(|e| efforts.iter().any(|v| v == e))
             {
-                body["reasoning"] = json!({"effort":effort,"summary":"auto"});
+                let mut reasoning = json!({"effort":effort,"summary":"auto"});
+                if responses_lite {
+                    reasoning["context"] = json!("all_turns");
+                }
+                body["reasoning"] = reasoning;
             }
             if entry.capabilities().parallel_tool_calls()
                 == CodexCatalogCapabilityEvidence::DeclaredUnsupported
@@ -888,12 +987,15 @@ impl TurnStateFetcher {
         else {
             return FetchOutcome::paused("请求编码失败");
         };
-        let payload = payload.with_context(
-            json!({"use_websocket":false})
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        );
+        let mut payload_context = Map::new();
+        payload_context.insert("use_websocket".to_owned(), Value::Bool(false));
+        if responses_lite {
+            payload_context.insert(
+                "responses_lite".to_owned(),
+                Value::String("true".to_owned()),
+            );
+        }
+        let payload = payload.with_context(payload_context);
         let mut request = match encode_generate_request(
             &GenerateRequest::from_protocol_payload(payload),
             model,
@@ -910,7 +1012,20 @@ impl TurnStateFetcher {
         let Ok(authorization) = runtime.authentication.authorization_header() else {
             return FetchOutcome::paused("凭据格式无效");
         };
-        let request_id = format!("turn-state-fetch-{}", uuid::Uuid::new_v4());
+        let request_id = format!("req_turn_state_fetch_{}", uuid::Uuid::new_v4());
+        let mut usage = ProbeUsage::start(
+            self.execution.clone(),
+            &request_id,
+            &id,
+            model,
+            egress.config_revision,
+            request
+                .body()
+                .get("reasoning")
+                .and_then(|value| value.get("effort"))
+                .and_then(Value::as_str),
+        )
+        .await;
         let mut context = CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             account.upstream_account_id(),
@@ -929,53 +1044,65 @@ impl TurnStateFetcher {
             .await
         {
             Ok(response) => response,
-            Err(error) => return FetchOutcome::from_error(&error),
+            Err(error) => {
+                let outcome = FetchOutcome::from_error(&error);
+                usage.opening_error(&error);
+                usage.finish().await;
+                return outcome;
+            }
         };
         let mut outcome = FetchOutcome::retry("未返回 292 字节值", 0);
+        usage.response(&response);
         if let Some(value) = response.turn_state {
             outcome.capture(&value);
         }
-        let mut decoder = SseEventDecoder::default();
+        let mut decoder = CodexCanonicalDecoder::new(model)
+            .with_reported_model(response.response_metadata.effective_model.as_deref());
         let mut bytes = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, response.body.next()).await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(_) => {
+        loop {
+            let chunk = match tokio::time::timeout_at(deadline, response.body.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(None) => {
+                    usage.decoded(decoder.finish());
+                    if !usage.completed() {
+                        usage.fail("probe stream ended before a terminal response");
+                        outcome.message = "响应流未完整结束".to_owned();
+                    }
+                    break;
+                }
+                Ok(Some(Err(_))) => {
+                    usage.fail("probe response stream interrupted");
                     outcome.message = "响应流中断".to_owned();
+                    break;
+                }
+                Err(_) => {
+                    usage.timeout();
+                    outcome.message = "探测响应读取超时".to_owned();
                     break;
                 }
             };
             bytes = bytes.saturating_add(chunk.len());
             if bytes > 1024 * 1024 {
+                usage.fail("probe response exceeded read limit");
                 outcome.message = "响应超过获取器读取上限".to_owned();
                 break;
             }
-            let Ok(events) = decoder.push(&chunk) else {
+            let decoded = decoder.push(&chunk);
+            let failed = matches!(decoded, CodexCanonicalOutcome::Failed(_));
+            usage.decoded(decoded);
+            if failed {
+                outcome.message = "上游返回探测失败事件".to_owned();
                 break;
-            };
-            let mut terminal = false;
-            for event in events {
-                let Ok(event) = serde_json::from_str::<Value>(&event.data) else {
-                    continue;
-                };
-                if matches!(
-                    event["type"].as_str(),
-                    Some("response.completed" | "response.incomplete" | "response.failed")
-                ) {
-                    outcome.input_tokens = event
-                        .pointer("/response/usage/input_tokens")
-                        .and_then(Value::as_u64);
-                    outcome.output_tokens = event
-                        .pointer("/response/usage/output_tokens")
-                        .and_then(Value::as_u64);
-                    terminal = true;
-                }
             }
-            if terminal {
+            if usage.completed() {
                 break;
             }
         }
+        usage.service_tier(decoder.response_service_tier());
+        outcome.input_tokens = usage.tokens().input_tokens;
+        outcome.output_tokens = usage.tokens().output_tokens;
+        usage.finish().await;
         // 防止获取期间发生凭据替换后将旧身份的结果用于新凭据。
         if !self
             .accounts
@@ -983,7 +1110,11 @@ impl TurnStateFetcher {
             .await
             .is_ok_and(|fresh| fresh.account.revision() == account.revision())
         {
-            return FetchOutcome::retry("凭据已更新，重新排队", 60);
+            outcome.value = None;
+            outcome.received_at = 0;
+            outcome.success = false;
+            outcome.retry_after = 60;
+            outcome.message = "凭据已更新，重新排队".to_owned();
         }
         outcome
     }
@@ -998,6 +1129,75 @@ mod probe_nonce_tests {
         let first = next_probe_nonce().unwrap();
         let second = next_probe_nonce().unwrap();
         assert_ne!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod probe_body_tests {
+    use super::build_probe_body;
+
+    #[test]
+    fn probe_body_uses_codex_core_message_shape_without_user_history() {
+        let body = build_probe_body(
+            "gpt-5.4",
+            123456,
+            serde_json::json!({
+                "root_turn_id": "root-turn",
+                "x-codex-installation-id": "installation",
+                "session_id": "session",
+                "thread_id": "thread",
+                "x-codex-window-id": "window",
+                "turn_id": "turn",
+                "x-codex-turn-metadata": r#"{"request_kind":"turn"}"#
+            }),
+            true,
+        );
+
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["model"], "gpt-5.4");
+        assert_eq!(body["input"].as_array().map(Vec::len), Some(5));
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["id"].as_str().map(str::len), Some(39));
+        assert_eq!(body["input"][0]["tools"][0]["type"], "namespace");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][3]["role"], "user");
+        assert_eq!(
+            body["input"][4]["content"][0]["text"],
+            "123456\nReply only OK."
+        );
+        assert_eq!(body["client_metadata"]["root_turn_id"], "root-turn");
+        assert_eq!(
+            body["client_metadata"]["x-codex-installation-id"],
+            "installation"
+        );
+        assert_eq!(
+            body["client_metadata"]["x-codex-turn-metadata"],
+            r#"{"request_kind":"turn"}"#
+        );
+
+        let api_key_body = build_probe_body(
+            "gpt-5.4",
+            123456,
+            serde_json::json!({
+                "root_turn_id": "root-turn",
+                "x-codex-installation-id": "installation",
+                "session_id": "session",
+                "thread_id": "thread",
+                "x-codex-window-id": "window",
+                "turn_id": "turn",
+                "x-codex-turn-metadata": r#"{"request_kind":"turn"}"#
+            }),
+            false,
+        );
+        assert_eq!(
+            api_key_body["instructions"],
+            "You are Codex, an AI coding agent."
+        );
+        assert_eq!(api_key_body["tools"], serde_json::json!([]));
+        assert_eq!(api_key_body["parallel_tool_calls"], true);
     }
 }
 
@@ -1028,6 +1228,7 @@ impl FetchOutcome {
             exit_ip: None,
         }
     }
+
     fn paused(message: &str) -> Self {
         let mut result = Self::retry(message, 900);
         result.paused = true;

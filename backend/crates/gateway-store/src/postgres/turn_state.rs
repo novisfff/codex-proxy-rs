@@ -151,7 +151,7 @@ impl TurnStateStore for PgTurnStateStore {
         config: TurnStateFetcherConfig,
     ) -> BoxFuture<'_, Result<TurnStateFetchEgress, ProviderStoreError>> {
         Box::pin(async move {
-            let row = sqlx::query("SELECT coalesce(a.concurrency_limit,r.max_concurrent_per_account) AS capacity,r.request_interval_ms,p.proxy_url,p.last_test_success,c.proxy_id FROM turn_state_fetcher_configs c JOIN provider_accounts a ON a.id=c.account_id CROSS JOIN runtime_settings r LEFT JOIN outbound_proxies p ON p.id=c.proxy_id WHERE c.account_id=$1 AND c.revision=$2 AND c.enabled")
+            let row = sqlx::query("SELECT coalesce(a.concurrency_limit,r.max_concurrent_per_account) AS capacity,r.config_revision,r.request_interval_ms,p.proxy_url,p.last_test_success,c.proxy_id FROM turn_state_fetcher_configs c JOIN provider_accounts a ON a.id=c.account_id CROSS JOIN runtime_settings r LEFT JOIN outbound_proxies p ON p.id=c.proxy_id WHERE c.account_id=$1 AND c.revision=$2 AND c.enabled")
                 .bind(&config.account_id).bind(config.revision).fetch_optional(&self.0).await.map_err(unavailable)?.ok_or_else(invalid)?;
             let proxy = if row
                 .try_get::<Option<String>, _>("proxy_id")
@@ -171,6 +171,13 @@ impl TurnStateStore for PgTurnStateStore {
                 None
             };
             Ok(TurnStateFetchEgress {
+                config_revision: gateway_core::routing::ConfigRevision::new(
+                    row.try_get::<i64, _>("config_revision")
+                        .map_err(unavailable)?
+                        .try_into()
+                        .map_err(|_| invalid())?,
+                )
+                .map_err(|_| invalid())?,
                 proxy,
                 max_concurrent: row
                     .try_get::<i64, _>("capacity")

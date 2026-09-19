@@ -112,6 +112,7 @@ const clientUpstreamItems = computed(() => [
 ])
 
 const identifierItems = computed(() => [
+  { label: '请求类型', value: props.record?.requestKind === 'turn_state_fetcher' ? '292 探测' : props.record?.requestKind },
   { label: '请求 ID', value: props.record?.requestId, mono: true, wrap: true, fullWidth: true },
   { label: '响应 ID', value: props.record?.responseId, mono: true, wrap: true },
   { label: '上游请求 ID', value: props.record?.upstreamRequestId, mono: true, wrap: true },

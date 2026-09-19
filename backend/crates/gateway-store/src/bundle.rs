@@ -131,6 +131,7 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
     let (execution, execution_writer) =
         postgres::BufferedExecutionStore::new(Arc::clone(&execution_repository));
     let execution = Arc::new(execution);
+    let provider_execution = Arc::clone(&execution);
     let (client_key_usage, client_key_usage_writer) =
         postgres::PgClientApiKeyUsageSink::new(pool.clone());
     let retention = Arc::new(postgres::PgRetentionRepository::new(pool.clone()));
@@ -188,7 +189,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         runtime_policy,
         oauth_pending,
     )
-    .with_turn_state(Arc::new(postgres::PgTurnStateStore::new(pool.clone())));
+    .with_turn_state(Arc::new(postgres::PgTurnStateStore::new(pool.clone())))
+    .with_execution(provider_execution);
     let worker_leader_lease = Arc::new(redis::worker_lease::RedisWorkerLeaderLeasePort::new(
         credential_leases,
     ));

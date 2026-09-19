@@ -954,6 +954,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .lock()
         .expect("usage records")
         .push(UsageListRecord {
+            request_kind: None,
             response_turn_state_byte_length: Some(292),
             id: "request_endpoint".to_owned(),
             endpoint: "/v1/responses".to_owned(),

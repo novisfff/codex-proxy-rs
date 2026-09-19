@@ -3,6 +3,7 @@ import type { UsageDisplayRecord } from '../utils/records'
 import type { BaseTableColumn } from '@/components/base/BaseTable/columns'
 import { Minimize2 } from '@lucide/vue'
 import BaseTable from '@/components/base/BaseTable/index.vue'
+import BaseTag from '@/components/base/BaseTag.vue'
 import ProviderIconGroup from '@/components/ProviderIconGroup.vue'
 import {
   usageAccountText,
@@ -88,6 +89,9 @@ withDefaults(
 
     <template #route="{ row }">
       <div class="inline-flex max-w-full items-center gap-1.5 whitespace-nowrap">
+        <BaseTag v-if="row.requestKind === 'turn_state_fetcher'" type="info">
+          292 探测
+        </BaseTag>
         <code class="font-mono text-cp-sm font-emphasis">{{ row.route || '—' }}</code>
         <span
           v-if="usageIsCompact(row)"

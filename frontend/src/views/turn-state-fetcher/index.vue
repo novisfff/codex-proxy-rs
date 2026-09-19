@@ -305,7 +305,7 @@ onBeforeUnmount(() => {
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
       </p>
       <p class="text-cp-sm text-cp-text-secondary">
-        Azure 出口校验并保持 24 小时不重复。NovaProxy 每次新建连接，实际出口未验证，可能重复。连接失败不会回退到其他出口。
+        Azure 出口校验并保持 24 小时不重复。NovaProxy 每次通过 SOCKS5 新建连接，实际出口未验证，可能重复。连接失败不会回退到其他出口。
       </p>
       <BaseButton :disabled="!instancesEditable || saving" @click="editInstance()">
         添加出口实例
@@ -435,7 +435,7 @@ onBeforeUnmount(() => {
             <BaseInput v-model="instanceForm.password" type="password" autocomplete="new-password" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-sm text-cp-warning">
-            Residential Premium · IPv4 · 每次独立连接；不保证出口不重复，实际 IP 未验证。
+            Residential Premium · IPv4 · 每次独立 SOCKS5 连接；不保证出口不重复，实际 IP 未验证。
           </p>
         </template>
         <template v-else>
