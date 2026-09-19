@@ -711,7 +711,7 @@ impl SettingsStore for UnavailableStore {
     }
     async fn sync_pricing(
         &self,
-        _: gateway_core::metering::PricingOverrides,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
         _: &MutationContext,
     ) -> AdminStoreResult<gateway_admin::model::Revision> {
         panic!("unexpected pricing sync")

@@ -63,9 +63,6 @@ async function submit() {
       <FormItem label="确认新密码" :error="confirmationError" required>
         <BaseInput v-model="form.confirmation" type="password" autocomplete="new-password" placeholder="再次输入新密码" :disabled="loading" maxlength="1024" />
       </FormItem>
-      <p class="m-0 rounded-cp bg-cp-fill-quaternary px-3 py-2.5 text-cp-sm leading-relaxed text-cp-text-secondary">
-        保存后，当前及其他设备上的管理员登录都会失效，需要重新登录。
-      </p>
     </form>
     <template #footer>
       <BaseButton variant="secondary" :disabled="loading" @click="open = false">

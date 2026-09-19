@@ -420,7 +420,7 @@ pub trait SettingsStore: Send + Sync {
     async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
     async fn sync_pricing(
         &self,
-        prices: gateway_core::metering::PricingOverrides,
+        changes: crate::model::pricing::PricingSyncChanges,
         context: &MutationContext,
     ) -> AdminStoreResult<crate::model::Revision>;
     async fn update_pricing(
