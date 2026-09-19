@@ -114,6 +114,7 @@ pub(crate) struct CodexCyberPolicyScope {
 }
 
 pub struct CodexCredentialSelector {
+    pub(crate) turn_state: crate::provider::turn_state::TurnStateCache,
     waiting: ConcurrencyWaitQueue<ProviderAccountId>,
     provider_kind: ProviderKind,
     repository: CodexCredentialRepository,
@@ -270,6 +271,7 @@ impl CodexCredentialSelector {
         cookie_policy: CodexCookiePolicy,
     ) -> Self {
         Self {
+            turn_state: crate::provider::turn_state::TurnStateCache::default(),
             provider_kind,
             repository,
             leases,
@@ -561,6 +563,32 @@ impl CodexCredentialSelector {
                     }
                 }
                 let selection = AccountSelector.select(&candidates, &context);
+                // 保留绑定、权重和所有硬性过滤，只在同权重 OAuth 候选中偏好可用的状态。
+                let selection = if !diagnostic
+                    && preferred.is_none()
+                    && let (Some(original), Some(model)) = (selection, upstream_model)
+                    && original.candidate().account.authentication_kind()
+                        == CODEX_AUTHENTICATION_KIND_OAUTH
+                {
+                    let valid_accounts = self.turn_state.valid_accounts(model);
+                    let mut state_context = context.clone();
+                    for candidate in &candidates {
+                        if candidate.account.authentication_kind()
+                            != CODEX_AUTHENTICATION_KIND_OAUTH
+                            || candidate.account.weight() != original.candidate().account.weight()
+                            || !valid_accounts.contains(candidate.account.id().as_str())
+                        {
+                            state_context
+                                .excluded_accounts
+                                .insert(candidate.account.id().clone());
+                        }
+                    }
+                    AccountSelector
+                        .select(&candidates, &state_context)
+                        .or(selection)
+                } else {
+                    selection
+                };
                 request.attempt.trace().account_selection(
                     &candidates,
                     &context,

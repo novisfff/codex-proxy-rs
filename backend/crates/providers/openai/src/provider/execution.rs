@@ -588,6 +588,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     } = response;
     Box::pin(async_stream::try_stream! {
         let turn_state = turn_state.scope(lease.account_id().as_str(), request.model());
+        let automatic_turn_state = lease.codex_turn_state().mode == gateway_core::policy::CodexTurnStateMode::Auto;
         turn_state.apply(&mut request, lease.codex_turn_state());
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
@@ -661,6 +662,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                             && let Ok(value) = std::str::from_utf8(header.value())
                         {
                             turn_state.observe(value);
+                            if let Some(delay) = turn_state.missing_state_retry(automatic_turn_state, value.len()).await {
+                                Err(missing_turn_state_error(delay))?;
+                            }
                         }
                     }
                 }
@@ -723,6 +727,13 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         );
         if let Some(observation) = observation_state.observation(None) {
             yield ProviderEvent::observation(observation);
+        }
+        for (name, value) in &response.response_metadata.client_headers {
+            if name.eq_ignore_ascii_case("x-codex-turn-state")
+                && let Some(delay) = turn_state.missing_state_retry(automatic_turn_state, value.len()).await
+            {
+                Err(missing_turn_state_error(delay))?;
+            }
         }
         if let Some(etag) = response.response_metadata.models_etag.as_deref()
             && let Err(error) = catalog.observe_response_etag(etag)
@@ -832,11 +843,12 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     let metadata_merge = merge_response_metadata_updates(
                         response_metadata_updates.as_ref(),
                         &turn_state,
+                        automatic_turn_state,
                         &mut session_capture,
                         &mut observation_state,
                         &mut decoder,
                     )
-                    .await;
+                    .await?;
                     let observation_event = if rate_limits_changed || metadata_merge.is_some() {
                         observation_state.observation(None).map(ProviderEvent::observation)
                     } else {
@@ -907,11 +919,12 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             let metadata_merge = merge_response_metadata_updates(
                 response_metadata_updates.as_ref(),
                 &turn_state,
+                automatic_turn_state,
                 &mut session_capture,
                 &mut observation_state,
                 &mut decoder,
             )
-            .await;
+            .await?;
             let metadata_changed = metadata_merge.unwrap_or(false);
             pre_commit_events.observe_chunk(chunk_len);
             let response_model_changed = observation_state
@@ -1085,11 +1098,12 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let metadata_changed = merge_response_metadata_updates(
             response_metadata_updates.as_ref(),
             &turn_state,
+            automatic_turn_state,
             &mut session_capture,
             &mut observation_state,
             &mut decoder,
         )
-        .await
+        .await?
         .unwrap_or(false);
         attach_openai_session_update(&mut events, &mut session_capture);
         let completed = events
@@ -1159,21 +1173,30 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
     scoped_turn_state: &turn_state::ScopedTurnState,
+    automatic_turn_state: bool,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
     decoder: &mut CodexCanonicalDecoder,
-) -> Option<bool> {
-    let updates = updates?;
+) -> Result<Option<bool>, ProviderError> {
+    let Some(updates) = updates else {
+        return Ok(None);
+    };
     let mut pending = updates.lock().await;
     let turn_state = pending.turn_state.take();
     let reported_model = pending.reported_model.clone();
     drop(pending);
     if turn_state.is_none() && reported_model.is_none() {
-        return None;
+        return Ok(None);
     }
     let mut changed = false;
     if let Some(turn_state) = turn_state {
         scoped_turn_state.observe(&turn_state);
+        if let Some(delay) = scoped_turn_state
+            .missing_state_retry(automatic_turn_state, turn_state.len())
+            .await
+        {
+            return Err(missing_turn_state_error(delay));
+        }
         if let Some(capture) = session_capture.as_mut() {
             capture.turn_state = Some(turn_state.clone());
         }
@@ -1183,5 +1206,29 @@ async fn merge_response_metadata_updates(
         decoder.observe_reported_model(&model);
         changed |= observation_state.observe_upstream_response_model(decoder.response_model());
     }
-    Some(changed)
+    Ok(Some(changed))
+}
+
+fn missing_turn_state_error(seconds: u64) -> ProviderError {
+    let message = format!("当前不存在有效 Turn State，正在尝试获取，请在 {seconds} 秒后重试");
+    let body = json!({"error": {"message": message, "type": "server_error", "code": "turn_state_unavailable", "retry_after": seconds}});
+    // 请求已经发给上游，不允许网关偷偷换号重放；将等待时间交给客户端。
+    ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)
+        .with_retry_after(Duration::from_secs(seconds))
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            message,
+            Some("turn_state_unavailable".to_owned()),
+            Some("server_error".to_owned()),
+        ))
+        .with_client_visible_upstream_response(
+            ClientVisibleUpstreamResponse::new(
+                503,
+                Some(b"application/json".to_vec()),
+                Bytes::from(body.to_string()),
+            )
+            .with_headers(vec![ProviderResponseHeader::new(
+                "retry-after",
+                Bytes::from(seconds.to_string()),
+            )]),
+        )
 }

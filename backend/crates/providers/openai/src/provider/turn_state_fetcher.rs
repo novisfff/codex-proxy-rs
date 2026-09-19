@@ -1,6 +1,6 @@
 //! 独立低并发获取任务。凭据、账号额度与业务共用；连接池、出站代理与用量记录独立。
 
-use super::turn_state::{REFRESH_AFTER_MS, TurnStateCache};
+use super::turn_state::{REFRESH_AFTER_MS, REFRESH_BEFORE_MS, TurnStateCache};
 use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
@@ -73,6 +73,7 @@ impl TurnStateFetcher {
         profile: CodexWireProfileState,
         base_url: String,
     ) -> Self {
+        cache.attach_store(store.clone());
         Self {
             store,
             accounts,
@@ -295,7 +296,7 @@ impl TurnStateFetcher {
                     .iter()
                     .find(|v| v.account_id == config.account_id && v.model == *model);
                 if previous.is_none_or(|a| a.status != "queued")
-                    && value.is_some_and(|v| now < v.acquired_at.saturating_add(REFRESH_AFTER_MS))
+                    && value.is_some_and(|v| now < v.expires_at.saturating_sub(REFRESH_BEFORE_MS))
                 {
                     continue;
                 }
@@ -359,7 +360,7 @@ impl TurnStateFetcher {
                 && self.cache.values().iter().any(|v| {
                     v.account_id == config.account_id
                         && v.model == model
-                        && v.acquired_at + REFRESH_AFTER_MS > finished
+                        && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > finished
                 })
             {
                 outcome.success = true;
@@ -389,7 +390,7 @@ impl TurnStateFetcher {
                 .iter()
                 .find(|v| v.account_id == config.account_id && v.model == model)
                 .map_or(finished + REFRESH_AFTER_MS, |v| {
-                    v.acquired_at + REFRESH_AFTER_MS
+                    v.expires_at.saturating_sub(REFRESH_BEFORE_MS)
                 })
         } else {
             finished

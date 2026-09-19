@@ -365,6 +365,189 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
+    async fn turn_state_missing_websocket_metadata_returns_retry_error() {
+        use futures::SinkExt;
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        use tokio_tungstenite::tungstenite::Message;
+        let mock = MockServer::start().await;
+        let accounts = fetch_accounts(&mock).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        accounts
+            .set_openai_base_url(
+                ACCOUNT,
+                Some(format!("http://{}", listener.local_addr().unwrap())),
+            )
+            .await;
+        accounts
+            .set_turn_state(
+                ACCOUNT,
+                CodexTurnStateConfig {
+                    mode: CodexTurnStateMode::Auto,
+                    value: String::new(),
+                },
+            )
+            .await;
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = crate::transport::accept_codex_test_websocket(socket).await;
+            ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(json!({"type":"response.metadata", "headers":{"x-codex-turn-state":["x".repeat(312)]}}).to_string().into())).await.unwrap();
+            ws.send(Message::Text(json!({"type":"response.completed", "response":{"id":"resp_gate_ws", "model":MODEL, "status":"completed", "output":[]}}).to_string().into())).await.unwrap();
+        });
+        let store = Arc::new(MemoryTurnStateStore::default());
+        store.configs.lock().unwrap().push(fetch_config());
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            Map::from_iter([
+                ("model".to_owned(), json!(MODEL)),
+                ("input".to_owned(), json!("test")),
+            ]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
+        let mut stream = bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request(
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                    ACCOUNT,
+                ),
+                initialized_attempt_context("req_turn_state_ws_gate", ACCOUNT),
+            )
+            .await
+            .unwrap();
+        let mut error = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Err(e) => {
+                    error = Some(e);
+                    break;
+                }
+                Ok(event) => assert!(
+                    !event
+                        .canonical_facts()
+                        .iter()
+                        .any(|e| matches!(e, gateway_core::event::GatewayEvent::Completed(_)))
+                ),
+            }
+        }
+        assert_eq!(error.unwrap().retry_after(), Some(Duration::from_secs(30)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_state_missing_client_retry_backoff_and_configuration_gate() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        let server = MockServer::start().await;
+        let accounts = fetch_accounts(&server).await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(accounts.clone(), Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store.clone()),
+        )
+        .await
+        .unwrap();
+        let mut enabled = fetch_config();
+        enabled.enabled = false;
+        store.configs.lock().unwrap().push(enabled);
+        let provider = bundle.core_provider();
+        let mut fresh = vec![0u8; 217];
+        fresh[0] = 0x80;
+        fresh[1..9].copy_from_slice(&(Utc::now().timestamp() as u64).to_be_bytes());
+        let fresh = URL_SAFE.encode(fresh);
+        let mut expired = vec![0u8; 217];
+        expired[0] = 0x80;
+        expired[1..9].copy_from_slice(&((Utc::now().timestamp() - 7200) as u64).to_be_bytes());
+        let expired = URL_SAFE.encode(expired);
+        for (index, (on, mode, header, expected)) in [
+            (false, CodexTurnStateMode::Auto, "x".repeat(312), None),
+            (true, CodexTurnStateMode::Manual, "x".repeat(312), None),
+            (true, CodexTurnStateMode::Auto, "x".repeat(291), None),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(30)),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(60)),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(180)),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(300)),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(600)),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(600)),
+            (true, CodexTurnStateMode::Auto, fresh, None),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), None),
+            (true, CodexTurnStateMode::Auto, expired, None),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(30)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            server.reset().await;
+            mount(&server, &header, 200).await;
+            store.configs.lock().unwrap()[0].enabled = on;
+            accounts
+                .set_turn_state(
+                    ACCOUNT,
+                    CodexTurnStateConfig {
+                        mode,
+                        value: "manual-state".to_owned(),
+                    },
+                )
+                .await;
+            let payload = ProtocolPayload::json_object(
+                "openai",
+                Map::from_iter([
+                    ("model".to_owned(), json!(MODEL)),
+                    ("input".to_owned(), json!("test")),
+                ]),
+            )
+            .unwrap()
+            .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+            let mut stream = provider
+                .execute(
+                    initialized_provider_request(
+                        Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                        ACCOUNT,
+                    ),
+                    initialized_attempt_context(&format!("req_turn_state_gate_{index}"), ACCOUNT),
+                )
+                .await
+                .unwrap();
+            let mut failure = None;
+            while let Some(event) = stream.next().await {
+                if let Err(error) = event {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            assert_eq!(
+                failure
+                    .as_ref()
+                    .and_then(|e| e.retry_after())
+                    .map(|d| d.as_secs()),
+                expected,
+                "case {index}"
+            );
+            if let Some(error) = failure {
+                assert!(!error.replay_is_safe());
+                let response = error.client_visible_upstream_response().unwrap();
+                assert_eq!(response.status(), 503);
+                let body: Value = serde_json::from_slice(response.body()).unwrap();
+                assert_eq!(body["error"]["code"], "turn_state_unavailable");
+                assert_eq!(body["error"]["retry_after"], expected.unwrap());
+                assert!(response.headers().iter().any(|h| h.name() == "retry-after"
+                    && h.value() == expected.unwrap().to_string().as_bytes()));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn fetcher_uses_dedicated_direct_gateway_without_turn_state_and_restores_cache() {
         let server = MockServer::start().await;
         mount(&server, &"a".repeat(292), 200).await;

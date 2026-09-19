@@ -4518,6 +4518,99 @@ async fn matching_turn_id_should_restore_previous_turn_state() {
 }
 
 #[tokio::test]
+async fn automatic_turn_state_routing_prefers_matching_valid_oauth_account() {
+    use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+    let store = Arc::new(MemoryAccountStore::default());
+    let other = "acct_affinity_switch_b";
+    let ready = "acct_provider_contract";
+    for account in [other, ready] {
+        create_account(&store, account).await;
+        store
+            .set_turn_state(
+                account,
+                CodexTurnStateConfig {
+                    mode: CodexTurnStateMode::Auto,
+                    value: String::new(),
+                },
+            )
+            .await;
+    }
+    let server = MockServer::start().await;
+    let provider = provider_with_base_url(&store, server.uri());
+    for (index, (model, pinned, returned, expected)) in [
+        ("gpt-5.4", Some(ready), Some("a".repeat(292)), ready),
+        ("gpt-5.5", Some(other), Some("b".repeat(292)), other),
+        ("gpt-5.4", None, None, ready),
+        ("gpt-5.4", None, None, ready),
+        ("gpt-5.5", None, None, other),
+        ("gpt-5.4", Some(other), None, other),
+        ("gpt-5.4", None, None, other),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        server.reset().await;
+        let mut response = ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(CAPTURE_COMPLETED_SSE);
+        if let Some(value) = returned {
+            response = response.insert_header("x-codex-turn-state", value);
+        }
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let request_id = format!("req_state_routing_{index}");
+        let ctx = pinned.map_or_else(
+            || context(&request_id, CancellationToken::new()),
+            |account| diagnostic_context(&request_id, account),
+        );
+        let ctx = if index == 6 {
+            AttemptContext::new(
+                RequestAttemptContext::new(
+                    ModelRequestId::new(&request_id).unwrap(),
+                    ClientApiKeyId::new("key_openai_contract").unwrap(),
+                ),
+                NonZeroU32::new(1).unwrap(),
+                SystemTime::now() + Duration::from_secs(30),
+                account_policy(),
+                AccountAttemptContext::new(
+                    BTreeSet::from([ProviderAccountId::new(ready).unwrap()]),
+                    None,
+                    None,
+                )
+                .with_account_scope(contract_account_scope()),
+                None,
+                CancellationToken::new(),
+            )
+        } else {
+            ctx
+        };
+        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+            ProtocolPayload::json_object(
+                "openai",
+                json!({"model":model,"input":"hello"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap()
+            .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))])),
+        ));
+        let mut stream = provider
+            .execute(planned_request_for_model("openai", operation, model), ctx)
+            .await
+            .unwrap();
+        assert_eq!(stream.metadata().provider_account_id().as_str(), expected);
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn automatic_turn_state_should_isolate_accounts_and_models_but_not_reasoning() {
     use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
 

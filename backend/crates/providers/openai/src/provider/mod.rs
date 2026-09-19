@@ -193,7 +193,7 @@ impl CodexProvider {
         let client =
             CodexBackendClient::new(http, base_url, profile).with_websocket_pool(websocket_pool);
         Ok(Self {
-            turn_state: TurnStateCache::default(),
+            turn_state: selector.turn_state.clone(),
             selector,
             catalog,
             quota,
