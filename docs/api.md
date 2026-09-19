@@ -689,17 +689,26 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 旧请求省略 `dynamicEgress` 等同 null。动态出口严格使用所选地址类型，不回退到其他出口。
 
 动态出口实例除 Azure 外支持 `novaproxy`：配置为
-`{provider:"novaproxy",name:"名称",credentialRef:"nova-us",bindings:{ipv4:{}}}`。
-`credentialRef` 只允许 1–64 位字母、数字、下划线或连字符；真实认证信息仅保存在出口服务的凭据文件中，
-不能通过配置接口提交。NovaProxy Rotating 仅支持 IPv4，每个租约创建新连接，由供应商轮换，
+`{provider:"novaproxy",name:"名称",host:"residential-gateway.novaproxy.io",port:1111,username:"YOUR_USERNAME",password:"YOUR_PASSWORD",bindings:{ipv4:{}}}`。
+`host` 限定为 `*.novaproxy.io` 单级子域名，`port` 为 1–65535 的整数。新增实例必须提交密码；
+编辑相同实例 ID 时省略 `password` 或传空字符串保留原密码。状态返回 `passwordSet`，不返回 `password`；
+提交配置时不携带 `passwordSet`。认证信息由出口服务持久化，配置接口不再接受 `credentialRef`。
+所有出口实例接受 `maxConcurrent` 和 `intervalSeconds`，省略时分别为 1 和 10。
+`maxConcurrent` 为 1–16 的整数，Azure 只接受 1；`intervalSeconds` 为 0–3600 的整数，表示同一实例相邻尝试启动的最短秒数，0 表示不限间隔。
+同一实例下账号和模型共享并发与间隔限制；同一账号、同一模型允许并发搜索，获取到有效新值后取消其余搜索。
+账号自身并发限制、上游冷却及错误退避仍然生效。Azure 同一出口服务内仍串行管理公网 IP。
+获取器状态新增 `runningRequests`，每项为 `[accountId, model]`，同一账号模型可重复出现；旧 `running` 保留其中一项，空闲时为 null。
+NovaProxy Rotating 仅支持 IPv4，每个租约创建新连接，由供应商轮换，
 不保证 24 小时内出口唯一。此类就绪租约返回 `provider:"novaproxy",ip:null,ipVerification:"unverified"`，
 获取记录 `exitIp` 为空，不能将独立探测的 IP 当作 OpenAI 出口；Azure 仍要求经过校验的实际 IP。
-凭据安装步骤见 [动态出口部署](../deploy/dynamic-egress/README.md#novaproxy-rotating)。
+配置与旧凭据迁移见 [动态出口部署](../deploy/dynamic-egress/README.md#novaproxy-rotating)。
 选定代理必须测试成功，连接失败不会回退到业务代理或直连。被引用代理须先解除获取器绑定才能删除。
 首次保存 `revision: 0`，后续携带 GET 返回版本；并发修改返回 409。重新保存清除失败暂停及退避。
 
 `values` 包含账号、模型、原值、来源 `traffic` / `fetcher`、`acquiredAt`、`lastSeenAt`、`expiresAt`；
 这些时间为 Unix 毫秒，过期值仍可在此接口查看。原值仅供管理员复制，不进入客户用量记录。
+获取器发出的每次探测请求都会在最前面的用户输入中加入新的随机数字前缀，随后才是固定的简短提示；
+前缀由随机种子和单调计数器共同生成，保证并发探测的请求体不重复，同时仍不携带 Turn State。
 `attempts` 返回最近一次的状态、返回长度、输入/输出 token 数（无法获得时为 null）、耗时、下一次尝试时间和安全错误说明。
 `running` 为正在获取的 `[accountId, model]`，没有任务时为 null。
 `attempts.exitIp` 为本次租约分配且通过出站验证的地址，无租约时为 null。

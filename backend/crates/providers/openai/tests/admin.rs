@@ -178,7 +178,7 @@ mod turn_state_fetcher {
         let upstream = MockServer::start().await;
         mount(&upstream, &"a".repeat(292), 200).await;
         Mock::given(method("GET")).and(path("/v1/status"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{"id":"azure","families":["ipv4","ipv6"]}],"history":[]})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{"id":"azure","intervalSeconds":0,"families":["ipv4","ipv6"]}],"history":[]})))
             .mount(&control).await;
         Mock::given(method("POST")).and(path("/v1/leases"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state":"ready","ip":"203.0.113.42","proxyUrl":"http://127.0.0.1:1","secret":"test-lease-secret"})))
@@ -275,10 +275,9 @@ mod turn_state_fetcher {
         let upstream = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/status"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"instances":[{"id":"azure","families":["ipv6"]}]})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"available":true,"instances":[{"id":"azure","families":["ipv6"]}]}),
+            ))
             .mount(&control)
             .await;
         Mock::given(method("POST"))
@@ -362,6 +361,168 @@ mod turn_state_fetcher {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("cancelled provisioning must release its attempt ID");
+    }
+
+    #[tokio::test]
+    async fn nova_parallel_searches_same_model_respect_interval_capacity_and_cancel_together() {
+        for fresh_from_traffic in [false, true] {
+            let control = MockServer::start().await;
+            let upstream = MockServer::start().await;
+            let starts = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+            Mock::given(method("GET")).and(path("/v1/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{
+                "id":"nova","provider":"novaproxy","families":["ipv4"],"maxConcurrent":2,"intervalSeconds":1
+            }]}))).mount(&control).await;
+            let observed = starts.clone();
+            Mock::given(method("POST"))
+                .and(path("/v1/leases"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    observed
+                        .lock()
+                        .unwrap()
+                        .entry(body["id"].as_str().unwrap().to_owned())
+                        .or_insert_with(std::time::Instant::now);
+                    ResponseTemplate::new(200).set_body_json(json!({"state":"provisioning"}))
+                })
+                .mount(&control)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&control)
+                .await;
+            let token = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(
+                token.path(),
+                "test-control-secret-with-at-least-32-characters",
+            )
+            .unwrap();
+            let mut config = valid_config();
+            config.config.dynamic_egress = Some(provider_openai::config::DynamicEgressConfig {
+                url: control.uri(),
+                token_file: token.path().to_owned(),
+            });
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let mut bundle = provider_openai::initialize(
+                config.config,
+                provider_ports_with(
+                    fetch_accounts(&upstream).await,
+                    Arc::new(TestOAuthPending::default()),
+                )
+                .with_turn_state(store),
+            )
+            .await
+            .unwrap();
+            let admin = bundle.admin_provider();
+            let mut selected = fetch_config();
+            selected.dynamic_egress = Some(DynamicEgressSelection {
+                instance: "nova".to_owned(),
+                family: "ipv4".to_owned(),
+            });
+            admin.configure_turn_state_fetcher(selected).await.unwrap();
+            let worker = fetch_worker(&mut bundle);
+            let cancellation = CancellationToken::new();
+            let context = WorkerCycleContext::new(worker.0, None, cancellation.clone());
+            let task = tokio::spawn(async move { worker.1.run_cycle(context).await });
+            for _ in 0..100 {
+                if starts.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let snapshot = admin.turn_state_fetcher().await.unwrap();
+            assert_eq!(
+                snapshot.running_requests,
+                vec![(ACCOUNT.to_owned(), MODEL.to_owned()); 2]
+            );
+            {
+                let starts = starts.lock().unwrap();
+                assert_eq!(starts.len(), 2, "capacity must prevent a third lease");
+                let mut times: Vec<_> = starts.values().copied().collect();
+                times.sort();
+                assert!(times[1].duration_since(times[0]) >= Duration::from_millis(950));
+            }
+            if fresh_from_traffic {
+                mount(&upstream, &"a".repeat(292), 200).await;
+                let payload = ProtocolPayload::json_object(
+                    "openai",
+                    Map::from_iter([
+                        ("model".to_owned(), json!(MODEL)),
+                        ("input".to_owned(), json!("test")),
+                    ]),
+                )
+                .unwrap()
+                .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+                let mut stream = bundle
+                    .core_provider()
+                    .execute(
+                        initialized_provider_request(
+                            Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                            ACCOUNT,
+                        ),
+                        initialized_attempt_context("req_parallel_search_stop", ACCOUNT),
+                    )
+                    .await
+                    .unwrap();
+                while let Some(event) = stream.next().await {
+                    event.unwrap();
+                }
+            } else {
+                let mut paused = snapshot.configs[0].clone();
+                paused.enabled = false;
+                admin.configure_turn_state_fetcher(paused).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(
+                admin
+                    .turn_state_fetcher()
+                    .await
+                    .unwrap()
+                    .running_requests
+                    .is_empty()
+            );
+            for _ in 0..100 {
+                if control
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method.as_str() == "DELETE")
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                control
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method.as_str() == "DELETE")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len(),
+                usize::from(fresh_from_traffic)
+            );
+            if fresh_from_traffic {
+                let state = admin.turn_state_fetcher().await.unwrap();
+                assert_eq!(state.values[0].value, "a".repeat(292));
+                assert!(
+                    state.attempts.is_empty(),
+                    "cancelled searches must not write stale failures"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -584,15 +745,13 @@ mod turn_state_fetcher {
         let body = zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["model"], MODEL);
-        assert_eq!(
-            body["input"],
-            json!([{
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "Reply only OK."}]
-            }]),
-            "fetcher must use the Codex message-array input contract"
-        );
+        let probe_text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+        let (nonce, prompt) = probe_text.split_once('\n').unwrap();
+        assert!(!nonce.is_empty() && nonce.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(prompt, "Reply only OK.");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert!(body.get("previous_response_id").is_none());
         assert!(
             body.get("tools")

@@ -76,10 +76,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.provider.provision.set()
-        if self.service.active:
-            await self.service.release(self.service.active)
-        if self.service.task:
-            await self.service.task
+        await self.service.stop()
         self.journal.db.close()
         self.directory.cleanup()
 
@@ -100,9 +97,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.acquire("22222222-2222-4222-8222-222222222222", "azure", "ipv4")
         await self.service.release(self.id)
         self.provider.provision.set()
-        await self.service.task
+        await self.service.jobs[self.id]["task"]
         self.assertEqual(self.journal.job(self.id)["state"], "released")
-        self.assertIsNone(self.service.active)
+        self.assertFalse(self.service.jobs)
         self.assertEqual(self.provider.cleanups, 1)
 
     async def test_cleanup_failure_blocks_new_allocation(self):
@@ -110,7 +107,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.ready()
         self.provider.fail_cleanup = True
         await self.service.release(self.id)
-        await self.service.task
+        await self.service.jobs[self.id]["task"]
         self.assertFalse(self.service.snapshot()["available"])
         with self.assertRaises(web.HTTPServiceUnavailable):
             await self.service.acquire("22222222-2222-4222-8222-222222222222", "azure", "ipv4")
@@ -180,7 +177,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await asyncio.wait_for(reader.readexactly(4), 5), b"ping")
                 writer.close()
                 await writer.wait_closed()
-            await self.service.task
+            await self.service.stop()
             reader, writer = await original_connect("127.0.0.1", proxy_port)
             writer.write(f"CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
             await writer.drain()

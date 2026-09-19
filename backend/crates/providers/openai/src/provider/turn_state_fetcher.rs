@@ -12,7 +12,7 @@ use crate::{
     },
 };
 use chrono::Utc;
-use futures::{StreamExt, future::BoxFuture};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use gateway_core::{
     account::{CredentialState, ProviderAccountId, ProviderAccountStore},
     lifecycle::CancellationToken,
@@ -29,16 +29,86 @@ use gateway_protocol::openai::sse::SseEventDecoder;
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::NonZeroU32,
-    sync::{Arc, Mutex},
+    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
+
+// 用随机种子初始化单调计数器：既保留随机性，也保证同一进程内并发探测不会生成重复前缀。
+static PROBE_NONCE: OnceLock<Result<AtomicU64, ()>> = OnceLock::new();
+
+fn next_probe_nonce() -> Result<u64, ()> {
+    let counter = PROBE_NONCE
+        .get_or_init(|| {
+            let mut seed = [0_u8; 8];
+            getrandom::fill(&mut seed).map_err(|_| ())?;
+            Ok(AtomicU64::new(u64::from_le_bytes(seed)))
+        })
+        .as_ref()
+        .map_err(|_| ())?;
+    Ok(counter.fetch_add(1, Ordering::Relaxed))
+}
 
 struct Running {
     account: String,
     model: String,
     cancellation: CancellationToken,
+    group: String,
+    initial_value: Option<String>,
+}
+
+struct RunningGuard<'a> {
+    running: &'a Mutex<BTreeMap<uuid::Uuid, Running>>,
+    id: uuid::Uuid,
+}
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+#[derive(Clone)]
+struct FetchPolicy {
+    group: String,
+    capacity: usize,
+    interval: Duration,
+}
+
+fn fetch_policy(config: &TurnStateFetcherConfig, status: &Value) -> Option<FetchPolicy> {
+    let Some(selection) = &config.dynamic_egress else {
+        return Some(FetchPolicy {
+            group: "static".to_owned(),
+            capacity: 1,
+            interval: Duration::ZERO,
+        });
+    };
+    if status["available"] != true {
+        return None;
+    }
+    let instance = status["instances"]
+        .as_array()?
+        .iter()
+        .find(|i| i["id"].as_str() == Some(&selection.instance))?;
+    let nova = instance["provider"] == "novaproxy";
+    Some(FetchPolicy {
+        group: if nova {
+            format!("nova:{}", selection.instance)
+        } else {
+            "azure".to_owned()
+        },
+        capacity: if nova {
+            usize::try_from(instance["maxConcurrent"].as_u64().unwrap_or(1).clamp(1, 16)).ok()?
+        } else {
+            1
+        },
+        interval: Duration::from_secs(instance["intervalSeconds"].as_u64().unwrap_or(10).min(3600)),
+    })
 }
 
 pub(crate) struct TurnStateFetcher {
@@ -51,7 +121,8 @@ pub(crate) struct TurnStateFetcher {
     profile: CodexWireProfileState,
     base_url: String,
     dynamic_egress: Option<super::dynamic_egress::DynamicEgress>,
-    running: Mutex<Option<Running>>,
+    running: Mutex<BTreeMap<uuid::Uuid, Running>>,
+    last_started: Mutex<BTreeMap<String, Instant>>,
     cycle: tokio::sync::Mutex<()>,
     persisted: Mutex<Vec<TurnStateValue>>,
     updates: tokio::sync::Mutex<()>,
@@ -84,7 +155,8 @@ impl TurnStateFetcher {
             profile,
             base_url,
             dynamic_egress: None,
-            running: Mutex::new(None),
+            running: Mutex::new(BTreeMap::new()),
+            last_started: Mutex::new(BTreeMap::new()),
             cycle: tokio::sync::Mutex::new(()),
             persisted: Mutex::new(Vec::new()),
             updates: tokio::sync::Mutex::new(()),
@@ -102,6 +174,13 @@ impl TurnStateFetcher {
     }
 
     pub(crate) async fn snapshot(&self) -> Result<TurnStateFetcherSnapshot, ProviderStoreError> {
+        let running_requests: Vec<_> = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|r| (r.account.clone(), r.model.clone()))
+            .collect();
         Ok(TurnStateFetcherSnapshot {
             dynamic_egress: match &self.dynamic_egress {
                 Some(service) => service.status().await,
@@ -112,12 +191,8 @@ impl TurnStateFetcher {
             configs: self.store.configs().await?,
             values: self.cache.values(),
             attempts: self.store.attempts().await?,
-            running: self
-                .running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .map(|r| (r.account.clone(), r.model.clone())),
+            running: running_requests.first().cloned(),
+            running_requests,
         })
     }
 
@@ -184,12 +259,12 @@ impl TurnStateFetcher {
         }
         let _update = self.updates.lock().await;
         self.store.save_config(config.clone()).await?;
-        if let Some(running) = self
+        for running in self
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            && running.account == config.account_id
+            .values()
+            .filter(|r| r.account == config.account_id)
         {
             running.cancellation.cancel();
         }
@@ -213,8 +288,8 @@ impl TurnStateFetcher {
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|r| r.account == account && r.model == model)
+            .values()
+            .any(|r| r.account == account && r.model == model)
         {
             return Ok(());
         }
@@ -275,6 +350,68 @@ impl TurnStateFetcher {
         cancellation: &CancellationToken,
     ) -> Result<(), ProviderStoreError> {
         let _guard = self.cycle.lock().await;
+        let status = match &self.dynamic_egress {
+            Some(service) => service.status().await,
+            None => Value::Null,
+        };
+        let mut tasks = FuturesUnordered::new();
+        let cycle_started = Instant::now();
+        loop {
+            if cancellation.is_cancelled() {
+                return Ok(());
+            }
+            // 限制单个调度周期的准入时间，已开始的请求仍正常收尾。
+            if cycle_started.elapsed() < Duration::from_secs(60) {
+                for (config, model, policy) in self.due(&status).await? {
+                    let id = uuid::Uuid::new_v4();
+                    let stop = CancellationToken::new();
+                    self.running
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(
+                            id,
+                            Running {
+                                account: config.account_id.clone(),
+                                model: model.clone(),
+                                cancellation: stop.clone(),
+                                group: policy.group.clone(),
+                                initial_value: self
+                                    .cache
+                                    .values()
+                                    .iter()
+                                    .find(|v| v.account_id == config.account_id && v.model == model)
+                                    .map(|v| v.value.clone()),
+                            },
+                        );
+                    self.last_started
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(policy.group, Instant::now());
+                    let guard = RunningGuard {
+                        running: &self.running,
+                        id,
+                    };
+                    tasks.push(async move {
+                        let _guard = guard;
+                        self.run_attempt(config, model, stop, cancellation).await
+                    });
+                }
+            }
+            if tasks.is_empty() {
+                return Ok(());
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return Ok(()),
+                Some(result) = tasks.next() => result?,
+                () = tokio::time::sleep(Duration::from_millis(250)) => {},
+            }
+        }
+    }
+
+    async fn due(
+        &self,
+        status: &Value,
+    ) -> Result<Vec<(TurnStateFetcherConfig, String, FetchPolicy)>, ProviderStoreError> {
         // 有界周期写回，不为每个正常请求生成后台任务；存储不可用时不继续付费获取。
         self.persist().await?;
         let configs = self.store.configs().await?;
@@ -304,37 +441,89 @@ impl TurnStateFetcher {
                     previous.map_or(0, |a| a.next_attempt_at),
                     config.clone(),
                     model.clone(),
-                    previous.cloned(),
                 ));
             }
         }
-        due.sort_by_key(|(at, _, _, _)| *at);
-        let Some((_, config, model, previous)) = due.into_iter().next() else {
-            return Ok(());
-        };
-        if cancellation.is_cancelled() {
-            return Ok(());
-        }
-        let stop = CancellationToken::new();
-        *self
+        let running = self
             .running
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Running {
-            account: config.account_id.clone(),
-            model: model.clone(),
-            cancellation: stop.clone(),
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for r in running.values() {
+            if values.iter().any(|v| {
+                v.account_id == r.account
+                    && v.model == r.model
+                    && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > now
+                    && r.initial_value.as_ref() != Some(&v.value)
+            }) {
+                r.cancellation.cancel();
+            }
+        }
+        due.sort_by_key(|(at, config, model)| {
+            (
+                running
+                    .values()
+                    .filter(|r| r.account == config.account_id && r.model == *model)
+                    .count(),
+                *at,
+            )
         });
+        let mut counts = BTreeMap::<String, usize>::new();
+        for r in running.values() {
+            *counts.entry(r.group.clone()).or_default() += 1;
+        }
+        let last = self
+            .last_started
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut selected = Vec::new();
+        for (_, config, model) in due {
+            let Some(policy) = fetch_policy(&config, status) else {
+                continue;
+            };
+            if last
+                .get(&policy.group)
+                .is_some_and(|at| at.elapsed() < policy.interval)
+            {
+                continue;
+            }
+            let count = counts.entry(policy.group.clone()).or_default();
+            if *count < policy.capacity {
+                selected.push((config, model, policy.clone()));
+                // 非零间隔每轮只启动一个；零间隔在后续轮次补齐同一账号模型的槽位。
+                *count = if policy.interval.is_zero() {
+                    *count + 1
+                } else {
+                    policy.capacity
+                };
+            }
+        }
+        Ok(selected)
+    }
+
+    async fn run_attempt(
+        &self,
+        config: TurnStateFetcherConfig,
+        model: String,
+        stop: CancellationToken,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProviderStoreError> {
+        let now = Utc::now().timestamp_millis();
+        let initial_value = self
+            .cache
+            .values()
+            .iter()
+            .find(|v| v.account_id == config.account_id && v.model == model)
+            .map(|v| v.value.clone());
         let started = Instant::now();
         let mut outcome = tokio::select! {
-            () = cancellation.cancelled() => FetchOutcome::retry("服务正在停止", 60),
-            () = stop.cancelled() => FetchOutcome::retry("配置已改变，本次获取已取消", 60),
+            () = cancellation.cancelled() => return Ok(()),
+            () = stop.cancelled() => return Ok(()),
             result = self.fetch_with_egress(&config, &model) => result,
         };
-        *self
-            .running
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let _update = self.updates.lock().await;
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         // 设置改变、暂停和删除后，旧任务不得写入共享缓存。
         if !self
             .store
@@ -346,6 +535,15 @@ impl TurnStateFetcher {
             return Ok(());
         }
         let finished = Utc::now().timestamp_millis();
+        // 并发搜索或正常流量已获得新值时，迟到结果不能覆盖成功状态。
+        if self.cache.values().iter().any(|v| {
+            v.account_id == config.account_id
+                && v.model == model
+                && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > finished
+                && initial_value.as_ref() != Some(&v.value)
+        }) {
+            return Ok(());
+        }
         if let Some(value) = &outcome.value {
             self.cache.observe_at(
                 &config.account_id,
@@ -370,17 +568,38 @@ impl TurnStateFetcher {
             }
         }
         let failures = if outcome.success {
+            for r in self
+                .running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+            {
+                if r.account == config.account_id && r.model == model {
+                    r.cancellation.cancel();
+                }
+            }
             0
         } else {
-            previous
-                .as_ref()
+            self.store
+                .attempts()
+                .await?
+                .iter()
+                .find(|a| {
+                    a.account_id == config.account_id
+                        && a.model == model
+                        && a.config_revision == config.revision
+                })
                 .map_or(1, |a| a.failures.saturating_add(1))
         };
         let retry_missing_value = !outcome.success && !outcome.paused && outcome.retry_after == 0;
         let delay = if outcome.success {
             0
         } else if retry_missing_value {
-            10
+            if config.dynamic_egress.is_some() {
+                0
+            } else {
+                10
+            }
         } else {
             backoff_seconds(failures).max(outcome.retry_after)
         };
@@ -599,12 +818,15 @@ impl TurnStateFetcher {
                 None
             });
         // 与账号连接测试及官方 Codex 一致，使用消息数组，不能依赖公开 API 的字符串简写。
+        let Ok(nonce) = next_probe_nonce() else {
+            return FetchOutcome::retry("探测请求随机数生成失败", 60);
+        };
         let mut body = json!({
             "model": model,
             "input": [{
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": "Reply only OK."}]
+                "content": [{"type": "input_text", "text": format!("{}\nReply only OK.", nonce)}]
             }],
             "instructions": "Be brief.",
             "stream": true,
@@ -734,6 +956,18 @@ pub(crate) fn backoff_seconds(failures: u32) -> u64 {
         3 => 300,
         4 => 600,
         _ => 900,
+    }
+}
+
+#[cfg(test)]
+mod probe_nonce_tests {
+    use super::next_probe_nonce;
+
+    #[test]
+    fn probe_nonce_is_numeric_and_unique() {
+        let first = next_probe_nonce().unwrap();
+        let second = next_probe_nonce().unwrap();
+        assert_ne!(first, second);
     }
 }
 

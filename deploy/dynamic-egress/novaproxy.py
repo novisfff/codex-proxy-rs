@@ -12,8 +12,22 @@ import h11
 
 
 class NovaProxy:
+    @staticmethod
+    def validate(config):
+        host = config.get("host")
+        if not isinstance(host, str) or not re.fullmatch(r"[a-zA-Z0-9-]+\.novaproxy\.io", host):
+            raise ValueError("Invalid NovaProxy gateway")
+        if type(config.get("port")) is not int or not 1 <= config["port"] <= 65535:
+            raise ValueError("Invalid proxy port")
+        for field in ("username", "password"):
+            value = config.get(field)
+            if not isinstance(value, str) or not 1 <= len(value) <= 1024 or any(ord(c) < 33 or ord(c) > 126 for c in value):
+                raise ValueError("Invalid credentials")
+        if ":" in config["username"]:
+            raise ValueError("Invalid username")
+
     def credentials(self, reference):
-        # 控制面仅传受限名称，不接受任意文件路径或明文认证信息。
+        # 仅用于迁移旧安装；新配置直接保存在数据库中。
         if not isinstance(reference, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", reference):
             raise ValueError("Invalid credential reference")
         directory = Path(os.environ.get("EGRESS_NOVAPROXY_CREDENTIALS_DIR", "/etc/cpr292-egress/novaproxy"))
@@ -23,17 +37,13 @@ class NovaProxy:
         data = json.loads(path.read_text())
         if not isinstance(data, dict) or set(data) != {"username", "password"}:
             raise ValueError("Invalid credentials")
-        for field in ("username", "password"):
-            value = data[field]
-            if not isinstance(value, str) or not 1 <= len(value) <= 1024 or any(ord(c) < 33 or ord(c) > 126 for c in value):
-                raise ValueError("Invalid credentials")
-        if ":" in data["username"]:
-            raise ValueError("Invalid username")
+        self.validate(dict(data, host="residential-gateway.novaproxy.io", port=1111))
         return data
 
     async def connect(self, credentials, target):
-        # 地址固定为供应商网关，认证信息不会发送给控制面指定的任意服务器。
-        reader, writer = await asyncio.open_connection("residential-gateway.novaproxy.io", 1111)
+        # 只接受供应商域名，防止误填第三方地址时泄露认证信息。
+        self.validate(credentials)
+        reader, writer = await asyncio.open_connection(credentials["host"], credentials["port"])
         try:
             connection = h11.Connection(h11.CLIENT, max_incomplete_event_size=16384)
             auth = base64.b64encode(f"{credentials['username']}:{credentials['password']}".encode())

@@ -53,19 +53,16 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
 
 ### NovaProxy Rotating
 
-在「动态出口 → 添加出口实例」选择 NovaProxy Rotating，填写实例 ID、名称和服务器凭据名称
-（例如 `nova-us`）。将凭据存入 `/etc/cpr292-egress/novaproxy/nova-us.json`：
-
-```json
-{"username":"YOUR_ROTATING_USERNAME","password":"YOUR_PROXY_PASSWORD"}
-```
-
-文件使用 `root:cpr292`、权限 `0640`，目录禁止其他用户写入；不支持符号链接。
-可以用 `EGRESS_NOVAPROXY_CREDENTIALS_DIR` 指定凭据目录。凭据不会进入管理 API 或 SQLite；
-修改文件后下一租约生效。更新服务时必须同时安装 `egress.py` 和 `novaproxy.py`。
+在「292 获取器 → 动态出口 → 添加出口实例」选择 NovaProxy Rotating，填写实例 ID、名称、
+代理地址、端口、代理用户名和代理密码。默认地址为 `residential-gateway.novaproxy.io`，端口为 `1111`。
+编辑已有实例时密码留空保留原值；状态接口仅返回是否已配置密码，不回传密码。
+认证信息保存在出口服务 SQLite 数据库中，不需要手工创建配置文件。数据库、WAL 及备份包含明文认证信息，
+应保留服务的 `UMask=0077` 和状态目录访问限制。更新服务时必须同时安装 `egress.py` 和 `novaproxy.py`。
+旧版 `credentialRef` 配置启动时从原凭据目录自动导入数据库；文件缺失时可在页面补填。
+迁移成功后不再依赖原文件，`EGRESS_NOVAPROXY_CREDENTIALS_DIR` 仅供旧文件迁移使用。
 账号获取器选择此动态出口实例和 IPv4。仅使用 Rotating 用户名，不添加 sticky/session 参数。
 
-服务固定连接 `residential-gateway.novaproxy.io:1111`，每次尝试新建一个 CONNECT 隧道，
+服务仅接受 `*.novaproxy.io` 的单级子域名，每次尝试新建一个 CONNECT 隧道，
 只访问官方 OpenAI；TLS 端到端校验证书，失败不会直连或改用业务代理。
 当前 Residential Premium 仅支持 IPv4。供应商负责轮换，**不保证最近 24 小时不重复**；
 独立 IP 探测与 OpenAI 连接可能走不同出口，因此不探测、不声明实际 OpenAI 出口 IP，页面显示未验证。
@@ -73,7 +70,11 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
 
 ## 租约与故障恢复
 
-- 全局只有一个活动租约，所有实例共享数据库和进程文件锁。不要启动使用其他数据库副本的第二个服务。
+- 每个实例可设置最大并发数（NovaProxy 1–16，Azure 固定 1）和尝试间隔（0–3600 整秒），默认 1 和 10 秒。
+  间隔从上次尝试启动计时，0 表示仅限制并发；所有绑定该实例的账号和模型共用这些限制。
+  同一账号、同一模型可以并发搜索，获取到有效新值后取消其余搜索。账号自身并发限制仍然生效。
+- NovaProxy 租约分别维护认证、连接和释放状态。Azure 在同一出口服务内串行申请与清理，避免清理在用 IP。
+  所有实例共享数据库和进程文件锁。不要启动使用其他数据库副本的第二个服务。
 - 每次获取使用新 attempt ID；控制面重试使用同一 ID，不重复申请。
 - Azure 依次创建 Standard 静态公网 IP、检查最近 24 小时历史、绑定专用配置、核实实际公网 IP。
   每次申请前先回收日志中自己的残留资源，再清理实例公网 IP 资源组内的闲置公网 IP（含非本服务创建的 IPv4/IPv6）。

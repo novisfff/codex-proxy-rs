@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import contextlib
+import copy
 import fcntl
 import hmac
 import ipaddress
@@ -261,19 +262,29 @@ class Service:
     def __init__(self, config, journal, provider):
         self.config, self.journal, self.provider = config, journal, provider
         self.novaproxy = NovaProxy()
-        self.nova_credentials = None
-        self.active = None
-        self.task = None
+        self.jobs = {}
+        self.last_started = {}
         self.ready = False
         self.fault = ""
-        self.tunnel = None
-        self.source = None
-        self.released = asyncio.Event()
         saved = self.journal.db.execute("SELECT data,revision FROM settings WHERE id=1").fetchone()
         self.revision = saved[1] if saved else 0
         if saved:
             self.config["instances"] = json.loads(saved[0])
             self.provider.instances = self.config["instances"]
+        migrated = False
+        for instance in self.config["instances"].values():
+            if instance.get("provider") == "novaproxy" and "credentialRef" in instance:
+                try:
+                    credentials = self.novaproxy.credentials(instance["credentialRef"])
+                except (OSError, ValueError):
+                    # 文件缺失时仍允许管理员进入页面补填，不阻断其他实例。
+                    continue
+                instance.pop("credentialRef")
+                instance.update(credentials, host="residential-gateway.novaproxy.io", port=1111)
+                migrated = True
+        if migrated:
+            self.revision += 1
+            self.journal.execute("INSERT OR REPLACE INTO settings VALUES(1,?,?)", (json.dumps(self.config["instances"]), self.revision))
 
     async def start(self):
         try:
@@ -285,16 +296,33 @@ class Service:
             self.fault = "Startup reconciliation failed; inspect Azure resources before restarting"
 
     def snapshot(self):
-        instances = [{"id": key, **c, "families": list(c["bindings"])}
-                     for key, c in self.config["instances"].items()]
+        instances = []
+        for key, config in self.config["instances"].items():
+            public = {k: v for k, v in config.items() if k not in ("password", "credentialRef")}
+            public.update(maxConcurrent=config.get("maxConcurrent", 1), intervalSeconds=config.get("intervalSeconds", 10))
+            if config["provider"] == "novaproxy":
+                public.update(host=config.get("host", "residential-gateway.novaproxy.io"),
+                              port=config.get("port", 1111), username=config.get("username", ""),
+                              passwordSet=bool(config.get("password")))
+            instances.append({"id": key, **public, "families": list(config["bindings"])})
         history = [dict(row) for row in self.journal.db.execute(
             "SELECT id,instance,family,state,ip,created,expires,message,provider FROM jobs ORDER BY created DESC LIMIT 50")]
         return {"available": self.ready and not self.fault, "message": self.fault,
                 "instances": instances, "history": history, "revision": self.revision}
 
     def configure(self, instances, revision):
-        if self.active or self.fault or not self.ready or type(revision) is not int or revision != self.revision:
+        if self.jobs or self.fault or not self.ready or type(revision) is not int or revision != self.revision:
             raise web.HTTPConflict()
+        if not isinstance(instances, dict):
+            raise web.HTTPBadRequest()
+        instances = copy.deepcopy(instances)
+        for key, instance in instances.items():
+            if isinstance(instance, dict) and instance.get("provider") == "novaproxy":
+                if "credentialRef" in instance:
+                    raise web.HTTPBadRequest()
+                if instance.get("password", "") == "":
+                    previous = self.config["instances"].get(key, {})
+                    instance["password"] = previous.get("password", "") if previous.get("provider") == "novaproxy" else ""
         validate_instances(instances)
         self.journal.execute("INSERT OR REPLACE INTO settings VALUES(1,?,?)", (json.dumps(instances), self.revision + 1))
         self.revision += 1
@@ -314,14 +342,21 @@ class Service:
         config = self.config["instances"].get(instance)
         if not config or family not in config["bindings"]:
             raise web.HTTPBadRequest()
-        if self.active:
+        active = [job for job in self.jobs.values() if job["instance"] == instance]
+        if (len(active) >= config.get("maxConcurrent", 1)
+                or (config["provider"] == "azure" and any(job["provider"] == "azure" for job in self.jobs.values()))):
+            raise web.HTTPConflict()
+        now = time.monotonic()
+        if now - self.last_started.get(instance, float("-inf")) < config.get("intervalSeconds", 10):
             raise web.HTTPConflict()
         self.journal.execute("DELETE FROM jobs WHERE created<? AND state IN ('released','failed')", (time.time() - 7 * 86400,))
-        self.active = job_id
-        self.released = asyncio.Event()
+        job = {"instance": instance, "provider": config["provider"], "released": asyncio.Event(),
+               "tunnel": None, "source": None, "credentials": config}
+        self.jobs[job_id] = job
+        self.last_started[instance] = now
         self.journal.execute("INSERT INTO jobs(id,instance,family,state,created,provider) VALUES(?,?,?,'provisioning',?,?)",
                              (job_id, instance, family, time.time(), config["provider"]))
-        self.task = asyncio.create_task(self.run(job_id, instance, family))
+        job["task"] = asyncio.create_task(self.run(job_id, instance, family))
         return self.present(self.journal.job(job_id))
 
     def present(self, row):
@@ -332,41 +367,41 @@ class Service:
         return result
 
     async def run(self, job_id, instance, family):
+        job = self.jobs[job_id]
         try:
             if self.config["instances"][instance]["provider"] == "novaproxy":
-                self.nova_credentials = self.novaproxy.credentials(self.config["instances"][instance]["credentialRef"])
-                address, self.source = None, None
+                address = None
             else:
-                address, self.source = await self.provider.allocate(instance, family)
-            if not self.released.is_set():
+                address, job["source"] = await self.provider.allocate(instance, family)
+            if not job["released"].is_set():
                 self.journal.execute("UPDATE jobs SET state='ready',ip=?,secret=?,expires=? WHERE id=?",
                                      (address, secrets.token_urlsafe(32), time.time() + 90, job_id))
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(self.released.wait(), 90)
+                    await asyncio.wait_for(job["released"].wait(), 90)
         except Exception as error:
             message = str(error) if isinstance(error, EgressError) else "Address allocation or verification failed"
             self.journal.execute("UPDATE jobs SET state='failed',message=? WHERE id=?", (message, job_id))
         finally:
-            if self.tunnel:
-                self.tunnel.cancel()
+            if job["tunnel"]:
+                job["tunnel"].cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self.tunnel
+                    await job["tunnel"]
             row = self.journal.job(job_id)
             if row["ip"]:
                 self.journal.used(row["ip"])
             try:
-                await self.provider.recover()
+                if job["provider"] == "azure":
+                    await self.provider.recover()
             except Exception:
                 self.fault = "Azure cleanup is incomplete; new leases blocked until reconciliation succeeds"
             self.journal.execute("UPDATE jobs SET state=CASE WHEN state='failed' THEN state ELSE 'released' END,secret=NULL WHERE id=?", (job_id,))
-            self.source, self.active, self.tunnel = None, None, None
-            self.nova_credentials = None
+            self.jobs.pop(job_id, None)
 
     async def release(self, job_id):
         if not re.fullmatch(r"[a-f0-9-]{36}", job_id):
             raise web.HTTPBadRequest()
-        if self.active == job_id:
-            self.released.set()
+        if job_id in self.jobs:
+            self.jobs[job_id]["released"].set()
         elif not self.journal.job(job_id):
             # 取消先于迟到的 acquire 到达时，用墓碑阻止该 ID 启动资源分配。
             self.journal.execute("INSERT INTO jobs(id,instance,family,state,created) VALUES(?,'','','released',?)", (job_id, time.time()))
@@ -374,6 +409,7 @@ class Service:
     async def connect(self, reader, writer):
         connection = h11.Connection(h11.SERVER, max_incomplete_event_size=16384)
         accepted = False
+        job = None
         upstream_writer = None
         try:
             async with asyncio.timeout(15):
@@ -389,22 +425,27 @@ class Service:
                     else:
                         raise EgressError("Invalid CONNECT")
                 headers = dict(event.headers)
-                row = self.journal.job(self.active) if self.active else None
-                expected = b"Basic " + base64.b64encode(f"{self.active}:{row['secret']}".encode()) if row else b""
+                auth = headers.get(b"proxy-authorization", b"")
+                if not auth.startswith(b"Basic "):
+                    raise EgressError("CONNECT denied")
+                job_id = base64.b64decode(auth[6:], validate=True).decode().split(":", 1)[0]
+                job = self.jobs.get(job_id)
+                row = self.journal.job(job_id) if job else None
+                expected = b"Basic " + base64.b64encode(f"{job_id}:{row['secret']}".encode()) if row else b""
                 if (event.method != b"CONNECT" or event.target not in (b"chatgpt.com:443", b"api.openai.com:443")
                         or not row or row["state"] != "ready" or row["expires"] <= time.time()
-                        or self.released.is_set()
+                        or job["released"].is_set()
                         or not hmac.compare_digest(headers.get(b"proxy-authorization", b""), expected)):
                     raise EgressError("CONNECT denied")
                 # await 之前原子消耗租约，一次连接失败也不能再次使用同一 IP。
-                self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (self.active,))
+                self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (job_id,))
                 if row["ip"]:
                     self.journal.used(row["ip"])
-                self.tunnel = asyncio.current_task()
+                job["tunnel"] = asyncio.current_task()
                 accepted = True
                 proxy_trailing = b""
                 if row["provider"] == "novaproxy":
-                    upstream_reader, upstream_writer, proxy_trailing = await self.novaproxy.connect(self.nova_credentials, event.target)
+                    upstream_reader, upstream_writer, proxy_trailing = await self.novaproxy.connect(job["credentials"], event.target)
                 else:
                     family = socket.AF_INET if row["family"] == "ipv4" else socket.AF_INET6
                     host = event.target.decode().split(":")[0]
@@ -413,7 +454,7 @@ class Service:
                     if not ipaddress.ip_address(address).is_global:
                         raise EgressError("Non-public destination")
                     upstream_reader, upstream_writer = await asyncio.open_connection(
-                        address, 443, family=family, local_addr=(self.source, 0))
+                        address, 443, family=family, local_addr=(job["source"], 0))
                 writer.write(connection.send(h11.Response(status_code=200, headers=[])))
                 writer.write(proxy_trailing)
                 await writer.drain()
@@ -447,8 +488,15 @@ class Service:
                     with contextlib.suppress(Exception):
                         await stream.wait_closed()
             if accepted:
-                self.tunnel = None
-                self.released.set()
+                job["tunnel"] = None
+                job["released"].set()
+
+    async def stop(self):
+        self.ready = False
+        jobs = list(self.jobs.values())
+        for job in jobs:
+            job["released"].set()
+        await asyncio.gather(*(job["task"] for job in jobs))
 
 
 def application(service, token):
@@ -494,16 +542,30 @@ def validate_instances(instances):
     for key, config in instances.items():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", key) or not isinstance(config, dict):
             raise web.HTTPBadRequest()
+        concurrency, interval = config.get("maxConcurrent", 1), config.get("intervalSeconds", 10)
+        if (type(concurrency) is not int or not 1 <= concurrency <= 16
+                or type(interval) is not int or not 0 <= interval <= 3600
+                or (config.get("provider") == "azure" and concurrency != 1)):
+            raise web.HTTPBadRequest()
+        fields_present = set(config) - {"maxConcurrent", "intervalSeconds"}
         if config.get("provider") == "novaproxy":
-            if (set(config) != {"provider", "name", "credentialRef", "bindings"}
+            legacy = "credentialRef" in config
+            fields = {"credentialRef"} if legacy else {"host", "port", "username", "password"}
+            if (fields_present != {"provider", "name", "bindings"} | fields
                     or not isinstance(config["name"], str) or not 1 <= len(config["name"]) <= 128
                     or any(ord(c) < 32 for c in config["name"])
-                    or not isinstance(config["credentialRef"], str)
-                    or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", config["credentialRef"])
                     or config["bindings"] != {"ipv4": {}}):
                 raise web.HTTPBadRequest()
+            if legacy:
+                if not isinstance(config["credentialRef"], str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", config["credentialRef"]):
+                    raise web.HTTPBadRequest()
+            else:
+                try:
+                    NovaProxy.validate(config)
+                except ValueError:
+                    raise web.HTTPBadRequest() from None
             continue
-        if set(config) != {"provider", "name", "subscription", "resourceGroup", "location", "bindings"}:
+        if fields_present != {"provider", "name", "subscription", "resourceGroup", "location", "bindings"}:
             raise web.HTTPBadRequest()
         if config["provider"] != "azure" or not isinstance(config["bindings"], dict) or not config["bindings"]:
             raise web.HTTPBadRequest()
@@ -556,11 +618,7 @@ async def main():
         async with proxy:
             await stopped.wait()
     finally:
-        service.ready = False
-        if service.active:
-            await service.release(service.active)
-        if service.task:
-            await asyncio.shield(service.task)
+        await asyncio.shield(service.stop())
         await runner.cleanup()
         journal.db.close()
 

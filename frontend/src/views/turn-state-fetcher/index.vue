@@ -48,7 +48,8 @@ const bindingFields = [
   { key: 'ipConfiguration', label: 'IP 配置名称' },
   { key: 'sourceIp', label: '私网源 IP' },
 ] as const
-const instancesEditable = computed(() => !!snapshot.value.dynamicEgress?.available && !snapshot.value.configs.some(config => config.enabled && config.dynamicEgress) && !snapshot.value.running)
+const runningRequests = computed(() => snapshot.value.runningRequests ?? (snapshot.value.running ? [snapshot.value.running] : []))
+const instancesEditable = computed(() => !!snapshot.value.dynamicEgress?.available && !snapshot.value.configs.some(config => config.enabled && config.dynamicEgress) && !runningRequests.value.length)
 const dynamicOptions = computed(() => snapshot.value.dynamicEgress?.instances.map(instance => ({ label: instance.name, value: instance.id })) ?? [])
 const familyOptions = computed(() => (snapshot.value.dynamicEgress?.instances.find(instance => instance.id === dynamicInstance.value)?.families ?? []).map(family => ({ label: family === 'ipv4' ? 'IPv4' : 'IPv6', value: family })))
 const editOpen = ref(false)
@@ -80,7 +81,7 @@ function editInstance(id = '') {
   instanceId.value = id
   originalInstanceId.value = id
   instanceRevision.value = snapshot.value.dynamicEgress?.revision ?? 0
-  instanceForm.value = existing ? { ...instanceConfig(existing), bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', credentialRef: '', bindings: {} }
+  instanceForm.value = existing ? { ...instanceConfig(existing), password: '', passwordSet: existing.passwordSet, bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', host: 'residential-gateway.novaproxy.io', port: 1111, username: '', password: '', bindings: {} }
   editingFamilies.value = Object.keys(instanceForm.value.bindings)
   for (const family of ['ipv4', 'ipv6']) {
     instanceForm.value.bindings[family] ??= { resourceGroup: '', nic: '', ipConfiguration: '', sourceIp: '', dedicated: true }
@@ -88,9 +89,11 @@ function editInstance(id = '') {
   instanceOpen.value = true
 }
 function instanceConfig(instance: EgressInstance): EgressInstance {
-  return instance.provider === 'novaproxy'
-    ? { provider: 'novaproxy', name: instance.name, credentialRef: instance.credentialRef, bindings: { ipv4: {} } }
+  const scheduling = { maxConcurrent: instance.provider === 'azure' ? 1 : instance.maxConcurrent ?? 1, intervalSeconds: instance.intervalSeconds ?? 10 }
+  const config = instance.provider === 'novaproxy'
+    ? { provider: 'novaproxy', name: instance.name, host: instance.host, port: instance.port, username: instance.username, ...(instance.password ? { password: instance.password } : {}), bindings: { ipv4: {} } }
     : { provider: 'azure', name: instance.name, subscription: instance.subscription, resourceGroup: instance.resourceGroup, location: instance.location, bindings: instance.bindings }
+  return { ...config, ...scheduling }
 }
 function isNova(accountId: string) {
   const id = config(accountId).dynamicEgress?.instance
@@ -100,8 +103,14 @@ function toggleFamily(family: string, enabled: boolean) {
   editingFamilies.value = enabled ? [...new Set([...editingFamilies.value, family])] : editingFamilies.value.filter(value => value !== family)
 }
 async function saveInstance(remove = false) {
-  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || (instanceForm.value.provider === 'azure' ? !editingFamilies.value.length : !/^[\w-]{1,64}$/.test(instanceForm.value.credentialRef ?? '')))) {
-    toast.warning(instanceForm.value.provider === 'novaproxy' ? '填写有效的实例 ID 和服务器凭据名称' : '填写实例 ID 并至少选择一种地址类型')
+  const nova = instanceForm.value
+  if (!remove && (!Number.isInteger(nova.maxConcurrent ?? 1) || (nova.maxConcurrent ?? 1) < 1 || (nova.maxConcurrent ?? 1) > 16 || !Number.isInteger(nova.intervalSeconds ?? 10) || (nova.intervalSeconds ?? 10) < 0 || (nova.intervalSeconds ?? 10) > 3600)) {
+    toast.warning('并发数需为 1–16 的整数，尝试间隔需为 0–3600 秒的整数')
+    return
+  }
+  const validNova = /^[a-z0-9-]+\.novaproxy\.io$/i.test(nova.host ?? '') && Number.isInteger(nova.port) && (nova.port ?? 0) >= 1 && (nova.port ?? 0) <= 65535 && !!nova.username && (!!nova.password || nova.passwordSet)
+  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || (nova.provider === 'azure' ? !editingFamilies.value.length : !validNova))) {
+    toast.warning(nova.provider === 'novaproxy' ? '填写有效的实例 ID、NovaProxy 地址、端口、用户名和密码' : '填写实例 ID 并至少选择一种地址类型')
     return
   }
   await action.run(async () => {
@@ -113,6 +122,7 @@ async function saveInstance(remove = false) {
     if (!remove)
       instances[instanceId.value] = instanceConfig({ ...instanceForm.value, bindings: Object.fromEntries(editingFamilies.value.map(family => [family, instanceForm.value.bindings[family]!])) })
     await configureDynamicEgress({ instances, revision: instanceRevision.value })
+    instanceForm.value.password = ''
     instanceOpen.value = false
     await refresh()
     toast.success(remove ? '实例已移除' : '实例已保存')
@@ -127,9 +137,9 @@ function rows(accountId: string) {
   return selected.models.map((model) => {
     const value = snapshot.value.values.find(v => v.accountId === accountId && v.model === model)
     const attempt = snapshot.value.attempts.find(a => a.accountId === accountId && a.model === model && a.configRevision === selected.revision)
-    const running = snapshot.value.running?.[0] === accountId && snapshot.value.running?.[1] === model
+    const running = runningRequests.value.filter(([account, currentModel]) => account === accountId && currentModel === model).length
     const expired = !!value && value.expiresAt <= now.value
-    const status = !selected.enabled ? '已暂停' : running ? '获取中' : attempt?.paused ? '需要处理' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
+    const status = !selected.enabled ? '已暂停' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
     return { model, value, attempt, running, expired, status }
   })
 }
@@ -305,6 +315,7 @@ onBeforeUnmount(() => {
       </p>
       <div v-for="instance in snapshot.dynamicEgress?.instances" :key="instance.id" class="my-3 flex flex-wrap gap-3">
         <strong>{{ instance.name }}</strong><span>{{ instance.families.join(' / ') }}</span>
+        <span>并发 {{ instance.maxConcurrent ?? 1 }} · 间隔 {{ instance.intervalSeconds ?? 10 }} 秒</span>
         <BaseButton size="sm" :disabled="!instancesEditable || saving" @click="editInstance(instance.id)">
           编辑
         </BaseButton>
@@ -356,7 +367,7 @@ onBeforeUnmount(() => {
               <div class="flex min-w-0 flex-wrap items-center gap-3">
                 <strong class="break-all text-cp-text">{{ row.model }}</strong><span :class="row.status === '有效' ? 'text-cp-success' : row.expired || row.attempt?.paused ? 'text-cp-error' : 'text-cp-text-secondary'">{{ row.status }}</span>
               </div>
-              <BaseButton size="sm" :disabled="saving || error || row.running || !config(account.id).enabled || row.attempt?.paused || (!!row.attempt?.failures && row.attempt.nextAttemptAt > now)" @click="run(account.id, row.model)">
+              <BaseButton size="sm" :disabled="saving || error || !!row.running || !config(account.id).enabled || row.attempt?.paused || (!!row.attempt?.failures && row.attempt.nextAttemptAt > now)" @click="run(account.id, row.model)">
                 立即获取
               </BaseButton>
             </div>
@@ -397,14 +408,31 @@ onBeforeUnmount(() => {
           <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'NovaProxy Rotating', value: 'novaproxy' }]" :disabled="saving || !!originalInstanceId" />
         </BaseFormItem>
         <BaseFormItem label="实例 ID">
-          <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" placeholder="azure-main" />
+          <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" :placeholder="instanceForm.provider === 'novaproxy' ? 'nova-us' : 'azure-main'" />
         </BaseFormItem>
+        <div class="grid grid-cols-2 gap-4">
+          <BaseFormItem :label="instanceForm.provider === 'azure' ? '最大并发数（Azure 固定 1）' : '最大并发数'">
+            <BaseInput :model-value="String(instanceForm.provider === 'azure' ? 1 : instanceForm.maxConcurrent ?? 1)" type="number" min="1" max="16" :disabled="saving || instanceForm.provider === 'azure'" @update:model-value="instanceForm.maxConcurrent = Number($event)" />
+          </BaseFormItem>
+          <BaseFormItem label="尝试间隔（秒）">
+            <BaseInput :model-value="String(instanceForm.intervalSeconds ?? 10)" type="number" min="0" max="3600" :disabled="saving" @update:model-value="instanceForm.intervalSeconds = Number($event)" />
+          </BaseFormItem>
+        </div>
         <template v-if="instanceForm.provider === 'novaproxy'">
           <BaseFormItem label="名称">
             <BaseInput v-model="instanceForm.name" :disabled="saving" />
           </BaseFormItem>
-          <BaseFormItem label="服务器凭据名称">
-            <BaseInput v-model="instanceForm.credentialRef" placeholder="nova-us" :disabled="saving" />
+          <BaseFormItem label="代理地址">
+            <BaseInput v-model="instanceForm.host" placeholder="residential-gateway.novaproxy.io" :disabled="saving" />
+          </BaseFormItem>
+          <BaseFormItem label="端口">
+            <BaseInput :model-value="String(instanceForm.port ?? '')" type="number" min="1" max="65535" :disabled="saving" @update:model-value="instanceForm.port = Number($event)" />
+          </BaseFormItem>
+          <BaseFormItem label="代理用户名">
+            <BaseInput v-model="instanceForm.username" autocomplete="off" :disabled="saving" />
+          </BaseFormItem>
+          <BaseFormItem :label="instanceForm.passwordSet ? '代理密码（已配置，留空保留）' : '代理密码'">
+            <BaseInput v-model="instanceForm.password" type="password" autocomplete="new-password" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-sm text-cp-warning">
             Residential Premium · IPv4 · 每次独立连接；不保证出口不重复，实际 IP 未验证。
@@ -480,7 +508,7 @@ onBeforeUnmount(() => {
           此账号的请求头模式不是“自动”。获取的值会保存，但不会用于正常请求；请在账号编辑中切换模式。
         </p>
         <p class="text-cp-xs text-cp-text-secondary">
-          使用无历史的简短请求，不携带 Turn State。未获得有效新值时等待 10 秒重试；连接错误保留退避，账号或模型错误需处理。
+          使用无历史的简短请求，不携带 Turn State。动态出口按实例的并发数和启动间隔搜索，其他出口未获得有效新值时等待 10 秒重试；连接错误保留退避，账号或模型错误需处理。
         </p>
       </div>
       <template #footer>

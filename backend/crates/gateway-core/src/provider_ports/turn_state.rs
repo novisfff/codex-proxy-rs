@@ -74,6 +74,7 @@ pub struct TurnStateFetcherSnapshot {
     pub values: Vec<TurnStateValue>,
     pub attempts: Vec<TurnStateFetchAttempt>,
     pub running: Option<(String, String)>,
+    pub running_requests: Vec<(String, String)>,
     pub dynamic_egress: serde_json::Value,
 }
 

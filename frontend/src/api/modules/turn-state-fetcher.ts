@@ -14,7 +14,13 @@ export interface EgressInstance {
   subscription?: string
   resourceGroup?: string
   location?: string
-  credentialRef?: string
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  passwordSet?: boolean
+  maxConcurrent?: number
+  intervalSeconds?: number
   bindings: Record<string, Partial<EgressBinding>>
 }
 
@@ -56,6 +62,7 @@ export interface FetcherSnapshot {
   values: FetcherValue[]
   attempts: FetcherAttempt[]
   running: [string, string] | null
+  runningRequests?: [string, string][]
   dynamicEgress?: {
     revision: number
     available: boolean
