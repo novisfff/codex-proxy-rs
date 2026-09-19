@@ -18,5 +18,3 @@ alter table runtime_settings add column pricing_synced_json jsonb not null defau
 alter table runtime_settings add column pricing_synced_at timestamptz;
 alter table model_requests add column billing_snapshot_json jsonb
     check (billing_snapshot_json is null or jsonb_typeof(billing_snapshot_json) = 'object');
-
-alter table runtime_settings drop column disable_fast;
