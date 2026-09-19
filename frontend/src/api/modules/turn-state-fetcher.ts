@@ -11,10 +11,11 @@ export interface EgressBinding {
 export interface EgressInstance {
   provider: string
   name: string
-  subscription: string
-  resourceGroup: string
-  location: string
-  bindings: Record<string, EgressBinding>
+  subscription?: string
+  resourceGroup?: string
+  location?: string
+  credentialRef?: string
+  bindings: Record<string, Partial<EgressBinding>>
 }
 
 export interface FetcherConfig {
@@ -60,7 +61,7 @@ export interface FetcherSnapshot {
     available: boolean
     message: string
     instances: Array<EgressInstance & { id: string, families: string[] }>
-    history: Array<{ id: string, instance: string, family: string, state: string, ip: string | null, created: number, message: string }>
+    history: Array<{ id: string, instance: string, family: string, state: string, ip: string | null, created: number, message: string, provider?: string }>
   }
 }
 export function configureDynamicEgress(data: { instances: Record<string, EgressInstance>, revision: number }) {

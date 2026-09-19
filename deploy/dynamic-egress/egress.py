@@ -19,6 +19,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 import h11
+from novaproxy import NovaProxy
 
 
 class EgressError(Exception):
@@ -50,6 +51,9 @@ class Journal:
         if settings_columns and "revision" not in settings_columns:
             with self.db:
                 self.db.execute("ALTER TABLE settings ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
+        if "provider" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+            with self.db:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN provider TEXT NOT NULL DEFAULT 'azure'")
 
     def execute(self, sql, args=()):
         with self.db:
@@ -76,6 +80,7 @@ class Journal:
 class Azure:
     def __init__(self, instances, journal, owner):
         self.instances, self.journal, self.owner = instances, journal, owner
+        self.logged_in = False
 
     async def command(self, *args):
         process = await asyncio.create_subprocess_exec(
@@ -95,7 +100,10 @@ class Azure:
         return json.loads(stdout) if stdout.strip() else None
 
     async def start(self):
-        await self.command("login", "--identity")
+        if not self.logged_in and (any(c["provider"] == "azure" for c in self.instances.values())
+                                   or self.journal.db.execute("SELECT count(*) FROM resources").fetchone()[0]):
+            await self.command("login", "--identity")
+            self.logged_in = True
         await self.recover()
 
     def binding(self, instance, family):
@@ -147,7 +155,7 @@ class Azure:
             raise EgressError("Dedicated IPv6 source must have preferred_lft 0 to exclude ordinary traffic")
 
     async def allocate(self, instance, family):
-        await self.recover()
+        await self.start()
         config, binding = await self.preflight(instance, family)
         await self.cleanup_unused_public_ips(config)
         for _ in range(5):
@@ -252,6 +260,8 @@ class Azure:
 class Service:
     def __init__(self, config, journal, provider):
         self.config, self.journal, self.provider = config, journal, provider
+        self.novaproxy = NovaProxy()
+        self.nova_credentials = None
         self.active = None
         self.task = None
         self.ready = False
@@ -278,7 +288,7 @@ class Service:
         instances = [{"id": key, **c, "families": list(c["bindings"])}
                      for key, c in self.config["instances"].items()]
         history = [dict(row) for row in self.journal.db.execute(
-            "SELECT id,instance,family,state,ip,created,expires,message FROM jobs ORDER BY created DESC LIMIT 50")]
+            "SELECT id,instance,family,state,ip,created,expires,message,provider FROM jobs ORDER BY created DESC LIMIT 50")]
         return {"available": self.ready and not self.fault, "message": self.fault,
                 "instances": instances, "history": history, "revision": self.revision}
 
@@ -309,20 +319,25 @@ class Service:
         self.journal.execute("DELETE FROM jobs WHERE created<? AND state IN ('released','failed')", (time.time() - 7 * 86400,))
         self.active = job_id
         self.released = asyncio.Event()
-        self.journal.execute("INSERT INTO jobs(id,instance,family,state,created) VALUES(?,?,?,'provisioning',?)",
-                             (job_id, instance, family, time.time()))
+        self.journal.execute("INSERT INTO jobs(id,instance,family,state,created,provider) VALUES(?,?,?,'provisioning',?,?)",
+                             (job_id, instance, family, time.time(), config["provider"]))
         self.task = asyncio.create_task(self.run(job_id, instance, family))
         return self.present(self.journal.job(job_id))
 
     def present(self, row):
         result = {k: row[k] for k in ("id", "state", "ip", "message")}
+        result.update(provider=row["provider"], ipVerification="unverified" if row["provider"] == "novaproxy" else "verified")
         if row["state"] == "ready":
             result.update(proxyUrl=self.config["proxyUrl"], secret=row["secret"])
         return result
 
     async def run(self, job_id, instance, family):
         try:
-            address, self.source = await self.provider.allocate(instance, family)
+            if self.config["instances"][instance]["provider"] == "novaproxy":
+                self.nova_credentials = self.novaproxy.credentials(self.config["instances"][instance]["credentialRef"])
+                address, self.source = None, None
+            else:
+                address, self.source = await self.provider.allocate(instance, family)
             if not self.released.is_set():
                 self.journal.execute("UPDATE jobs SET state='ready',ip=?,secret=?,expires=? WHERE id=?",
                                      (address, secrets.token_urlsafe(32), time.time() + 90, job_id))
@@ -345,6 +360,7 @@ class Service:
                 self.fault = "Azure cleanup is incomplete; new leases blocked until reconciliation succeeds"
             self.journal.execute("UPDATE jobs SET state=CASE WHEN state='failed' THEN state ELSE 'released' END,secret=NULL WHERE id=?", (job_id,))
             self.source, self.active, self.tunnel = None, None, None
+            self.nova_credentials = None
 
     async def release(self, job_id):
         if not re.fullmatch(r"[a-f0-9-]{36}", job_id):
@@ -382,18 +398,24 @@ class Service:
                     raise EgressError("CONNECT denied")
                 # await 之前原子消耗租约，一次连接失败也不能再次使用同一 IP。
                 self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (self.active,))
-                self.journal.used(row["ip"])
+                if row["ip"]:
+                    self.journal.used(row["ip"])
                 self.tunnel = asyncio.current_task()
                 accepted = True
-                family = socket.AF_INET if row["family"] == "ipv4" else socket.AF_INET6
-                host = event.target.decode().split(":")[0]
-                addresses = await asyncio.get_running_loop().getaddrinfo(host, 443, family=family, type=socket.SOCK_STREAM)
-                address = addresses[0][4][0]
-                if not ipaddress.ip_address(address).is_global:
-                    raise EgressError("Non-public destination")
-                upstream_reader, upstream_writer = await asyncio.open_connection(
-                    address, 443, family=family, local_addr=(self.source, 0))
+                proxy_trailing = b""
+                if row["provider"] == "novaproxy":
+                    upstream_reader, upstream_writer, proxy_trailing = await self.novaproxy.connect(self.nova_credentials, event.target)
+                else:
+                    family = socket.AF_INET if row["family"] == "ipv4" else socket.AF_INET6
+                    host = event.target.decode().split(":")[0]
+                    addresses = await asyncio.get_running_loop().getaddrinfo(host, 443, family=family, type=socket.SOCK_STREAM)
+                    address = addresses[0][4][0]
+                    if not ipaddress.ip_address(address).is_global:
+                        raise EgressError("Non-public destination")
+                    upstream_reader, upstream_writer = await asyncio.open_connection(
+                        address, 443, family=family, local_addr=(self.source, 0))
                 writer.write(connection.send(h11.Response(status_code=200, headers=[])))
+                writer.write(proxy_trailing)
                 await writer.drain()
                 # CONNECT 切换后剩余字节属于 TLS，不可丢弃。
                 trailing, _ = connection.trailing_data
@@ -472,6 +494,15 @@ def validate_instances(instances):
     for key, config in instances.items():
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", key) or not isinstance(config, dict):
             raise web.HTTPBadRequest()
+        if config.get("provider") == "novaproxy":
+            if (set(config) != {"provider", "name", "credentialRef", "bindings"}
+                    or not isinstance(config["name"], str) or not 1 <= len(config["name"]) <= 128
+                    or any(ord(c) < 32 for c in config["name"])
+                    or not isinstance(config["credentialRef"], str)
+                    or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", config["credentialRef"])
+                    or config["bindings"] != {"ipv4": {}}):
+                raise web.HTTPBadRequest()
+            continue
         if set(config) != {"provider", "name", "subscription", "resourceGroup", "location", "bindings"}:
             raise web.HTTPBadRequest()
         if config["provider"] != "azure" or not isinstance(config["bindings"], dict) or not config["bindings"]:

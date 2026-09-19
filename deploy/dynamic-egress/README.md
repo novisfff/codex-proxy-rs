@@ -1,6 +1,6 @@
 # 292 获取器动态出口
 
-此服务运行在 Azure VM 宿主机上，使用 Managed Identity 和 Azure CLI 管理专用公网 IP。
+此服务运行在宿主机上，支持 Azure 专用公网 IP 和 NovaProxy Rotating 住宅代理。
 控制面由网关管理 API 代理，CONNECT 端口只允许一次性租约访问 `chatgpt.com:443` 和
 `api.openai.com:443`；TLS 由网关直接与 OpenAI 建立，出口服务不读取账号凭据或请求内容。
 业务请求仍使用账号原有代理。
@@ -28,7 +28,7 @@
 
 ## 安装与配置
 
-需要 Python 3.11+、Azure CLI、iproute2 和网络准备完成的 Linux 宿主机。
+需要 Python 3.11+ 的 Linux 宿主机；Azure 实例额外需要 Azure CLI、iproute2 和完成网络准备。
 将本目录放到 `/opt/cpr292-egress`，建立独立虚拟环境并安装 `requirements.txt`。
 创建无登录权限的 `cpr292` 用户，将示例配置复制到 `/etc/cpr292-egress/config.json`，
 生成至少 32 字符随机控制令牌，存到仅服务和网关可读的 `token` 文件。
@@ -51,11 +51,31 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
 首次获取才执行 Azure 预检。修改或移除实例前，暂停所有动态获取账号并等待活动租约清理完成。
 实例配置保存在 SQLite 中，配置文件 `instances` 只作为首次启动的初值。
 
+### NovaProxy Rotating
+
+在「动态出口 → 添加出口实例」选择 NovaProxy Rotating，填写实例 ID、名称和服务器凭据名称
+（例如 `nova-us`）。将凭据存入 `/etc/cpr292-egress/novaproxy/nova-us.json`：
+
+```json
+{"username":"YOUR_ROTATING_USERNAME","password":"YOUR_PROXY_PASSWORD"}
+```
+
+文件使用 `root:cpr292`、权限 `0640`，目录禁止其他用户写入；不支持符号链接。
+可以用 `EGRESS_NOVAPROXY_CREDENTIALS_DIR` 指定凭据目录。凭据不会进入管理 API 或 SQLite；
+修改文件后下一租约生效。更新服务时必须同时安装 `egress.py` 和 `novaproxy.py`。
+账号获取器选择此动态出口实例和 IPv4。仅使用 Rotating 用户名，不添加 sticky/session 参数。
+
+服务固定连接 `residential-gateway.novaproxy.io:1111`，每次尝试新建一个 CONNECT 隧道，
+只访问官方 OpenAI；TLS 端到端校验证书，失败不会直连或改用业务代理。
+当前 Residential Premium 仅支持 IPv4。供应商负责轮换，**不保证最近 24 小时不重复**；
+独立 IP 探测与 OpenAI 连接可能走不同出口，因此不探测、不声明实际 OpenAI 出口 IP，页面显示未验证。
+仅使用 NovaProxy 的服务无需 Azure 登录、身份或网络资源权限。
+
 ## 租约与故障恢复
 
 - 全局只有一个活动租约，所有实例共享数据库和进程文件锁。不要启动使用其他数据库副本的第二个服务。
 - 每次获取使用新 attempt ID；控制面重试使用同一 ID，不重复申请。
-- 依次创建 Standard 静态公网 IP、检查最近 24 小时历史、绑定专用配置、核实实际公网 IP。
+- Azure 依次创建 Standard 静态公网 IP、检查最近 24 小时历史、绑定专用配置、核实实际公网 IP。
   每次申请前先回收日志中自己的残留资源，再清理实例公网 IP 资源组内的闲置公网 IP（含非本服务创建的 IPv4/IPv6）。
   该资源组必须专供获取器使用；配置网卡的主 IPv4 公网 IP 始终保留，无法识别主地址时停止清理。
   其他地址若仍绑定资源或尚未完成操作则停止申请，不自动解绑；删除失败也不继续申请。
@@ -63,9 +83,9 @@ Azure 实例可分别填写 IPv4 / IPv6 的 NIC、IP configuration 和私网源 
   重复分配最多尝试 5 次。Azure CLI 等待 ARM 完成，单次命令上限 10 分钟；网关等待上限 15 分钟，
   超时发出释放请求，服务完成正在进行的 ARM 操作后清理。
 - 租约就绪后最长保留 90 秒，CONNECT 限一次，隧道最长 60 秒。网关上游请求最长 45 秒。
-  失败、取消和到期均关闭隧道、解绑并删除自己的公网 IP；下一请求不会复用旧地址。
+  失败、取消和到期均关闭隧道；Azure 还会解绑并删除自己的公网 IP，下一请求不会复用旧地址。
 - IPv4/IPv6 是严格选择，DNS、绑定或探测失败不改用另一协议、旧 IP、业务代理或默认出口。
-- IP 历史按规范化地址持久化，连接和清理时延后最后使用时间。没有 24 小时外的可用 IP 时失败重试。
+- Azure IP 历史按规范化地址持久化，连接和清理时延后最后使用时间。没有 24 小时外的可用 IP 时失败重试。
   重启不清空历史；最近任务保留 7 天，页面展示最近 50 条。备份和恢复必须同时保留 SQLite 与 WAL，
   停服务后备份最简单；丢失历史文件不能保证历史窗口内不重复。
 - 先写资源日志再创建。启动时先对账和清理自己的资源；清理失败就禁止新租约。

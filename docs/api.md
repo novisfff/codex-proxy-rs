@@ -687,6 +687,14 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 `models` 为最多 32 个不同的上游模型名，开启时不能为空；两个出口字段均为 null 时明确选择直连。
 `dynamicEgress` 为 `{instance, family}`，family 只能是 `ipv4` 或 `ipv6`，与非空 `proxyId` 互斥。
 旧请求省略 `dynamicEgress` 等同 null。动态出口严格使用所选地址类型，不回退到其他出口。
+
+动态出口实例除 Azure 外支持 `novaproxy`：配置为
+`{provider:"novaproxy",name:"名称",credentialRef:"nova-us",bindings:{ipv4:{}}}`。
+`credentialRef` 只允许 1–64 位字母、数字、下划线或连字符；真实认证信息仅保存在出口服务的凭据文件中，
+不能通过配置接口提交。NovaProxy Rotating 仅支持 IPv4，每个租约创建新连接，由供应商轮换，
+不保证 24 小时内出口唯一。此类就绪租约返回 `provider:"novaproxy",ip:null,ipVerification:"unverified"`，
+获取记录 `exitIp` 为空，不能将独立探测的 IP 当作 OpenAI 出口；Azure 仍要求经过校验的实际 IP。
+凭据安装步骤见 [动态出口部署](../deploy/dynamic-egress/README.md#novaproxy-rotating)。
 选定代理必须测试成功，连接失败不会回退到业务代理或直连。被引用代理须先解除获取器绑定才能删除。
 首次保存 `revision: 0`，后续携带 GET 返回版本；并发修改返回 409。重新保存清除失败暂停及退避。
 

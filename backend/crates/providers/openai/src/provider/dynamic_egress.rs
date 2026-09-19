@@ -26,6 +26,8 @@ struct LeaseResponse {
     ip: Option<String>,
     proxy_url: Option<String>,
     secret: Option<String>,
+    provider: Option<String>,
+    ip_verification: Option<String>,
 }
 
 pub(super) struct Lease {
@@ -141,15 +143,14 @@ impl DynamicEgress {
                 match body.state.as_str() {
                     "provisioning" => tokio::time::sleep(Duration::from_secs(2)).await,
                     "ready" => {
-                        let ip: std::net::IpAddr = body.ip.ok_or(())?.parse().map_err(|_| ())?;
-                        if ip.is_ipv4() != (selection.family == "ipv4") { return Err(()); }
+                        let ip = lease_ip(&body, &selection.family)?;
                         let proxy = reqwest::Proxy::all(body.proxy_url.ok_or(())?).map_err(|_| ())?
                             .basic_auth(&lease.id, &body.secret.ok_or(())?);
                         lease.http = Some(build_reqwest_client_with_custom_ca(Client::builder()
                             .no_proxy().proxy(proxy).redirect(reqwest::redirect::Policy::none())
                             .retry(reqwest::retry::never()).http1_only().pool_max_idle_per_host(0)
                             .connect_timeout(Duration::from_secs(15))) .map_err(|_| ())?);
-                        lease.ip = Some(ip.to_string());
+                        lease.ip = ip;
                         return Ok(());
                     }
                     _ => return Err(()),
@@ -158,5 +159,42 @@ impl DynamicEgress {
         }).await.map_err(|_| ())?;
         result?;
         Ok(lease)
+    }
+}
+
+fn lease_ip(body: &LeaseResponse, family: &str) -> Result<Option<String>, ()> {
+    if body.provider.as_deref() == Some("novaproxy") {
+        return if family == "ipv4"
+            && body.ip.is_none()
+            && body.ip_verification.as_deref() == Some("unverified")
+        {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    }
+    let ip: std::net::IpAddr = body.ip.as_deref().ok_or(())?.parse().map_err(|_| ())?;
+    if ip.is_ipv4() != (family == "ipv4") {
+        return Err(());
+    }
+    Ok(Some(ip.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn novaproxy_requires_explicit_unverified_ipv4_lease() {
+        let mut body: LeaseResponse = serde_json::from_value(
+            json!({"state":"ready", "provider":"novaproxy", "ipVerification":"unverified"}),
+        )
+        .unwrap();
+        assert_eq!(lease_ip(&body, "ipv4"), Ok(None));
+        assert!(lease_ip(&body, "ipv6").is_err());
+        body.ip = Some("203.0.113.1".to_owned());
+        assert!(lease_ip(&body, "ipv4").is_err());
+        body.ip = None;
+        body.provider = Some("azure".to_owned());
+        assert!(lease_ip(&body, "ipv4").is_err());
     }
 }

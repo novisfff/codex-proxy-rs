@@ -71,7 +71,7 @@ const visible = computed(() => accounts.value.filter(a => `${a.name} ${a.email ?
 const modelOptions = computed(() => [...new Map([...catalog.value, ...form.value.models.map(id => ({ id, label: id }))].map(m => [m.id, m])).values()])
 const proxyOptions = computed(() => [
   { label: '直连 · 不使用代理', value: 'direct' },
-  { label: '动态出口 · 每次请求新 IP', value: 'dynamic' },
+  { label: '动态出口 · Azure / NovaProxy', value: 'dynamic' },
   ...proxies.value.map(p => ({ label: `${p.name} · ${p.endpoint}${p.lastTest?.success ? '' : '（未通过测试）'}`, value: p.id, disabled: !p.lastTest?.success })),
 ])
 
@@ -80,29 +80,38 @@ function editInstance(id = '') {
   instanceId.value = id
   originalInstanceId.value = id
   instanceRevision.value = snapshot.value.dynamicEgress?.revision ?? 0
-  instanceForm.value = existing ? { provider: existing.provider, name: existing.name, subscription: existing.subscription, resourceGroup: existing.resourceGroup, location: existing.location, bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', bindings: {} }
+  instanceForm.value = existing ? { ...instanceConfig(existing), bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', credentialRef: '', bindings: {} }
   editingFamilies.value = Object.keys(instanceForm.value.bindings)
   for (const family of ['ipv4', 'ipv6']) {
     instanceForm.value.bindings[family] ??= { resourceGroup: '', nic: '', ipConfiguration: '', sourceIp: '', dedicated: true }
   }
   instanceOpen.value = true
 }
+function instanceConfig(instance: EgressInstance): EgressInstance {
+  return instance.provider === 'novaproxy'
+    ? { provider: 'novaproxy', name: instance.name, credentialRef: instance.credentialRef, bindings: { ipv4: {} } }
+    : { provider: 'azure', name: instance.name, subscription: instance.subscription, resourceGroup: instance.resourceGroup, location: instance.location, bindings: instance.bindings }
+}
+function isNova(accountId: string) {
+  const id = config(accountId).dynamicEgress?.instance
+  return snapshot.value.dynamicEgress?.instances.some(instance => instance.id === id && instance.provider === 'novaproxy')
+}
 function toggleFamily(family: string, enabled: boolean) {
   editingFamilies.value = enabled ? [...new Set([...editingFamilies.value, family])] : editingFamilies.value.filter(value => value !== family)
 }
 async function saveInstance(remove = false) {
-  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || !editingFamilies.value.length)) {
-    toast.warning('填写实例 ID 并至少选择一种地址类型')
+  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || (instanceForm.value.provider === 'azure' ? !editingFamilies.value.length : !/^[\w-]{1,64}$/.test(instanceForm.value.credentialRef ?? '')))) {
+    toast.warning(instanceForm.value.provider === 'novaproxy' ? '填写有效的实例 ID 和服务器凭据名称' : '填写实例 ID 并至少选择一种地址类型')
     return
   }
   await action.run(async () => {
     const instances: Record<string, EgressInstance> = {}
     for (const instance of snapshot.value.dynamicEgress?.instances ?? []) {
       if (instance.id !== originalInstanceId.value)
-        instances[instance.id] = { provider: instance.provider, name: instance.name, subscription: instance.subscription, resourceGroup: instance.resourceGroup, location: instance.location, bindings: instance.bindings }
+        instances[instance.id] = instanceConfig(instance)
     }
     if (!remove)
-      instances[instanceId.value] = { ...instanceForm.value, bindings: Object.fromEntries(editingFamilies.value.map(family => [family, instanceForm.value.bindings[family]!])) }
+      instances[instanceId.value] = instanceConfig({ ...instanceForm.value, bindings: Object.fromEntries(editingFamilies.value.map(family => [family, instanceForm.value.bindings[family]!])) })
     await configureDynamicEgress({ instances, revision: instanceRevision.value })
     instanceOpen.value = false
     await refresh()
@@ -281,15 +290,15 @@ onBeforeUnmount(() => {
         动态出口
       </BaseButton>
     </div>
-    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="每次获取独占一个新 IP，全局 24 小时内不重复。只直连 OpenAI。">
+    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；NovaProxy Rotating 住宅代理。仅用于 292 获取器。">
       <p :class="snapshot.dynamicEgress?.available ? 'text-cp-success' : 'text-cp-warning'">
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
       </p>
       <p class="text-cp-sm text-cp-text-secondary">
-        等待 Azure 分配期间不占用账号并发。地址校验或清理失败时暂停分配，不会切换到业务代理或默认出口。
+        Azure 出口校验并保持 24 小时不重复。NovaProxy 每次新建连接，实际出口未验证，可能重复。连接失败不会回退到其他出口。
       </p>
       <BaseButton :disabled="!instancesEditable || saving" @click="editInstance()">
-        添加 Azure 实例
+        添加出口实例
       </BaseButton>
       <p class="text-cp-xs text-cp-text-secondary">
         修改实例前，请暂停使用动态出口的获取账号，并等待当前任务释放。保存配置不会立即申请公网 IP。
@@ -303,7 +312,7 @@ onBeforeUnmount(() => {
       <div class="mt-4 grid gap-3">
         <section v-for="entry in snapshot.dynamicEgress?.history" :key="entry.id" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-3 text-cp-sm">
           <div class="flex flex-wrap gap-3">
-            <strong class="break-all">{{ entry.ip || '等待分配' }}</strong><span>{{ entry.family }}</span><span>{{ ({ provisioning: '正在分配', ready: '等待请求', connected: '请求进行中', released: '已释放', failed: '失败' } as Record<string, string>)[entry.state] || entry.state }}</span>
+            <strong class="break-all">{{ entry.ip || (entry.provider === 'novaproxy' ? '轮换出口 · IP 未验证' : '等待分配') }}</strong><span>{{ entry.family }}</span><span>{{ ({ provisioning: '正在分配', ready: '等待请求', connected: '请求进行中', released: '已释放', failed: '失败' } as Record<string, string>)[entry.state] || entry.state }}</span>
           </div>
           <p class="text-cp-text-secondary">
             {{ date(entry.created * 1000) }} · {{ entry.instance }}
@@ -371,8 +380,9 @@ onBeforeUnmount(() => {
             <div v-if="row.attempt" class="mt-3 grid gap-1 text-cp-xs text-cp-text-secondary">
               <span>最近尝试：{{ date(row.attempt.attemptedAt) }} · {{ row.attempt.message }}</span>
               <span v-if="row.attempt.exitIp" class="break-all">本次出口 IP：{{ row.attempt.exitIp }}</span>
+              <span v-else-if="isNova(account.id)">本次出口 IP：未验证（NovaProxy Rotating）</span>
               <span>返回长度：{{ row.attempt.byteLength ?? '未返回' }} · 耗时：{{ row.attempt.durationMs }} ms · 输入 / 输出 token：{{ row.attempt.inputTokens ?? '未知' }} / {{ row.attempt.outputTokens ?? '未知' }}</span>
-              <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.acquiredAt + 2400000 : 0)) }}</span>
+              <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.expiresAt - 1200000 : 0)) }}</span>
             </div>
           </section>
         </div>
@@ -381,25 +391,41 @@ onBeforeUnmount(() => {
         没有匹配的 OpenAI 账号。
       </p>
     </template>
-    <BaseModal v-model="instanceOpen" title="Azure 动态出口实例" size="md" :dismissible="!saving">
+    <BaseModal v-model="instanceOpen" title="动态出口实例" size="md" :dismissible="!saving">
       <div class="grid gap-4">
+        <BaseFormItem label="出口供应商">
+          <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'NovaProxy Rotating', value: 'novaproxy' }]" :disabled="saving || !!originalInstanceId" />
+        </BaseFormItem>
         <BaseFormItem label="实例 ID">
           <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" placeholder="azure-main" />
         </BaseFormItem>
-        <BaseFormItem v-for="field in instanceFields" :key="field.key" :label="field.label">
-          <BaseInput v-model="instanceForm[field.key]" :disabled="saving" />
-        </BaseFormItem>
-        <section v-for="family in ['ipv4', 'ipv6']" :key="family" class="grid gap-3">
-          <BaseCheckbox :label="`启用 ${family === 'ipv4' ? 'IPv4' : 'IPv6'}`" show-label :model-value="editingFamilies.includes(family)" :disabled="saving" @update:model-value="toggleFamily(family, $event)" />
-          <template v-if="editingFamilies.includes(family) && instanceForm.bindings[family]">
-            <BaseFormItem v-for="field in bindingFields" :key="field.key" :label="field.label">
-              <BaseInput v-model="instanceForm.bindings[family]![field.key]" :disabled="saving" />
-            </BaseFormItem>
-          </template>
-        </section>
-        <p class="text-cp-sm text-cp-warning">
-          必须使用已准备好的专用 IP 配置，且没有其他服务使用。IPv4 不允许使用主 IP 配置；操作系统需预先配置私网源 IP。公网 IP 会产生 Azure 费用。
-        </p>
+        <template v-if="instanceForm.provider === 'novaproxy'">
+          <BaseFormItem label="名称">
+            <BaseInput v-model="instanceForm.name" :disabled="saving" />
+          </BaseFormItem>
+          <BaseFormItem label="服务器凭据名称">
+            <BaseInput v-model="instanceForm.credentialRef" placeholder="nova-us" :disabled="saving" />
+          </BaseFormItem>
+          <p class="text-cp-sm text-cp-warning">
+            Residential Premium · IPv4 · 每次独立连接；不保证出口不重复，实际 IP 未验证。
+          </p>
+        </template>
+        <template v-else>
+          <BaseFormItem v-for="field in instanceFields" :key="field.key" :label="field.label">
+            <BaseInput v-model="instanceForm[field.key]" :disabled="saving" />
+          </BaseFormItem>
+          <section v-for="family in ['ipv4', 'ipv6']" :key="family" class="grid gap-3">
+            <BaseCheckbox :label="`启用 ${family === 'ipv4' ? 'IPv4' : 'IPv6'}`" show-label :model-value="editingFamilies.includes(family)" :disabled="saving" @update:model-value="toggleFamily(family, $event)" />
+            <template v-if="editingFamilies.includes(family) && instanceForm.bindings[family]">
+              <BaseFormItem v-for="field in bindingFields" :key="field.key" :label="field.label">
+                <BaseInput v-model="instanceForm.bindings[family]![field.key]" :disabled="saving" />
+              </BaseFormItem>
+            </template>
+          </section>
+          <p class="text-cp-sm text-cp-warning">
+            必须使用已准备好的专用 IP 配置，且没有其他服务使用。IPv4 不允许使用主 IP 配置；操作系统需预先配置私网源 IP。公网 IP 会产生 Azure 费用。
+          </p>
+        </template>
       </div>
       <template #footer>
         <BaseButton v-if="originalInstanceId" :disabled="saving" @click="saveInstance(true)">
@@ -434,7 +460,7 @@ onBeforeUnmount(() => {
             <BaseSelect v-model="dynamicFamily" :options="familyOptions" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-xs text-cp-text-secondary">
-            每次尝试等待新 IP 就绪，仅请求官方 OpenAI。不会使用账号自定义网关或业务代理。
+            Azure 等待新 IP 就绪；NovaProxy 每次新建代理连接。仅请求官方 OpenAI，不使用账号自定义网关或业务代理。
           </p>
         </template>
         <BaseFormItem label="获取模型（最多 32 个）">
@@ -454,7 +480,7 @@ onBeforeUnmount(() => {
           此账号的请求头模式不是“自动”。获取的值会保存，但不会用于正常请求；请在账号编辑中切换模式。
         </p>
         <p class="text-cp-xs text-cp-text-secondary">
-          使用无历史的简短请求，不携带 Turn State。失败后按 1、2、5、10、15 分钟退避；账号或模型错误需修复后重新保存。
+          使用无历史的简短请求，不携带 Turn State。未获得有效新值时等待 10 秒重试；连接错误保留退避，账号或模型错误需处理。
         </p>
       </div>
       <template #footer>
