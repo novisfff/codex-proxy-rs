@@ -46,15 +46,16 @@ class FakeProvider:
 
 
 class JournalTests(unittest.TestCase):
-    def test_restart_and_canonical_ipv6_dedup(self):
+    def test_restart_and_canonical_ipv6_only_rejects_consecutive_duplicate(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.db")
             first = Journal(path)
             self.assertTrue(first.reserve("2001:db8:0::1", 100000))
             first.db.close()
             second = Journal(path)
-            self.assertFalse(second.reserve("2001:db8::1", 186399))
-            self.assertTrue(second.reserve("2001:db8::1", 186400))
+            self.assertFalse(second.reserve("2001:db8::1", 200000))
+            self.assertTrue(second.reserve("2001:db8::2", 200001))
+            self.assertTrue(second.reserve("2001:db8::1", 200002))
             second.db.close()
 
     def test_reject_wrong_family_and_duplicate_binding(self):
@@ -279,8 +280,8 @@ class AzureTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.azure, "nic", AsyncMock(return_value=nic)), patch.object(self.azure, "command", command):
             await self.azure.cleanup_unused_public_ips(self.azure.instances["azure"])
         self.assertEqual([call.args[-1] for call in command.call_args_list[1:]], ["old4", "old6"])
+        self.assertTrue(self.journal.reserve("203.0.113.7", time.time()))
         self.assertFalse(self.journal.reserve("203.0.113.7", time.time()))
-        self.assertFalse(self.journal.reserve("2001:db8::7", time.time()))
 
     async def test_stale_cleanup_fails_closed_for_attached_or_unready_ip(self):
         nic = {"ipConfigurations": [{"primary": True, "publicIPAddress": {"id": "/primary"}}]}

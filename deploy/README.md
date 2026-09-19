@@ -475,4 +475,4 @@ pg_restore --no-owner --no-privileges --password \
 页面可以复制当前值，查看预计到期时间和失败原因。失败暂停时，修复账号、网关或代理后重新保存配置。
 迁移 `0018` 增加配置、缓存和最近尝试表，`0019` 增加账号动态出口选择；完整数据库备份包含这些数据。
 动态出口需要额外安装 [Azure 专用出口服务](dynamic-egress/README.md)，支持 IPv4 / IPv6、每次请求新 IP，
-全局最近 24 小时不重复。其 SQLite IP 历史需要独立备份，不包含在网关 PostgreSQL 备份中。
+避免连续两次申请到同一个 IP。其 SQLite IP 状态需要独立备份，不包含在网关 PostgreSQL 备份中。

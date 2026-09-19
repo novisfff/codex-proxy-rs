@@ -35,6 +35,8 @@ class Journal:
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS history(ip TEXT PRIMARY KEY, used REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS last_allocation(
+                id INTEGER PRIMARY KEY CHECK(id=1), ip TEXT NOT NULL, used REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS jobs(
                 id TEXT PRIMARY KEY, instance TEXT NOT NULL, family TEXT NOT NULL,
                 state TEXT NOT NULL, ip TEXT, created REAL NOT NULL,
@@ -63,10 +65,11 @@ class Journal:
     def reserve(self, address, now):
         address = str(ipaddress.ip_address(address))
         with self.db:
-            row = self.db.execute("SELECT used FROM history WHERE ip=?", (address,)).fetchone()
-            if row and row[0] > now - 86400:
+            row = self.db.execute("SELECT ip FROM last_allocation WHERE id=1").fetchone()
+            if row and row[0] == address:
                 return False
             self.db.execute("INSERT OR REPLACE INTO history VALUES(?,?)", (address, now))
+            self.db.execute("INSERT OR REPLACE INTO last_allocation VALUES(1,?,?)", (address, now))
         return True
 
     def used(self, address):
@@ -183,7 +186,7 @@ class Azure:
                 "--name", binding["ipConfiguration"], "--public-ip-address", public["id"])
             await self.verify(binding["sourceIp"], family, address)
             return address, binding["sourceIp"]
-        raise EgressError("Azure repeatedly allocated IPs already used within 24 hours")
+        raise EgressError("Azure repeatedly allocated the previous IP consecutively")
 
     async def cleanup_unused_public_ips(self, config):
         # 此资源组专供获取器使用；先保护所有配置网卡的主 IPv4，再清理闲置公网地址。
@@ -206,7 +209,6 @@ class Azure:
             raise EgressError("Non-primary public IP is attached or not ready; stale cleanup stopped")
         for public in candidates:
             if public.get("ipAddress"):
-                self.journal.reserve(public["ipAddress"], time.time())
                 self.journal.used(public["ipAddress"])
             await self.command("network", "public-ip", "delete", "--subscription", config["subscription"],
                                "--resource-group", config["resourceGroup"], "--name", public["name"])
