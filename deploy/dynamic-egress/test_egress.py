@@ -30,11 +30,19 @@ class FakeProvider:
         self.provision = asyncio.Event()
         self.provision.set()
         self.fail_cleanup = False
+        self.retained = None
+
+    def retain(self, instance, family, address):
+        self.retained = (instance, family, address)
 
     async def start(self):
         pass
 
     async def allocate(self, instance, family):
+        if self.retained and self.retained[:2] == (instance, family):
+            address = self.retained[2]
+            self.retained = None
+            return address, "127.0.0.1"
         self.allocations += 1
         await self.provision.wait()
         return "203.0.113.9", "127.0.0.1"
@@ -43,6 +51,7 @@ class FakeProvider:
         self.cleanups += 1
         if self.fail_cleanup:
             raise EgressError()
+        self.retained = None
 
 
 class JournalTests(unittest.TestCase):
@@ -131,14 +140,65 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_configuration_persists_and_cannot_change_while_busy(self):
         config = configuration()["instances"]
         config["azure"]["name"] = "Renamed"
-        self.service.configure(config, 0)
+        await self.service.configure(config, 0)
         with self.assertRaises(web.HTTPConflict):
-            self.service.configure({}, 0)
+            await self.service.configure({}, 0)
         second = Service(configuration(), self.journal, self.provider)
         self.assertEqual(second.snapshot()["instances"][0]["name"], "Renamed")
         await self.service.acquire(self.id, "azure", "ipv4")
         with self.assertRaises(web.HTTPConflict):
-            self.service.configure({}, 1)
+            await self.service.configure({}, 1)
+
+    async def test_292_feedback_retains_connected_ip_until_configuration_changes(self):
+        await self.service.acquire(self.id, "azure", "ipv4")
+        await self.ready()
+        self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (self.id,))
+        task = self.service.jobs[self.id]["task"]
+        await self.service.release(self.id, True)
+        await self.service.release(self.id, False)
+        await task
+        self.assertEqual(self.provider.retained, ("azure", "ipv4", "203.0.113.9"))
+        self.assertEqual(self.provider.cleanups, 0)
+        await self.service.configure(configuration()["instances"], 0)
+        self.assertIsNone(self.provider.retained)
+        self.assertEqual(self.provider.cleanups, 1)
+
+    async def test_unconnected_lease_cannot_retain_ip(self):
+        await self.service.acquire(self.id, "azure", "ipv4")
+        await self.ready()
+        task = self.service.jobs[self.id]["task"]
+        await self.service.release(self.id, True)
+        await task
+        self.assertIsNone(self.provider.retained)
+        self.assertEqual(self.provider.cleanups, 1)
+
+    async def test_repeated_292_reuses_ip_then_non_292_requires_new_allocation(self):
+        for number, retain in enumerate((True, True, False, False), 1):
+            job_id = f"00000000-0000-4000-8000-{number:012d}"
+            self.service.last_started.clear()
+            await self.service.acquire(job_id, "azure", "ipv4")
+            for _ in range(100):
+                if self.journal.job(job_id)["state"] == "ready":
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(self.journal.job(job_id)["state"], "ready")
+            self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (job_id,))
+            task = self.service.jobs[job_id]["task"]
+            await self.service.release(job_id, retain)
+            await task
+            self.assertEqual(self.provider.allocations, 1 if number <= 3 else 2)
+        self.assertIsNone(self.provider.retained)
+        self.assertEqual(self.provider.cleanups, 2)
+
+    async def test_connected_non_292_feedback_cleans_up(self):
+        await self.service.acquire(self.id, "azure", "ipv4")
+        await self.ready()
+        self.journal.execute("UPDATE jobs SET state='connected' WHERE id=?", (self.id,))
+        task = self.service.jobs[self.id]["task"]
+        await self.service.release(self.id)
+        await task
+        self.assertIsNone(self.provider.retained)
+        self.assertEqual(self.provider.cleanups, 1)
 
     async def test_connect_tunnels_bytes_once_and_rejects_other_destinations(self):
         async def echo(reader, writer):
@@ -178,7 +238,22 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await asyncio.wait_for(reader.readexactly(4), 5), b"ping")
                 writer.close()
                 await writer.wait_closed()
+            # TLS 隧道关闭不等于失败；网关随后经控制面回报 292。
+            self.assertIn(self.id, self.service.jobs)
+            client = TestClient(TestServer(application(self.service, "test-control-secret")))
+            await client.start_server()
+            try:
+                task = self.service.jobs[self.id]["task"]
+                response = await client.delete(f"/v1/leases/{self.id}?retainIp=true",
+                                              headers={"Authorization": "Bearer test-control-secret"})
+                self.assertEqual(response.status, 200)
+                await task
+                self.assertEqual(self.provider.retained, ("azure", "ipv4", "203.0.113.9"))
+                self.assertEqual(self.provider.cleanups, 0)
+            finally:
+                await client.close()
             await self.service.stop()
+            self.assertIsNone(self.provider.retained)
             reader, writer = await original_connect("127.0.0.1", proxy_port)
             writer.write(f"CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
             await writer.drain()
@@ -201,6 +276,35 @@ class AzureTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.journal.db.close()
         self.directory.cleanup()
+
+    async def test_retained_ip_reuses_binding_without_allocating(self):
+        self.azure.retain("azure", "ipv4", "203.0.113.8")
+        verify = AsyncMock()
+        with patch.object(self.azure, "verify", verify), patch.object(self.azure, "start", AsyncMock()) as start:
+            self.assertEqual(await self.azure.allocate("azure", "ipv4"), ("203.0.113.8", "10.0.0.9"))
+        start.assert_not_awaited()
+        verify.assert_awaited_once_with("10.0.0.9", "ipv4", "203.0.113.8")
+        self.assertIsNone(self.azure.retained)
+
+    async def test_retained_ip_verification_failure_cannot_reuse_it_again(self):
+        self.azure.retain("azure", "ipv4", "203.0.113.8")
+        with patch.object(self.azure, "verify", AsyncMock(side_effect=EgressError("wrong IP"))):
+            with self.assertRaises(EgressError):
+                await self.azure.allocate("azure", "ipv4")
+        self.assertIsNone(self.azure.retained)
+
+    async def test_switching_instance_cleans_retained_resource_before_allocation(self):
+        self.azure.retain("previous", "ipv4", "203.0.113.8")
+        async def recover():
+            self.azure.retained = None
+        recover = AsyncMock(side_effect=recover)
+        start = AsyncMock(side_effect=EgressError("stop before allocating"))
+        with patch.object(self.azure, "recover", recover), patch.object(self.azure, "start", start):
+            with self.assertRaises(EgressError):
+                await self.azure.allocate("azure", "ipv4")
+        recover.assert_awaited_once()
+        start.assert_awaited_once()
+        self.assertIsNone(self.azure.retained)
 
     async def test_repeated_ip_is_deleted_before_binding(self):
         self.journal.reserve("203.0.113.1", time.time())

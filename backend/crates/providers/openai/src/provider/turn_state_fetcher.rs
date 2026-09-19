@@ -766,7 +766,7 @@ impl TurnStateFetcher {
                 return FetchOutcome::retry("获取器配置已改变或不可用", 60);
             }
         }
-        let lease = if let Some(selection) = &config.dynamic_egress {
+        let mut lease = if let Some(selection) = &config.dynamic_egress {
             let Some(service) = &self.dynamic_egress else {
                 return FetchOutcome::paused("未配置动态出口服务");
             };
@@ -785,6 +785,11 @@ impl TurnStateFetcher {
         .await
         .unwrap_or_else(|_| FetchOutcome::retry("获取超时", 60));
         outcome.exit_ip = lease.as_ref().and_then(|lease| lease.ip.clone());
+        if outcome.byte_length == Some(292)
+            && let Some(lease) = lease.as_mut()
+        {
+            lease.retain_ip();
+        }
         outcome
     }
 

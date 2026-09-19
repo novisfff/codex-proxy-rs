@@ -73,7 +73,7 @@ class Journal:
         return True
 
     def used(self, address):
-        # 失败、探测和连接结束也计入窗口，避免长请求缩短隔离时间。
+        # 使用时间仅用于历史记录，不能覆盖上一次申请的地址。
         self.execute("UPDATE history SET used=max(used,?) WHERE ip=?", (time.time(), address))
 
     def job(self, job_id):
@@ -85,6 +85,10 @@ class Azure:
     def __init__(self, instances, journal, owner):
         self.instances, self.journal, self.owner = instances, journal, owner
         self.logged_in = False
+        self.retained = None
+
+    def retain(self, instance, family, address):
+        self.retained = (instance, family, address)
 
     async def command(self, *args):
         process = await asyncio.create_subprocess_exec(
@@ -159,6 +163,15 @@ class Azure:
             raise EgressError("Dedicated IPv6 source must have preferred_lft 0 to exclude ordinary traffic")
 
     async def allocate(self, instance, family):
+        if self.retained:
+            previous_instance, previous_family, address = self.retained
+            if (previous_instance, previous_family) == (instance, family):
+                self.retained = None
+                _, binding = self.binding(instance, family)
+                await self.verify(binding["sourceIp"], family, address)
+                return address, binding["sourceIp"]
+            # 切换实例或协议前先按原配置回收保留资源，避免只丢内存指针而泄漏公网 IP。
+            await self.recover()
         await self.start()
         config, binding = await self.preflight(instance, family)
         await self.cleanup_unused_public_ips(config)
@@ -256,6 +269,7 @@ class Azure:
         self.journal.execute("DELETE FROM resources WHERE name=?", (name,))
 
     async def recover(self):
+        self.retained = None
         for row in self.journal.db.execute("SELECT * FROM resources").fetchall():
             await self.cleanup(row["name"], row["instance"], row["family"])
 
@@ -312,8 +326,9 @@ class Service:
         return {"available": self.ready and not self.fault, "message": self.fault,
                 "instances": instances, "history": history, "revision": self.revision}
 
-    def configure(self, instances, revision):
-        if self.jobs or self.fault or not self.ready or type(revision) is not int or revision != self.revision:
+    async def configure(self, instances, revision):
+        if (self.jobs or self.fault or not self.ready
+                or type(revision) is not int or revision != self.revision):
             raise web.HTTPConflict()
         if not isinstance(instances, dict):
             raise web.HTTPBadRequest()
@@ -326,6 +341,16 @@ class Service:
                     previous = self.config["instances"].get(key, {})
                     instance["password"] = previous.get("password", "") if previous.get("provider") == "novaproxy" else ""
         validate_instances(instances)
+        if getattr(self.provider, "retained", None):
+            # 清理期间暂停新租约；仍使用旧配置解绑，不能先覆盖 NIC 信息。
+            self.ready = False
+            try:
+                await self.provider.recover()
+            except Exception:
+                self.fault = "Azure cleanup is incomplete; new leases blocked until reconciliation succeeds"
+                raise web.HTTPServiceUnavailable()
+            finally:
+                self.ready = True
         self.journal.execute("INSERT OR REPLACE INTO settings VALUES(1,?,?)", (json.dumps(instances), self.revision + 1))
         self.revision += 1
         self.config["instances"] = instances
@@ -353,7 +378,7 @@ class Service:
             raise web.HTTPConflict()
         self.journal.execute("DELETE FROM jobs WHERE created<? AND state IN ('released','failed')", (time.time() - 7 * 86400,))
         job = {"instance": instance, "provider": config["provider"], "released": asyncio.Event(),
-               "tunnel": None, "source": None, "credentials": config}
+               "tunnel": None, "source": None, "credentials": config, "retain_ip": False}
         self.jobs[job_id] = job
         self.last_started[instance] = now
         self.journal.execute("INSERT INTO jobs(id,instance,family,state,created,provider) VALUES(?,?,?,'provisioning',?,?)",
@@ -393,17 +418,24 @@ class Service:
                 self.journal.used(row["ip"])
             try:
                 if job["provider"] == "azure":
-                    await self.provider.recover()
+                    if job["retain_ip"] and row["ip"] and row["state"] == "connected":
+                        self.provider.retain(instance, family, row["ip"])
+                    else:
+                        await self.provider.recover()
             except Exception:
                 self.fault = "Azure cleanup is incomplete; new leases blocked until reconciliation succeeds"
             self.journal.execute("UPDATE jobs SET state=CASE WHEN state='failed' THEN state ELSE 'released' END,secret=NULL WHERE id=?", (job_id,))
             self.jobs.pop(job_id, None)
 
-    async def release(self, job_id):
+    async def release(self, job_id, retain_ip=False):
         if not re.fullmatch(r"[a-f0-9-]{36}", job_id):
             raise web.HTTPBadRequest()
         if job_id in self.jobs:
-            self.jobs[job_id]["released"].set()
+            job = self.jobs[job_id]
+            # 第一次完成回报决定是否保留；迟到或重复释放不能改变决定。
+            if not job["released"].is_set():
+                job["retain_ip"] = retain_ip
+                job["released"].set()
         elif not self.journal.job(job_id):
             # 取消先于迟到的 acquire 到达时，用墓碑阻止该 ID 启动资源分配。
             self.journal.execute("INSERT INTO jobs(id,instance,family,state,created) VALUES(?,'','','released',?)", (job_id, time.time()))
@@ -491,7 +523,9 @@ class Service:
                         await stream.wait_closed()
             if accepted:
                 job["tunnel"] = None
-                job["released"].set()
+                # Azure 等待网关回报 292 结果；丢失回报由租约超时回收。
+                if job["provider"] != "azure":
+                    job["released"].set()
 
     async def stop(self):
         self.ready = False
@@ -499,6 +533,8 @@ class Service:
         for job in jobs:
             job["released"].set()
         await asyncio.gather(*(job["task"] for job in jobs))
+        if getattr(self.provider, "retained", None):
+            await self.provider.recover()
 
 
 def application(service, token):
@@ -520,14 +556,17 @@ def application(service, token):
         return web.json_response(await service.acquire(body["id"], body["instance"], body["family"]))
 
     async def release(request):
-        await service.release(request.match_info["id"])
+        retain = request.query.get("retainIp", "false")
+        if retain not in ("true", "false"):
+            raise web.HTTPBadRequest()
+        await service.release(request.match_info["id"], retain == "true")
         return web.json_response({})
 
     async def configure(request):
         body = await request.json()
         if not isinstance(body, dict) or set(body) != {"instances", "revision"}:
             raise web.HTTPBadRequest()
-        service.configure(body["instances"], body["revision"])
+        await service.configure(body["instances"], body["revision"])
         return web.json_response({})
 
     app.router.add_get("/v1/status", status)

@@ -93,7 +93,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
     ready = test_egress.ServiceTests.ready
 
     async def test_concurrency_limit_and_independent_release(self):
-        self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
+        await self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
         second = "22222222-2222-4222-8222-222222222222"
         third = "33333333-3333-4333-8333-333333333333"
         await self.service.acquire(self.id, "nova", "ipv4")
@@ -109,7 +109,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider.cleanups, 0)
 
     async def test_interval_is_between_starts_and_idempotent_acquire_does_not_consume_slot(self):
-        self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=10)}, 0)
+        await self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=10)}, 0)
         second = "22222222-2222-4222-8222-222222222222"
         await self.service.acquire(self.id, "nova", "ipv4")
         await self.service.acquire(self.id, "nova", "ipv4")
@@ -120,7 +120,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.service.jobs), 2)
 
     async def test_parallel_tunnels_are_independent_and_each_uses_novaproxy(self):
-        self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
+        await self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
         ids = [self.id, "22222222-2222-4222-8222-222222222222"]
         for job_id in ids:
             await self.service.acquire(job_id, "nova", "ipv4")
@@ -180,29 +180,29 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             validate_instances(azure)
 
     async def test_save_redacts_password_and_retains_it_on_edit_and_restart(self):
-        self.service.configure({"nova": instance()}, 0)
+        await self.service.configure({"nova": instance()}, 0)
         public = self.service.snapshot()["instances"][0]
         self.assertNotIn("password", public)
         self.assertTrue(public["passwordSet"])
         edited = {k: v for k, v in public.items() if k not in ("id", "families", "passwordSet")}
         edited["name"] = "Renamed"
-        self.service.configure({"nova": edited}, 1)
+        await self.service.configure({"nova": edited}, 1)
         restarted = Service(test_egress.configuration(), self.journal, self.provider)
         self.assertEqual(restarted.config["instances"]["nova"]["password"], "private-password")
         self.assertNotIn("private-password", json.dumps(restarted.snapshot()))
         edited["password"] = "replacement"
-        self.service.configure({"nova": edited}, 2)
+        await self.service.configure({"nova": edited}, 2)
         self.assertEqual(self.service.config["instances"]["nova"]["password"], "replacement")
         with self.assertRaises(web.HTTPConflict):
-            self.service.configure({"nova": dict(edited, password="stale")}, 2)
+            await self.service.configure({"nova": dict(edited, password="stale")}, 2)
         self.assertEqual(self.service.config["instances"]["nova"]["password"], "replacement")
 
     async def test_new_instance_requires_password_and_cannot_reuse_other_instance_secret(self):
-        self.service.configure({"nova": instance()}, 0)
+        await self.service.configure({"nova": instance()}, 0)
         incomplete = instance()
         incomplete.pop("password")
         with self.assertRaises(web.HTTPBadRequest):
-            self.service.configure({"other": incomplete}, 1)
+            await self.service.configure({"other": incomplete}, 1)
 
     async def test_legacy_credentials_migrate_once_without_file_dependency(self):
         legacy = {"provider": "novaproxy", "name": "Legacy", "credentialRef": "legacy", "bindings": {"ipv4": {}}}
@@ -217,7 +217,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("credentialRef", restarted.config["instances"]["nova"])
 
     async def test_nova_single_use_tunnel_and_no_azure_allocation(self):
-        self.service.configure({"nova": instance()}, 0)
+        await self.service.configure({"nova": instance()}, 0)
         with patch.object(self.service.novaproxy, "credentials", return_value={"username": "test", "password": "secret"}):
             await self.service.acquire(self.id, "nova", "ipv4")
             await self.ready()
@@ -285,7 +285,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             await upstream.wait_closed()
 
     async def test_nova_lease_has_no_claimed_ip_or_exposed_credentials(self):
-        self.service.configure({"nova": instance()}, 0)
+        await self.service.configure({"nova": instance()}, 0)
         with patch.object(self.service.novaproxy, "credentials", return_value={"username": "test", "password": "private-password"}):
             await self.service.acquire(self.id, "nova", "ipv4")
             await self.ready()

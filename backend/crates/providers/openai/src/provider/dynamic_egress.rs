@@ -35,17 +35,26 @@ pub(super) struct Lease {
     id: String,
     pub(super) ip: Option<String>,
     pub(super) http: Option<Client>,
+    retain_ip: bool,
+}
+
+impl Lease {
+    pub(super) fn retain_ip(&mut self) {
+        self.retain_ip = true;
+    }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
         let service = self.service.clone();
         let id = self.id.clone();
+        let retain_ip = self.retain_ip;
         tokio::spawn(async move {
             // 释放失败仍由远端租约超时关闭隧道；不能因此允许客户端回退。
             let _ = service
                 .http
                 .delete(format!("{}/v1/leases/{id}", service.url))
+                .query(&[("retainIp", retain_ip)])
                 .bearer_auth(service.token.expose_secret())
                 .send()
                 .await;
@@ -120,6 +129,7 @@ impl DynamicEgress {
             id: uuid::Uuid::new_v4().to_string(),
             ip: None,
             http: None,
+            retain_ip: false,
         };
         let result = tokio::time::timeout(Duration::from_secs(900), async {
             loop {
@@ -183,6 +193,51 @@ fn lease_ip(body: &LeaseResponse, family: &str) -> Result<Option<String>, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn release_reports_retention_only_after_explicit_success() {
+        for retain in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut lease = Lease {
+                service: DynamicEgress {
+                    http: Client::builder().no_proxy().build().unwrap(),
+                    url: format!("http://{address}"),
+                    token: "test-control-token".to_owned().into(),
+                },
+                id: "test-lease".to_owned(),
+                ip: None,
+                http: None,
+                retain_ip: false,
+            };
+            if retain {
+                lease.retain_ip();
+            }
+            drop(lease);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
+                while !data.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0; 1024];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0);
+                    data.extend_from_slice(&chunk[..count]);
+                }
+                let request = String::from_utf8(data).unwrap();
+                assert!(request.starts_with(&format!(
+                    "DELETE /v1/leases/test-lease?retainIp={retain} HTTP/1.1\r\n"
+                )));
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn novaproxy_requires_explicit_unverified_ipv4_lease() {
         let mut body: LeaseResponse = serde_json::from_value(
