@@ -20,6 +20,9 @@ use super::ClientApiKeySnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRuntimeSettings {
+    pub pricing: gateway_core::metering::PricingOverrides,
+    pub request_profiles:
+        BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
     pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub disable_fast: bool,
     pub request_location_enabled: bool,
@@ -161,6 +164,8 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
             .with_responses_max_decompressed_body_bytes(
                 data.settings.responses_max_decompressed_body_bytes,
             )
+            .with_request_profiles(data.settings.request_profiles)
+            .with_pricing(data.settings.pricing)
             .with_disable_fast(data.settings.disable_fast)
             .with_codex_turn_state(data.settings.codex_turn_state)
             .with_request_location(
@@ -182,6 +187,7 @@ impl SnapshotStorePort for PgRuntimeSnapshotRepository {
                         key.group_ids,
                         key.limits,
                     )
+                    .with_request_profiles(key.request_profiles)
                 })
                 .collect();
             let account_groups = data
@@ -245,6 +251,8 @@ fn core_revision(revision: Revision) -> Result<ConfigRevision, SnapshotStoreErro
 
 #[derive(sqlx::FromRow)]
 struct SnapshotSettingsRow {
+    pricing_synced_json: sqlx::types::Json<gateway_core::metering::PricingOverrides>,
+    pricing_overrides_json: sqlx::types::Json<gateway_core::metering::PricingOverrides>,
     config_revision: i64,
     refresh_margin_seconds: i64,
     refresh_concurrency: i64,
@@ -262,6 +270,8 @@ struct SnapshotSettingsRow {
     responses_max_decompressed_body_bytes: i64,
     disable_fast: bool,
     codex_turn_state_json: sqlx::types::Json<gateway_core::policy::CodexTurnStateConfig>,
+    provider_request_profiles_json:
+        sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
 }
 
 async fn load_settings(
@@ -272,6 +282,7 @@ async fn load_settings(
                 max_concurrent_per_account, request_interval_ms, rotation_strategy,
                 model_mappings_json, min_codex_desktop_version,
                 min_codex_cli_version, max_waiting_per_key, max_waiting_per_account, concurrency_wait_timeout_seconds, request_location_json, request_location_enabled, responses_max_decompressed_body_bytes, disable_fast, codex_turn_state_json
+                , provider_request_profiles_json, pricing_overrides_json, pricing_synced_json
          from runtime_settings where id = 1",
     )
     .fetch_optional(&mut **transaction)
@@ -288,6 +299,15 @@ async fn load_settings(
     Ok((
         revision_from_i64(row.config_revision)?,
         SnapshotRuntimeSettings {
+            pricing: {
+                super::pricing::validate_pricing(&row.pricing_synced_json.0)?;
+                super::pricing::validate_pricing(&row.pricing_overrides_json.0)?;
+                gateway_core::metering::merge_pricing(
+                    row.pricing_synced_json.0,
+                    &row.pricing_overrides_json.0,
+                )
+            },
+            request_profiles: decode_request_profiles(row.provider_request_profiles_json.0)?,
             codex_turn_state: row.codex_turn_state_json.0,
             disable_fast: row.disable_fast,
             responses_max_decompressed_body_bytes: to_u64(
@@ -313,11 +333,18 @@ async fn load_settings(
 async fn load_client_keys(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<Vec<ClientApiKeySnapshot>> {
-    let rows = sqlx::query_as::<_, (String, String, Vec<String>, i64, i64)>(
+    let rows = sqlx::query_as::<_, (
+        String,
+        String,
+        Vec<String>,
+        i64,
+        i64,
+        sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
+    )>(
         "select k.id, k.key,
                 coalesce(array_agg(kg.account_group_id order by kg.account_group_id)
                   filter (where kg.account_group_id is not null), '{}') as group_ids,
-                k.max_concurrency, k.requests_per_minute
+                k.max_concurrency, k.requests_per_minute, k.provider_request_profiles_json
          from client_api_keys k
          left join client_api_key_groups kg on kg.client_api_key_id = k.id
          where k.enabled
@@ -328,7 +355,11 @@ async fn load_client_keys(
     .await
     .map_err(|_| postgres_unavailable("load snapshot client policies"))?;
     rows.into_iter()
-        .map(|row| ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4))
+        .map(|row| {
+            let mut key = ClientApiKeySnapshot::from_persisted(row.0, row.1, row.2, row.3, row.4)?;
+            key.request_profiles = decode_request_profiles(row.5.0)?;
+            Ok(key)
+        })
         .collect()
 }
 
@@ -418,4 +449,21 @@ fn invalid(message: &str) -> StoreError {
         entity: "runtime snapshot",
         message: message.to_owned(),
     }
+}
+
+fn decode_request_profiles(
+    profiles: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+) -> StoreResult<
+    BTreeMap<gateway_core::routing::ProviderKind, gateway_core::account::OpaqueProviderData>,
+> {
+    profiles
+        .into_iter()
+        .map(|(kind, document)| {
+            Ok((
+                gateway_core::routing::ProviderKind::new(kind)
+                    .map_err(|_| invalid("invalid request profile provider"))?,
+                gateway_core::account::OpaqueProviderData::new(document),
+            ))
+        })
+        .collect()
 }

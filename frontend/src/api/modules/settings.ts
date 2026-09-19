@@ -1,5 +1,6 @@
 import type { RequestOptions } from '../request'
 import type { RequestLocation } from '../types/request-location'
+import type { ClientProfileSelection } from './client-profiles'
 import request from '../request'
 
 export type RotationStrategy = 'smart' | 'quota_reset_priority' | 'round_robin' | 'sticky'
@@ -12,6 +13,7 @@ export interface CodexTurnStateConfig {
 export interface RuntimeSettings {
   codexTurnState: CodexTurnStateConfig
   disableFast: boolean
+  openaiClientProfile: ClientProfileSelection
   requestLocationEnabled: boolean
   requestLocation: RequestLocation
   modelMappings: Record<string, string>
@@ -95,7 +97,7 @@ export function getAutomaticTurnState(options: RequestOptions = {}, accountId?: 
   })
 }
 
-type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'codexTurnState'>
+type UpdateSettingsParam = Omit<RuntimeSettings, 'updatedAt' | 'codexTurnState' | 'disableFast'>
 
 export function updateSettings(data: UpdateSettingsParam) {
   return request<RuntimeSettings>({

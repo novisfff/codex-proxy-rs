@@ -976,7 +976,7 @@ impl SettingsStore for StaticSettingsStore {
     }
     async fn sync_pricing(
         &self,
-        _: gateway_core::metering::PricingOverrides,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
         _: &MutationContext,
     ) -> AdminStoreResult<gateway_admin::model::Revision> {
         panic!("unexpected pricing sync")
@@ -991,6 +991,7 @@ impl SettingsStore for StaticSettingsStore {
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
             codex_turn_state: Default::default(),
+            openai_client_profile: None,
             disable_fast: false,
             request_location_enabled: false,
             request_location: Default::default(),

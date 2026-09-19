@@ -335,6 +335,7 @@ pub struct RequestMetricPoint {
 /// 已完整交付且由 Provider 计算费用的请求事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculatedUsageBillingFact {
+    pub billing_snapshot_json: Option<serde_json::Value>,
     pub bucket_start: DateTime<Utc>,
     pub provider_kind: String,
     pub upstream_model_id: String,

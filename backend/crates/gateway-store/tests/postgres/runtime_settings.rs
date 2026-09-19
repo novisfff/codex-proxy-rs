@@ -9,6 +9,7 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
+        openai_client_profile: None,
         codex_turn_state: None,
         disable_fast: None,
         request_location_enabled: false,

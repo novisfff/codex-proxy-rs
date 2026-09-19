@@ -4,7 +4,7 @@ use super::turn_state::{REFRESH_AFTER_MS, REFRESH_BEFORE_MS, TurnStateCache};
 use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
-        CodexBackendClient, CodexClientError, CodexRequestContext,
+        CodexBackendClient, CodexCatalogCapabilityEvidence, CodexClientError, CodexRequestContext,
         client::build_account_http_client,
         diagnostics::{CodexFailureCategory, CodexUpstreamFailure},
         encode_generate_request,
@@ -298,7 +298,7 @@ impl TurnStateFetcher {
             a.account_id == account
                 && a.model == model
                 && a.config_revision == config.revision
-                && (a.paused || (a.failures > 0 && a.next_attempt_at > now))
+                && a.paused
         }) {
             return Err(invalid());
         }
@@ -591,17 +591,14 @@ impl TurnStateFetcher {
                 })
                 .map_or(1, |a| a.failures.saturating_add(1))
         };
-        let retry_missing_value = !outcome.success && !outcome.paused && outcome.retry_after == 0;
-        let delay = if outcome.success {
+        // 获取器失败后不使用指数退避、上游 Retry-After 或随机抖动。静态出口仍以
+        // 10 秒为固定重试间隔；动态出口由对应实例的 intervalSeconds 控制实际间隔。
+        let delay: u64 = if outcome.success {
             0
-        } else if retry_missing_value {
-            if config.dynamic_egress.is_some() {
-                0
-            } else {
-                10
-            }
+        } else if outcome.paused || config.dynamic_egress.is_some() {
+            0
         } else {
-            backoff_seconds(failures).max(outcome.retry_after)
+            10
         };
         let next = if outcome.success {
             self.cache
@@ -612,13 +609,7 @@ impl TurnStateFetcher {
                     v.expires_at.saturating_sub(REFRESH_BEFORE_MS)
                 })
         } else {
-            finished
-                .saturating_add(i64::try_from(delay.saturating_mul(1000)).unwrap_or(i64::MAX))
-                .saturating_add(if retry_missing_value {
-                    0
-                } else {
-                    i64::from(uuid::Uuid::new_v4().as_bytes()[0]) * 20
-                })
+            finished.saturating_add(i64::try_from(delay.saturating_mul(1000)).unwrap_or(i64::MAX))
         };
         self.store
             .save_attempt(TurnStateFetchAttempt {
@@ -821,14 +812,46 @@ impl TurnStateFetcher {
         let Ok(nonce) = next_probe_nonce() else {
             return FetchOutcome::retry("探测请求随机数生成失败", 60);
         };
+        // Codex Core 每个 turn 都会带独立的会话、线程和窗口身份。获取器不复用真实
+        // 对话，但保留同样的身份形状，避免被上游按公开 Responses API 的简化请求处理。
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let thread_id = uuid::Uuid::new_v4().to_string();
+        let window_id = uuid::Uuid::new_v4().to_string();
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let turn_metadata = json!({
+            "installation_id": runtime.installation_id.clone(),
+            "session_id": session_id.clone(),
+            "thread_id": thread_id.clone(),
+            "window_id": window_id.clone(),
+            "turn_id": turn_id.clone(),
+            "request_kind": "turn"
+        })
+        .to_string();
         let mut body = json!({
             "model": model,
             "input": [{
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": format!("{}\nReply only OK.", nonce)}]
+                "content": [{"type": "input_text", "text": format!("{}\nReply only OK.", nonce)}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["user.text"],
+                    "create_time": Utc::now().timestamp_millis() as f64 / 1000.0
+                }
             }],
-            "instructions": "Be brief.",
+            "instructions": "You are Codex, an AI coding agent.",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "include": ["reasoning.encrypted_content"],
+            "prompt_cache_key": session_id.clone(),
+            "client_metadata": {
+                "x-codex-installation-id": runtime.installation_id.clone(),
+                "session_id": session_id.clone(),
+                "thread_id": thread_id.clone(),
+                "x-codex-window-id": window_id.clone(),
+                "turn_id": turn_id.clone(),
+                "x-codex-turn-metadata": turn_metadata.clone()
+            },
             "stream": true,
             "store": false
         });
@@ -843,7 +866,17 @@ impl TurnStateFetcher {
                 .into_iter()
                 .find(|e| efforts.iter().any(|v| v == e))
             {
-                body["reasoning"] = json!({"effort":effort});
+                body["reasoning"] = json!({"effort":effort,"summary":"auto"});
+            }
+            if entry.capabilities().parallel_tool_calls()
+                == CodexCatalogCapabilityEvidence::DeclaredUnsupported
+            {
+                body.as_object_mut()
+                    .expect("probe body is an object")
+                    .remove("parallel_tool_calls");
+            }
+            if entry.capabilities().verbosity() == CodexCatalogCapabilityEvidence::DeclaredNative {
+                body["text"] = json!({"verbosity":"low"});
             }
         }
         // Codex OAuth 不统一支持 max_output_tokens；API Key Responses 接口支持时才发送。
@@ -878,12 +911,19 @@ impl TurnStateFetcher {
             return FetchOutcome::paused("凭据格式无效");
         };
         let request_id = format!("turn-state-fetch-{}", uuid::Uuid::new_v4());
-        let context = CodexRequestContext::auxiliary(
+        let mut context = CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             account.upstream_account_id(),
             &request_id,
             Some(&runtime.installation_id),
         );
+        // 与普通 Codex turn 一样，将正文中的会话身份投影到协议请求头；这些 ID 只
+        // 属于本次探测，不携带用户历史，也不会改变账号 + 模型的 Turn State 缓存键。
+        context.session_id = Some(&session_id);
+        context.thread_id = Some(&thread_id);
+        context.codex_window_id = Some(&window_id);
+        context.turn_id = Some(&turn_id);
+        context.turn_metadata = Some(&turn_metadata);
         let mut response = match client
             .create_response_stream_with_pool_account(&request, context, None)
             .await
@@ -946,16 +986,6 @@ impl TurnStateFetcher {
             return FetchOutcome::retry("凭据已更新，重新排队", 60);
         }
         outcome
-    }
-}
-
-pub(crate) fn backoff_seconds(failures: u32) -> u64 {
-    match failures {
-        0 | 1 => 60,
-        2 => 120,
-        3 => 300,
-        4 => 600,
-        _ => 900,
     }
 }
 

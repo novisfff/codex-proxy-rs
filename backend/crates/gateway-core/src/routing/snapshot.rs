@@ -28,6 +28,8 @@ const MAXIMUM_CATALOG_STABILITY_ATTEMPTS: usize = 4;
 /// Store 在一个一致性读取中提供的调度设置事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotSettingsFacts {
+    pricing: Arc<crate::metering::PricingOverrides>,
+    request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     request_location_enabled: bool,
@@ -45,6 +47,21 @@ pub struct SnapshotSettingsFacts {
 }
 
 impl SnapshotSettingsFacts {
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: crate::metering::PricingOverrides) -> Self {
+        self.pricing = Arc::new(pricing);
+        self
+    }
+
+    #[must_use]
+    pub fn with_request_profiles(
+        mut self,
+        profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
+    ) -> Self {
+        self.request_profiles = profiles;
+        self
+    }
+
     #[must_use]
     pub fn with_codex_turn_state(mut self, config: crate::policy::CodexTurnStateConfig) -> Self {
         self.codex_turn_state = config;
@@ -97,6 +114,8 @@ impl SnapshotSettingsFacts {
         min_codex_cli_version: Option<String>,
     ) -> Self {
         Self {
+            request_profiles: BTreeMap::new(),
+            pricing: Arc::default(),
             disable_fast: false,
             codex_turn_state: crate::policy::CodexTurnStateConfig::default(),
             request_location_enabled: false,
@@ -118,6 +137,7 @@ impl SnapshotSettingsFacts {
 /// Store 读取到的一个启用 Client API Key 策略事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotClientPolicyFacts {
+    request_profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
     key_id: ClientApiKeyId,
     plaintext_key: PlaintextClientApiKey,
     group_ids: Vec<AccountGroupId>,
@@ -126,6 +146,15 @@ pub struct SnapshotClientPolicyFacts {
 
 impl SnapshotClientPolicyFacts {
     #[must_use]
+    pub fn with_request_profiles(
+        mut self,
+        profiles: BTreeMap<ProviderKind, crate::account::OpaqueProviderData>,
+    ) -> Self {
+        self.request_profiles = profiles;
+        self
+    }
+
+    #[must_use]
     pub fn new(
         key_id: ClientApiKeyId,
         plaintext_key: PlaintextClientApiKey,
@@ -133,6 +162,7 @@ impl SnapshotClientPolicyFacts {
         limits: RateLimits,
     ) -> Self {
         Self {
+            request_profiles: BTreeMap::new(),
             key_id,
             plaintext_key,
             group_ids,
@@ -505,10 +535,16 @@ async fn compile_runtime_snapshot(
                     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)?,
             )
         };
+        let mut request_profiles = facts.settings.request_profiles.clone();
+        request_profiles.extend(policy.request_profiles);
         client_policies.push(ClientPolicy::new(
             policy.key_id,
             policy.plaintext_key,
-            Arc::new(account_scope.with_disable_fast(disable_fast)),
+            Arc::new(
+                account_scope
+                    .with_disable_fast(disable_fast)
+                    .with_request_profiles(request_profiles),
+            ),
             true,
             policy.limits,
         ));
@@ -536,6 +572,7 @@ async fn compile_runtime_snapshot(
     .map_err(|_| RuntimeSnapshotCompileError::InvalidData)
     .map(|snapshot| {
         snapshot
+            .with_pricing(Arc::clone(&facts.settings.pricing))
             .with_codex_turn_state(facts.settings.codex_turn_state)
             .with_disable_fast(facts.settings.disable_fast)
             .with_request_location(request_location)
@@ -551,6 +588,7 @@ async fn compile_runtime_snapshot(
 /// 数据面使用的不可变配置快照。
 #[derive(Debug, Clone)]
 pub struct RuntimeSnapshot {
+    pricing: Arc<crate::metering::PricingOverrides>,
     codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     responses_max_decompressed_body_bytes: std::num::NonZeroUsize,
@@ -571,6 +609,12 @@ pub struct RuntimeSnapshot {
 }
 
 impl RuntimeSnapshot {
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: Arc<crate::metering::PricingOverrides>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
     #[must_use]
     pub fn with_codex_turn_state(mut self, config: crate::policy::CodexTurnStateConfig) -> Self {
         self.codex_turn_state = config;
@@ -685,6 +729,7 @@ impl RuntimeSnapshot {
         client_policy_map.retain(|_, policy| policy.enabled());
 
         Ok(Self {
+            pricing: Arc::default(),
             responses_max_decompressed_body_bytes: std::num::NonZeroUsize::new(64 * 1024 * 1024)
                 .expect("positive default limit"),
             codex_turn_state: crate::policy::CodexTurnStateConfig::default(),
@@ -999,6 +1044,7 @@ impl RuntimeSnapshot {
         }
 
         Ok(RoutingPlan {
+            pricing: Arc::clone(&self.pricing),
             config_revision: self.revision,
             codex_turn_state: self.codex_turn_state.clone(),
             disable_fast: self.disable_fast || account_scope.disable_fast(),
@@ -1043,6 +1089,7 @@ impl RuntimeSnapshot {
             account_scope: Arc::clone(&account_scope),
         };
         Ok(RoutingPlan {
+            pricing: Arc::clone(&self.pricing),
             config_revision: self.revision,
             codex_turn_state: self.codex_turn_state.clone(),
             disable_fast: self.disable_fast || account_scope.disable_fast(),

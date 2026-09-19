@@ -37,6 +37,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 fn update_body() -> Value {
     json!({
+        "openaiClientProfile": null,
         "codexTurnState": {"mode":"default","value":""},
         "disableFast": false,
         "requestLocationEnabled": false,
@@ -179,6 +180,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
 
     let settings = RuntimeSettings {
         codex_turn_state: Default::default(),
+        openai_client_profile: None,
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),
@@ -224,6 +226,7 @@ fn settings_response_should_cover_the_full_runtime_settings_contract() {
     assert_eq!(
         value,
         json!({
+            "openaiClientProfile": null,
             "codexTurnState": {"mode":"default","value":""},
             "disableFast": false,
         "requestLocationEnabled": false,
@@ -280,6 +283,7 @@ fn settings_request_and_response_fields_should_stay_in_lockstep() {
         .collect();
     let settings = RuntimeSettings {
         codex_turn_state: Default::default(),
+        openai_client_profile: None,
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),
@@ -779,7 +783,10 @@ async fn pricing_routes_keep_manual_overrides_during_sync_and_reset_to_source() 
         .oneshot(request(
             Method::POST,
             "/api/admin/settings/pricing/sync",
-            Some(approved),
+            Some(json!({
+                "preview": approved,
+                "models": {"openai": ["gpt-5.4"]}
+            })),
         ))
         .await
         .unwrap();
@@ -881,7 +888,10 @@ async fn pricing_rejects_invalid_edits_and_tampered_sync_without_writes() {
         .oneshot(request(
             Method::POST,
             "/api/admin/settings/pricing/sync",
-            Some(json!({"prices":{},"skipped":[]})),
+            Some(json!({
+                "preview": {"prices":{},"skipped":[]},
+                "models": {}
+            })),
         ))
         .await
         .unwrap();

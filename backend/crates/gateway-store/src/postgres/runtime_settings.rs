@@ -19,6 +19,7 @@ use crate::{Revision, StoreError, StoreResult, postgres_unavailable};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeSettings {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub codex_turn_state: gateway_core::policy::CodexTurnStateConfig,
     pub disable_fast: bool,
     pub config_revision: Revision,
@@ -55,6 +56,10 @@ impl fmt::Debug for RuntimeSettings {
         formatter
             .debug_struct("RuntimeSettings")
             .field("config_revision", &self.config_revision)
+            .field(
+                "openai_client_profile",
+                &self.openai_client_profile.as_ref().map(|_| "[REDACTED]"),
+            )
             .field(
                 "admin_api_key",
                 &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -111,6 +116,7 @@ impl fmt::Debug for RuntimeSettings {
 
 #[derive(Clone)]
 pub struct RuntimeSettingsUpdate {
+    pub openai_client_profile: Option<gateway_core::account::OpaqueProviderData>,
     pub codex_turn_state: Option<gateway_core::policy::CodexTurnStateConfig>,
     pub disable_fast: Option<bool>,
     pub admin_api_key: Option<String>,
@@ -144,6 +150,10 @@ impl fmt::Debug for RuntimeSettingsUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeSettingsUpdate")
+            .field(
+                "openai_client_profile",
+                &self.openai_client_profile.as_ref().map(|_| "[REDACTED]"),
+            )
             .field(
                 "admin_api_key",
                 &self.admin_api_key.as_ref().map(|_| "[REDACTED]"),
@@ -242,7 +252,7 @@ impl RuntimeSettingsRepository for PgRuntimeSettingsRepository {
 
 pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-            "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
+            "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
                     refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                     rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                     audit_retention_days, min_codex_desktop_version,
@@ -264,6 +274,34 @@ pub(crate) async fn load_runtime_settings_from_pool(pool: &PgPool) -> StoreResul
 }
 
 impl ProviderRuntimePolicyPort for PgRuntimeSettingsRepository {
+    fn initialize_request_profile<'a>(
+        &'a self,
+        provider: &'a gateway_core::routing::ProviderKind,
+        initial: gateway_core::account::OpaqueProviderData,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<gateway_core::account::OpaqueProviderData, ProviderStoreError>,
+    > {
+        Box::pin(async move {
+            let document = sqlx::query_scalar::<
+                _,
+                sqlx::types::Json<serde_json::Map<String, serde_json::Value>>,
+            >(
+                "update runtime_settings set
+                    provider_request_profiles_json = case when provider_request_profiles_json ? $1 then provider_request_profiles_json
+                        else jsonb_set(provider_request_profiles_json, array[$1], $2) end,
+                    config_revision = config_revision + case when provider_request_profiles_json ? $1 then 0 else 1 end
+                 where id = 1 returning provider_request_profiles_json -> $1",
+            )
+            .bind(provider.as_str())
+            .bind(sqlx::types::Json(initial.expose_to_provider()))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| provider_unavailable("initialize Provider request profile"))?;
+            Ok(gateway_core::account::OpaqueProviderData::new(document.0))
+        })
+    }
+
     fn load_refresh_policy(
         &self,
     ) -> futures::future::BoxFuture<'_, Result<ProviderRefreshPolicy, ProviderStoreError>> {
@@ -304,7 +342,7 @@ pub(crate) async fn load_runtime_settings_in_transaction(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> StoreResult<RuntimeSettings> {
     let row = sqlx::query_as::<_, RuntimeSettingsRow>(
-        "select config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
+        "select provider_request_profiles_json, config_revision, admin_api_key, refresh_margin_seconds, request_location_json, request_location_enabled, disable_fast, codex_turn_state_json,
                 refresh_concurrency, max_concurrent_per_account, request_interval_ms,
                 rotation_strategy, model_mappings_json, usage_retention_days, ops_event_retention_days,
                 audit_retention_days, min_codex_desktop_version,
@@ -362,6 +400,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
                      responses_max_decompressed_body_bytes = $25,
                      disable_fast = coalesce($26, disable_fast),
                      codex_turn_state_json = coalesce($27, codex_turn_state_json),
+                     provider_request_profiles_json = case when $28::jsonb is null then provider_request_profiles_json else jsonb_set(provider_request_profiles_json, '{openai}', $28) end,
 	                 updated_at = now()
 	             where id = 1
 	             returning config_revision",
@@ -405,6 +444,7 @@ pub(crate) async fn update_runtime_settings_in_transaction(
     )
     .bind(update.disable_fast)
     .bind(update.codex_turn_state.as_ref().map(sqlx::types::Json))
+    .bind(update.openai_client_profile.as_ref().map(|profile| sqlx::types::Json(profile.expose_to_provider())))
     .fetch_optional(&mut **transaction)
     .await
     .map_err(|_| postgres_unavailable("update runtime settings in transaction"))?
@@ -454,6 +494,8 @@ pub(crate) async fn update_admin_api_key_in_transaction(
 
 #[derive(sqlx::FromRow)]
 struct RuntimeSettingsRow {
+    provider_request_profiles_json:
+        sqlx::types::Json<BTreeMap<String, serde_json::Map<String, serde_json::Value>>>,
     codex_turn_state_json: sqlx::types::Json<gateway_core::policy::CodexTurnStateConfig>,
     disable_fast: bool,
     config_revision: i64,
@@ -491,6 +533,12 @@ fn runtime_settings_from_row(row: RuntimeSettingsRow) -> StoreResult<RuntimeSett
         .validate()
         .map_err(|_| invalid_numeric())?;
     Ok(RuntimeSettings {
+        openai_client_profile: row
+            .provider_request_profiles_json
+            .0
+            .get("openai")
+            .cloned()
+            .map(gateway_core::account::OpaqueProviderData::new),
         codex_turn_state: row.codex_turn_state_json.0,
         config_revision: Revision::new(to_u64(row.config_revision)?)?,
         admin_api_key: row.admin_api_key,

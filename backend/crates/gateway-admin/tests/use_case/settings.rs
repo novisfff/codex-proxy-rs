@@ -20,7 +20,7 @@ impl SettingsStore for UnusedSettingsStore {
     }
     async fn sync_pricing(
         &self,
-        _: gateway_core::metering::PricingOverrides,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
         _: &MutationContext,
     ) -> AdminStoreResult<gateway_admin::model::Revision> {
         panic!("unexpected pricing sync")
@@ -79,6 +79,7 @@ async fn settings_should_reject_zero_refresh_margin_before_store_call() {
             },
             ReplaceRuntimeSettings {
                 codex_turn_state: None,
+                openai_client_profile: None,
                 disable_fast: None,
                 request_location_enabled: false,
                 request_location: Default::default(),

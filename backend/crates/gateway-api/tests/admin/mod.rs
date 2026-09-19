@@ -446,11 +446,23 @@ impl SettingsStore for MemorySettingsStore {
     }
     async fn sync_pricing(
         &self,
-        prices: gateway_core::metering::PricingOverrides,
+        changes: gateway_admin::model::pricing::PricingSyncChanges,
         _: &MutationContext,
     ) -> AdminStoreResult<gateway_admin::model::Revision> {
         let mut pricing = self.pricing.lock().expect("pricing");
-        pricing.synced = prices;
+        for (provider, models) in changes {
+            let target = pricing.synced.entry(provider).or_default();
+            for (model, change) in models {
+                match change {
+                    Some(price) => {
+                        target.insert(model, price);
+                    }
+                    None => {
+                        target.remove(&model);
+                    }
+                }
+            }
+        }
         pricing.synced_at = Some(Utc::now());
         let mut settings = self.settings.lock().expect("settings");
         settings.config_revision = next_revision(settings.config_revision);
@@ -467,6 +479,9 @@ impl SettingsStore for MemorySettingsStore {
         for model in command.models {
             match &command.change {
                 PricingChange::Reset => {
+                    models.remove(&model);
+                }
+                PricingChange::Delete => {
                     models.remove(&model);
                 }
                 PricingChange::Replace(p) => {
@@ -505,6 +520,9 @@ impl SettingsStore for MemorySettingsStore {
             codex_turn_state: command
                 .codex_turn_state
                 .unwrap_or_else(|| settings.codex_turn_state.clone()),
+            openai_client_profile: command
+                .openai_client_profile
+                .or_else(|| settings.openai_client_profile.clone()),
             disable_fast: command.disable_fast.unwrap_or(settings.disable_fast),
             request_location_enabled: command.request_location_enabled,
             request_location: command.request_location,
@@ -876,6 +894,7 @@ impl ClientKeyStore for MemoryClientKeyStore {
         let now = Utc::now();
         Ok(Some(ClientKeySecret::new(
             ClientKeyRecord {
+                openai_client_profile_override: None,
                 budget: Default::default(),
                 id: id.clone(),
                 name: "revealed".to_owned(),
@@ -1410,6 +1429,7 @@ fn test_runtime_settings() -> RuntimeSettings {
     ]);
     RuntimeSettings {
         codex_turn_state: Default::default(),
+        openai_client_profile: None,
         disable_fast: false,
         request_location_enabled: false,
         request_location: Default::default(),

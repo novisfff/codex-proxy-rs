@@ -536,6 +536,7 @@ impl ProviderCandidate {
 /// 一次请求冻结的 Provider 尝试顺序。
 #[derive(Debug, Clone)]
 pub struct RoutingPlan {
+    pricing: Arc<crate::metering::PricingOverrides>,
     codex_turn_state: crate::policy::CodexTurnStateConfig,
     disable_fast: bool,
     request_location: Option<crate::account::RequestLocation>,
@@ -548,6 +549,11 @@ pub struct RoutingPlan {
 }
 
 impl RoutingPlan {
+    #[must_use]
+    pub fn pricing(&self) -> Arc<crate::metering::PricingOverrides> {
+        Arc::clone(&self.pricing)
+    }
+
     #[must_use]
     pub const fn codex_turn_state(&self) -> &crate::policy::CodexTurnStateConfig {
         &self.codex_turn_state

@@ -102,6 +102,7 @@ mod observation;
 pub(crate) mod turn_state;
 pub(crate) mod turn_state_fetcher;
 mod workers;
+pub(crate) use workers::ClientReleaseServices;
 
 use turn_state::TurnStateCache;
 

@@ -368,6 +368,10 @@ pub(crate) fn admin_calculated_usage_billing_fact(
     fact: CalculatedUsageBillingFact,
 ) -> AdminStoreResult<admin_observability::UsageCalculatedBillingFact> {
     Ok(admin_observability::UsageCalculatedBillingFact {
+        breakdown: fact
+            .billing_snapshot_json
+            .as_ref()
+            .and_then(super::super::pricing::decode_billing_snapshot),
         bucket_start: fact.bucket_start,
         provider_kind: fact.provider_kind,
         upstream_model_id: fact.upstream_model_id,
@@ -956,6 +960,7 @@ pub(crate) fn calculated_usage_billing_fact_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<CalculatedUsageBillingFact> {
     Ok(CalculatedUsageBillingFact {
+        billing_snapshot_json: get(row, "billing_snapshot_json")?,
         bucket_start: get(row, "bucket_start")?,
         provider_kind: get(row, "provider_kind")?,
         upstream_model_id: get(row, "upstream_model_id")?,

@@ -24,7 +24,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
 
     async fn sync_pricing(
         &self,
-        prices: gateway_core::metering::PricingOverrides,
+        prices: gateway_admin::model::pricing::PricingSyncChanges,
         context: &MutationContext,
     ) -> AdminStoreResult<gateway_admin::model::Revision> {
         let audit = mutation_audit(
@@ -86,6 +86,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
             .map_err(|error| admin_store_error("runtime settings", error))?;
         let replacement = postgres::ControlPlaneReplacement {
             settings: postgres::RuntimeSettingsUpdate {
+                openai_client_profile: command.openai_client_profile,
                 codex_turn_state: command.codex_turn_state,
                 admin_api_key: current.settings.admin_api_key,
                 refresh_margin_seconds: command.refresh_margin_seconds,
@@ -123,6 +124,7 @@ impl SettingsStore for AdminSettingsStoreAdapter {
                 "1",
                 vec![
                     "codex_turn_state_json".to_owned(),
+                    "provider_request_profiles_json".to_owned(),
                     "disable_fast".to_owned(),
                     "request_location_enabled".to_owned(),
                     "request_location_json".to_owned(),
@@ -234,6 +236,7 @@ pub(crate) fn admin_runtime_settings(
         .collect::<AdminStoreResult<ModelMappings>>()?;
     Ok(AdminRuntimeSettings {
         codex_turn_state: settings.codex_turn_state,
+        openai_client_profile: settings.openai_client_profile,
         config_revision: admin_revision(settings.config_revision)?,
         disable_fast: settings.disable_fast,
         request_location_enabled: settings.request_location_enabled,

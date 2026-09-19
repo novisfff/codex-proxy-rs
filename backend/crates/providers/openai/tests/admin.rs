@@ -742,6 +742,17 @@ mod turn_state_fetcher {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].headers.get("x-codex-turn-state").is_none());
+        for name in [
+            "session-id",
+            "thread-id",
+            "x-codex-window-id",
+            "x-codex-turn-metadata",
+        ] {
+            assert!(
+                requests[0].headers.get(name).is_some(),
+                "Codex request header {name} must be present"
+            );
+        }
         let body = zstd::stream::decode_all(std::io::Cursor::new(&requests[0].body)).unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["model"], MODEL);
@@ -752,6 +763,23 @@ mod turn_state_fetcher {
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["instructions"], "You are Codex, an AI coding agent.");
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["store"], false);
+        for key in ["session_id", "thread_id", "x-codex-window-id", "turn_id"] {
+            let value = body["client_metadata"][key].as_str().unwrap();
+            assert!(!value.is_empty(), "Codex metadata {key} must be populated");
+        }
+        assert_eq!(
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| value["request_kind"].as_str().map(str::to_owned)),
+            Some("turn".to_owned())
+        );
         assert!(body.get("previous_response_id").is_none());
         assert!(
             body.get("tools")
@@ -820,13 +848,13 @@ mod turn_state_fetcher {
             assert!(
                 (started + 10000..=finished + 10000).contains(&state.attempts[0].next_attempt_at)
             );
-            assert!(
-                admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.is_err(),
-                "manual action cannot bypass backoff"
-            );
+            admin
+                .run_turn_state_fetcher(ACCOUNT, MODEL)
+                .await
+                .expect("manual action should restart a failed fetch immediately");
             cycle(&worker).await;
-            assert_eq!(server.received_requests().await.unwrap().len(), 1);
-            // 连续多次未获得新值也不能拉长重试间隔。
+            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            // 连续多次未获得新值也不能拉长固定重试间隔。
             store.attempts.lock().unwrap()[0].next_attempt_at = 0;
             store.attempts.lock().unwrap()[0].failures = 20;
             let started = Utc::now().timestamp_millis();
@@ -837,7 +865,7 @@ mod turn_state_fetcher {
             assert!(
                 (started + 10000..=finished + 10000).contains(&state.attempts[0].next_attempt_at)
             );
-            assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            assert_eq!(server.received_requests().await.unwrap().len(), 3);
         }
     }
 
@@ -869,7 +897,7 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
-    async fn fetcher_honors_retry_after_and_config_change_cancels_inflight() {
+    async fn fetcher_ignores_retry_after_for_scheduling_and_config_change_cancels_inflight() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
@@ -893,7 +921,11 @@ mod turn_state_fetcher {
         let worker = fetch_worker(&mut bundle);
         cycle(&worker).await;
         let state = admin.turn_state_fetcher().await.unwrap();
-        assert!(state.attempts[0].next_attempt_at >= state.attempts[0].attempted_at + 600000);
+        assert!(
+            (state.attempts[0].attempted_at + 9000..=state.attempts[0].attempted_at + 30000)
+                .contains(&state.attempts[0].next_attempt_at),
+            "Retry-After must not create a long fetcher backoff"
+        );
         server.reset().await;
         Mock::given(method("POST"))
             .respond_with(
