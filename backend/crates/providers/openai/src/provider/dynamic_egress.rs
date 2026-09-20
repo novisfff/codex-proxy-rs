@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use gateway_core::provider_ports::turn_state::DynamicEgressSelection;
+use gateway_core::provider_ports::turn_state::{DynamicEgressSelection, TurnStateProbeProfile};
 use gateway_core::provider_ports::{ProviderStoreError, ProviderStoreErrorKind};
 use reqwest::Client;
 use secrecy::{ExposeSecret, SecretString};
@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::DynamicEgressConfig;
-use crate::transport::tls::build_reqwest_client_with_custom_ca;
+use crate::transport::client::{build_turn_state_http_client, turn_state_proxy};
 
 #[derive(Clone)]
 pub(super) struct DynamicEgress {
@@ -32,7 +32,7 @@ struct LeaseResponse {
 
 pub(super) struct Lease {
     service: DynamicEgress,
-    id: String,
+    pub(super) id: String,
     pub(super) ip: Option<String>,
     pub(super) http: Option<Client>,
     retain_ip: bool,
@@ -123,7 +123,11 @@ impl DynamicEgress {
         result.unwrap_or_else(|| json!({"available":false,"message":"动态出口服务不可用","instances":[],"history":[]}))
     }
 
-    pub(super) async fn acquire(&self, selection: &DynamicEgressSelection) -> Result<Lease, ()> {
+    pub(super) async fn acquire(
+        &self,
+        selection: &DynamicEgressSelection,
+        profile: TurnStateProbeProfile,
+    ) -> Result<Lease, ()> {
         let mut lease = Lease {
             service: self.clone(),
             id: uuid::Uuid::new_v4().to_string(),
@@ -154,12 +158,11 @@ impl DynamicEgress {
                     "provisioning" => tokio::time::sleep(Duration::from_secs(2)).await,
                     "ready" => {
                         let ip = lease_ip(&body, &selection.family)?;
-                        let proxy = reqwest::Proxy::all(body.proxy_url.ok_or(())?).map_err(|_| ())?
+                        let proxy = turn_state_proxy(&body.proxy_url.ok_or(())?).map_err(|_| ())?
                             .basic_auth(&lease.id, &body.secret.ok_or(())?);
-                        lease.http = Some(build_reqwest_client_with_custom_ca(Client::builder()
-                            .no_proxy().proxy(proxy).redirect(reqwest::redirect::Policy::none())
-                            .retry(reqwest::retry::never()).http1_only().pool_max_idle_per_host(0)
-                            .connect_timeout(Duration::from_secs(15))) .map_err(|_| ())?);
+                        lease.http = Some(build_turn_state_http_client(
+                            Some(proxy), profile == TurnStateProbeProfile::MinimalCompat,
+                        ).map_err(|_| ())?);
                         lease.ip = ip;
                         return Ok(());
                     }

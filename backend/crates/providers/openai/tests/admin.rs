@@ -73,8 +73,24 @@ mod turn_state_fetcher {
         values: Mutex<Vec<TurnStateValue>>,
         attempts: Mutex<Vec<TurnStateFetchAttempt>>,
         proxy: Mutex<Option<OutboundProxy>>,
+        probes: Mutex<Vec<TurnStateProbeRecord>>,
     }
     impl TurnStateStore for MemoryTurnStateStore {
+        fn recent_probes(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<TurnStateProbeRecord>, ProviderStoreError>> {
+            Box::pin(async { Ok(self.probes.lock().unwrap().clone()) })
+        }
+        fn save_probe(
+            &self,
+            probe: TurnStateProbeRecord,
+        ) -> BoxFuture<'_, Result<(), ProviderStoreError>> {
+            Box::pin(async move {
+                self.probes.lock().unwrap().push(probe);
+                Ok(())
+            })
+        }
+
         fn configs(
             &self,
         ) -> BoxFuture<'_, Result<Vec<TurnStateFetcherConfig>, ProviderStoreError>> {
@@ -165,6 +181,8 @@ mod turn_state_fetcher {
             proxy_id: None,
             dynamic_egress: None,
             schedule: None,
+            probe_profile: TurnStateProbeProfile::CodexCore,
+            adaptive_concurrency: false,
             revision: 0,
         }
     }
@@ -480,13 +498,17 @@ mod turn_state_fetcher {
 
     #[tokio::test]
     async fn socks5_parallel_searches_same_model_respect_interval_capacity_and_cancel_together() {
-        for fresh_from_traffic in [false, true] {
+        for (fresh_from_traffic, adaptive, capacity, expected) in [
+            (false, false, 2, 2),
+            (true, false, 2, 2),
+            (false, true, 8, 3),
+        ] {
             let control = MockServer::start().await;
             let upstream = MockServer::start().await;
             let starts = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
             Mock::given(method("GET")).and(path("/v1/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{
-                "id":"nova","provider":if fresh_from_traffic { "novaproxy" } else { "socks5" },"families":["ipv4"],"maxConcurrent":2,"intervalSeconds":1
+                "id":"nova","provider":if fresh_from_traffic { "novaproxy" } else { "socks5" },"families":["ipv4"],"maxConcurrent":capacity,"intervalSeconds":1
             }]}))).mount(&control).await;
             let observed = starts.clone();
             Mock::given(method("POST"))
@@ -530,6 +552,7 @@ mod turn_state_fetcher {
             .unwrap();
             let admin = bundle.admin_provider();
             let mut selected = fetch_config();
+            selected.adaptive_concurrency = adaptive;
             selected.dynamic_egress = Some(DynamicEgressSelection {
                 instance: "nova".to_owned(),
                 family: "ipv4".to_owned(),
@@ -540,7 +563,7 @@ mod turn_state_fetcher {
             let context = WorkerCycleContext::new(worker.0, None, cancellation.clone());
             let task = tokio::spawn(async move { worker.1.run_cycle(context).await });
             for _ in 0..100 {
-                if starts.lock().unwrap().len() == 2 {
+                if starts.lock().unwrap().len() == expected {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -549,11 +572,15 @@ mod turn_state_fetcher {
             let snapshot = admin.turn_state_fetcher().await.unwrap();
             assert_eq!(
                 snapshot.running_requests,
-                vec![(ACCOUNT.to_owned(), MODEL.to_owned()); 2]
+                vec![(ACCOUNT.to_owned(), MODEL.to_owned()); expected]
             );
             {
                 let starts = starts.lock().unwrap();
-                assert_eq!(starts.len(), 2, "capacity must prevent a third lease");
+                assert_eq!(
+                    starts.len(),
+                    expected,
+                    "instance and adaptive capacity must bound leases"
+                );
                 let mut times: Vec<_> = starts.values().copied().collect();
                 times.sort();
                 assert!(times[1].duration_since(times[0]) >= Duration::from_millis(950));
@@ -609,7 +636,7 @@ mod turn_state_fetcher {
                     .iter()
                     .filter(|r| r.method.as_str() == "DELETE")
                     .count()
-                    == 2
+                    == expected
                 {
                     break;
                 }
@@ -623,7 +650,7 @@ mod turn_state_fetcher {
                     .iter()
                     .filter(|r| r.method.as_str() == "DELETE")
                     .count(),
-                2
+                expected
             );
             assert_eq!(
                 upstream.received_requests().await.unwrap().len(),
@@ -858,6 +885,139 @@ mod turn_state_fetcher {
         cycle(&worker).await;
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(admin.turn_state_fetcher().await.unwrap().values.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn minimal_probe_records_results_and_adjusts_search_after_non_target_responses() {
+        let server = MockServer::start().await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let mut bundle = provider_openai::initialize(
+            valid_config().config,
+            provider_ports_with(
+                fetch_accounts(&server).await,
+                Arc::new(TestOAuthPending::default()),
+            )
+            .with_turn_state(store.clone()),
+        )
+        .await
+        .unwrap();
+        let admin = bundle.admin_provider();
+        let mut config = fetch_config();
+        config.probe_profile = TurnStateProbeProfile::MinimalCompat;
+        config.adaptive_concurrency = true;
+        admin.configure_turn_state_fetcher(config).await.unwrap();
+        let worker = fetch_worker(&mut bundle);
+        let mut sessions = std::collections::HashSet::new();
+        for (index, (length, concurrency)) in [(312, 5), (312, 8), (292, 3)].into_iter().enumerate()
+        {
+            server.reset().await;
+            mount(&server, &"a".repeat(length), 200).await;
+            if let Some(attempt) = store.attempts.lock().unwrap().first_mut() {
+                attempt.next_attempt_at = 0;
+            }
+            cycle(&worker).await;
+            let snapshot = admin.turn_state_fetcher().await.unwrap();
+            assert_eq!(snapshot.attempts[0].search_concurrency, Some(concurrency));
+            assert_eq!(snapshot.values.len(), usize::from(length == 292));
+            assert_eq!(snapshot.recent_probes.len(), index + 1);
+            let probe = snapshot.recent_probes.last().unwrap();
+            assert_eq!(probe.profile, TurnStateProbeProfile::MinimalCompat);
+            assert_eq!(probe.http_status, Some(200));
+            assert_eq!(probe.byte_length, Some(length));
+            assert_eq!(
+                probe.outcome,
+                if length == 292 {
+                    "captured"
+                } else {
+                    "non_target"
+                }
+            );
+            assert!(!probe.compressed && !probe.responses_lite);
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert!(request.headers.get("x-codex-turn-state").is_none());
+            assert!(request.headers.get("content-encoding").is_none());
+            assert!(request.headers.get("authorization").is_some());
+            assert!(request.headers.get("chatgpt-account-id").is_some());
+            let body: Value = request.body_json().unwrap();
+            assert_eq!(
+                body,
+                json!({
+                    "model": MODEL, "store": false, "stream": true,
+                    "instructions": "Reply with exactly: pong",
+                    "input": [{"role":"user", "content":[{"type":"input_text", "text":"ping"}]}]
+                })
+            );
+            for (name, expected) in [
+                ("connection", "close"),
+                ("originator", "codex-tui"),
+                ("version", "0.153.4"),
+                (
+                    "user-agent",
+                    "codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color",
+                ),
+                ("accept", "text/event-stream"),
+                ("openai-beta", "responses=experimental"),
+            ] {
+                assert_eq!(request.headers.get(name).unwrap(), expected);
+            }
+            let session =
+                uuid::Uuid::parse_str(request.headers["session_id"].to_str().unwrap()).unwrap();
+            assert!(sessions.insert(session));
+            assert!(probe.fresh_connection);
+            assert_eq!(probe.http_version.as_deref(), Some("HTTP/1.1"));
+            assert_eq!(body["model"], MODEL);
+            assert!(body.get("tools").is_none());
+            assert!(body.get("client_metadata").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_probe_never_caches_error_response_turn_state() {
+        for (status, retry_after, expected_delay) in [(429, "1", 30_000), (503, "7200", 3_600_000)]
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", retry_after)
+                        .insert_header("x-codex-turn-state", "a".repeat(292)),
+                )
+                .mount(&server)
+                .await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let mut bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(
+                    fetch_accounts(&server).await,
+                    Arc::new(TestOAuthPending::default()),
+                )
+                .with_turn_state(store),
+            )
+            .await
+            .unwrap();
+            let admin = bundle.admin_provider();
+            admin
+                .configure_turn_state_fetcher(fetch_config())
+                .await
+                .unwrap();
+            let worker = fetch_worker(&mut bundle);
+            cycle(&worker).await;
+            let snapshot = admin.turn_state_fetcher().await.unwrap();
+            assert!(snapshot.values.is_empty());
+            let attempt = &snapshot.attempts[0];
+            assert_eq!(attempt.status, "cooldown");
+            assert!(
+                (expected_delay..expected_delay + 10_000)
+                    .contains(&(attempt.next_attempt_at - attempt.attempted_at))
+            );
+            assert_eq!(snapshot.recent_probes[0].http_status, Some(status));
+            assert_eq!(snapshot.recent_probes[0].byte_length, Some(292));
+            assert!(admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.is_err());
+            cycle(&worker).await;
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -1114,35 +1274,411 @@ mod turn_state_fetcher {
         }
     }
 
-    #[tokio::test]
-    async fn fetcher_broken_dedicated_proxy_never_falls_back_to_account_or_direct() {
-        let server = MockServer::start().await;
-        mount(&server, &"x".repeat(292), 200).await;
-        let accounts = fetch_accounts(&server).await;
-        let store = Arc::new(MemoryTurnStateStore::default());
-        *store.proxy.lock().unwrap() = Some(OutboundProxy::parse("http://127.0.0.1:1").unwrap());
-        let config = valid_config();
-        let mut bundle = provider_openai::initialize(
-            config.config.clone(),
-            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
-                .with_turn_state(store),
-        )
-        .await
-        .unwrap();
-        bundle
-            .admin_provider()
-            .configure_turn_state_fetcher(fetch_config())
-            .await
-            .unwrap();
-        cycle(&fetch_worker(&mut bundle)).await;
-        let state = bundle.admin_provider().turn_state_fetcher().await.unwrap();
-        assert!(state.values.is_empty());
-        assert_eq!(state.attempts[0].status, "retrying");
-        assert!(server.received_requests().await.unwrap().is_empty());
+    async fn assert_probe_tls(stream: &mut tokio::net::TcpStream, minimal: bool) {
+        use bytes::{Buf, Bytes};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut header = [0; 5];
+        stream.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[0], 22);
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        assert!(length <= 16384);
+        let mut record = vec![0; length];
+        stream.read_exact(&mut record).await.unwrap();
+        if minimal {
+            let mut hello = Bytes::from(record);
+            assert_eq!(hello.get_u8(), 1);
+            hello.advance(3 + 2 + 32);
+            let session = usize::from(hello.get_u8());
+            hello.advance(session);
+            let ciphers = usize::from(hello.get_u16());
+            hello.advance(ciphers);
+            let compression = usize::from(hello.get_u8());
+            hello.advance(compression);
+            let size = usize::from(hello.get_u16());
+            assert_eq!(size, hello.len());
+            let mut extensions = std::collections::BTreeMap::new();
+            while hello.has_remaining() {
+                let kind = hello.get_u16();
+                let length = usize::from(hello.get_u16());
+                extensions.insert(kind, hello.split_to(length));
+            }
+            // ring 的 X25519/P-256/P-384，不能混入正常业务 aws-lc 的 MLKEM/P-521。
+            assert_eq!(extensions[&10].as_ref(), &[0, 6, 0, 29, 0, 23, 0, 24]);
+            assert_eq!(extensions[&16].as_ref(), b"\x00\x09\x08http/1.1");
+        }
+        stream.write_all(&[21, 3, 3, 0, 2, 2, 40]).await.unwrap();
     }
 
     #[tokio::test]
-    async fn fetcher_ignores_retry_after_for_scheduling_and_config_change_cancels_inflight() {
+    async fn static_and_dynamic_probes_tunnel_tls_through_the_selected_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for dynamic in [false, true] {
+            for profile in [
+                TurnStateProbeProfile::MinimalCompat,
+                TurnStateProbeProfile::CodexCore,
+            ] {
+                let control = MockServer::builder().start().await;
+                let account_gateway = MockServer::builder().start().await;
+                let accounts = fetch_accounts(&account_gateway).await;
+                if !dynamic {
+                    accounts
+                        .set_openai_base_url(ACCOUNT, Some("https://probe.invalid".to_owned()))
+                        .await;
+                }
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+                let capture = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(socket.read_u8().await.unwrap());
+                    }
+                    let header = String::from_utf8(header).unwrap().to_lowercase();
+                    let target = if dynamic {
+                        "chatgpt.com"
+                    } else {
+                        "probe.invalid"
+                    };
+                    assert!(header.starts_with(&format!("connect {target}:443 http/1.1\r\n")));
+                    assert!(header.contains("proxy-authorization: basic "));
+                    assert!(!header.contains("bearer"));
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await
+                        .unwrap();
+                    assert_probe_tls(&mut socket, profile == TurnStateProbeProfile::MinimalCompat)
+                        .await;
+                });
+                let store = Arc::new(MemoryTurnStateStore::default());
+                let mut config = valid_config();
+                let token = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(
+                    token.path(),
+                    "test-control-secret-with-at-least-32-characters",
+                )
+                .unwrap();
+                if dynamic {
+                    Mock::given(method("GET")).and(path("/v1/status"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{"id":"azure","intervalSeconds":3600,"families":["ipv4"]}]})))
+                        .mount(&control).await;
+                    Mock::given(method("POST")).and(path("/v1/leases"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state":"ready","ip":"203.0.113.42","proxyUrl":proxy_url,"secret":"test-lease-secret"})))
+                        .mount(&control).await;
+                    Mock::given(method("DELETE"))
+                        .respond_with(ResponseTemplate::new(200))
+                        .mount(&control)
+                        .await;
+                    config.config.dynamic_egress =
+                        Some(provider_openai::config::DynamicEgressConfig {
+                            url: control.uri(),
+                            token_file: token.path().to_owned(),
+                        });
+                } else {
+                    *store.proxy.lock().unwrap() = Some(
+                        OutboundProxy::parse(&proxy_url.replacen(
+                            "http://",
+                            "http://probe-user:probe-password@",
+                            1,
+                        ))
+                        .unwrap(),
+                    );
+                }
+                let mut bundle = provider_openai::initialize(
+                    config.config,
+                    provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                        .with_turn_state(store.clone()),
+                )
+                .await
+                .unwrap();
+                let mut selected = fetch_config();
+                selected.probe_profile = profile;
+                if dynamic {
+                    selected.dynamic_egress = Some(DynamicEgressSelection {
+                        instance: "azure".to_owned(),
+                        family: "ipv4".to_owned(),
+                    });
+                }
+                bundle
+                    .admin_provider()
+                    .configure_turn_state_fetcher(selected)
+                    .await
+                    .unwrap();
+                let worker = fetch_worker(&mut bundle);
+                let stop = CancellationToken::new();
+                let context = WorkerCycleContext::new(worker.0.clone(), None, stop.clone());
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    let finish = async {
+                        capture.await.unwrap();
+                        while store.attempts.lock().unwrap().is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                        stop.cancel();
+                    };
+                    let (result, ()) = tokio::join!(worker.1.run_cycle(context), finish);
+                    result.unwrap();
+                })
+                .await
+                .unwrap();
+                if dynamic {
+                    let lease_id = store.probes.lock().unwrap()[0].lease_id.clone().unwrap();
+                    // 等待异步 Drop 的清理完成，再销毁控制面，避免迟到 DELETE 污染下个测试。
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if control.received_requests().await.unwrap().iter().any(|r| {
+                                r.method.as_str() == "DELETE"
+                                    && r.url.path() == format!("/v1/leases/{lease_id}")
+                            }) {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                assert!(store.values.lock().unwrap().is_empty());
+                let unexpected = account_gateway.received_requests().await.unwrap();
+                assert!(
+                    unexpected.is_empty(),
+                    "dynamic={dynamic}, profile={profile:?}, unexpected={:?}",
+                    unexpected
+                        .iter()
+                        .map(|r| (r.method.as_str(), r.url.path()))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(store.probes.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_probe_profile_uses_the_dedicated_http_proxy_without_redirects() {
+        for profile in [
+            TurnStateProbeProfile::MinimalCompat,
+            TurnStateProbeProfile::CodexCore,
+        ] {
+            for status in [200, 307, 407, 502] {
+                let direct = MockServer::start().await;
+                mount(&direct, &"d".repeat(292), 200).await;
+                let proxy = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("location", format!("{}/codex/responses", direct.uri()))
+                            .insert_header("x-codex-turn-state", "p".repeat(292))
+                            .set_body_string(COMPLETED_SESSION_SSE),
+                    )
+                    .mount(&proxy)
+                    .await;
+                let store = Arc::new(MemoryTurnStateStore::default());
+                *store.proxy.lock().unwrap() = Some(
+                    OutboundProxy::parse(&proxy.uri().replacen(
+                        "http://",
+                        "http://probe-user:probe-password@",
+                        1,
+                    ))
+                    .unwrap(),
+                );
+                let mut bundle = provider_openai::initialize(
+                    valid_config().config,
+                    provider_ports_with(
+                        fetch_accounts(&direct).await,
+                        Arc::new(TestOAuthPending::default()),
+                    )
+                    .with_turn_state(store.clone()),
+                )
+                .await
+                .unwrap();
+                let mut selected = fetch_config();
+                selected.probe_profile = profile;
+                bundle
+                    .admin_provider()
+                    .configure_turn_state_fetcher(selected)
+                    .await
+                    .unwrap();
+                cycle(&fetch_worker(&mut bundle)).await;
+                assert!(direct.received_requests().await.unwrap().is_empty());
+                let requests = proxy.received_requests().await.unwrap();
+                assert_eq!(
+                    requests.len(),
+                    1,
+                    "redirects and failures must not replay probes"
+                );
+                assert!(requests[0].headers.contains_key("proxy-authorization"));
+                assert_eq!(
+                    requests[0].headers.contains_key("content-encoding"),
+                    profile == TurnStateProbeProfile::CodexCore
+                );
+                assert_eq!(
+                    store.values.lock().unwrap().len(),
+                    usize::from(status == 200)
+                );
+                assert!(store.probes.lock().unwrap()[0].fresh_connection);
+            }
+        }
+    }
+
+    async fn accept_probe_socks(stream: &mut tokio::net::TcpStream) -> (String, u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        assert_eq!(stream.read_u8().await.unwrap(), 5);
+        let count = stream.read_u8().await.unwrap();
+        let mut methods = vec![0; usize::from(count)];
+        stream.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&2));
+        stream.write_all(&[5, 2]).await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), 1);
+        let length = stream.read_u8().await.unwrap();
+        let mut user = vec![0; usize::from(length)];
+        stream.read_exact(&mut user).await.unwrap();
+        let length = stream.read_u8().await.unwrap();
+        let mut password = vec![0; usize::from(length)];
+        stream.read_exact(&mut password).await.unwrap();
+        assert_eq!(user, b"probe-user");
+        assert_eq!(password, b"probe-password");
+        stream.write_all(&[1, 0]).await.unwrap();
+        let mut command = [0; 4];
+        stream.read_exact(&mut command).await.unwrap();
+        // 即使配置 socks5://，探测也须把域名交给代理解析，而非本机 DNS。
+        assert_eq!(command, [5, 1, 0, 3]);
+        let length = stream.read_u8().await.unwrap();
+        let mut host = vec![0; usize::from(length)];
+        stream.read_exact(&mut host).await.unwrap();
+        let port = stream.read_u16().await.unwrap();
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+            .await
+            .unwrap();
+        (String::from_utf8(host).unwrap(), port)
+    }
+
+    #[tokio::test]
+    async fn every_probe_profile_uses_socks_remote_dns_auth_and_a_new_connection_per_attempt() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for profile in [
+            TurnStateProbeProfile::MinimalCompat,
+            TurnStateProbeProfile::CodexCore,
+        ] {
+            for scheme in ["socks5", "socks5h"] {
+                let direct = MockServer::start().await;
+                let accounts = fetch_accounts(&direct).await;
+                accounts
+                    .set_openai_base_url(ACCOUNT, Some("http://localhost:8080".to_owned()))
+                    .await;
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let proxy = format!(
+                    "{scheme}://probe-user:probe-password@{}",
+                    listener.local_addr().unwrap()
+                );
+                let capture = tokio::spawn(async move {
+                    for _ in 0..2 {
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        assert_eq!(
+                            accept_probe_socks(&mut stream).await,
+                            ("localhost".to_owned(), 8080)
+                        );
+                        let mut request = Vec::new();
+                        let (head_end, content_length) = loop {
+                            request.push(stream.read_u8().await.unwrap());
+                            if let Some(end) = request.windows(4).position(|p| p == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&request[..end]);
+                                assert!(head.starts_with("POST /codex/responses HTTP/1.1\r\n"));
+                                assert!(!head.to_lowercase().contains("proxy-authorization"));
+                                let length = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (name, value) = line.split_once(':')?;
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap();
+                                break (end + 4, length);
+                            }
+                        };
+                        request.resize(head_end + content_length, 0);
+                        stream.read_exact(&mut request[head_end..]).await.unwrap();
+                        if profile == TurnStateProbeProfile::MinimalCompat {
+                            // 字节级断言，覆盖排序、无压缩、无多余字段，不只比较 JSON 语义。
+                            assert_eq!(&request[head_end..], format!(r#"{{"input":[{{"content":[{{"text":"ping","type":"input_text"}}],"role":"user"}}],"instructions":"Reply with exactly: pong","model":"{MODEL}","store":false,"stream":true}}"#).as_bytes());
+                        }
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nx-codex-turn-state: {}\r\n\r\n{}", COMPLETED_SESSION_SSE.len(), "s".repeat(312), COMPLETED_SESSION_SSE).as_bytes()).await.unwrap();
+                        // 服务端保留连接；客户端必须关闭，不能将下一次探测写入同一连接。
+                        assert_eq!(
+                            stream.read_u8().await.unwrap_err().kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                        );
+                    }
+                });
+                let store = Arc::new(MemoryTurnStateStore::default());
+                *store.proxy.lock().unwrap() = Some(OutboundProxy::parse(&proxy).unwrap());
+                let mut bundle = provider_openai::initialize(
+                    valid_config().config,
+                    provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                        .with_turn_state(store.clone()),
+                )
+                .await
+                .unwrap();
+                let mut selected = fetch_config();
+                selected.probe_profile = profile;
+                bundle
+                    .admin_provider()
+                    .configure_turn_state_fetcher(selected)
+                    .await
+                    .unwrap();
+                let worker = fetch_worker(&mut bundle);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    for _ in 0..2 {
+                        if let Some(attempt) = store.attempts.lock().unwrap().first_mut() {
+                            attempt.next_attempt_at = 0;
+                        }
+                        cycle(&worker).await;
+                    }
+                    capture.await.unwrap();
+                })
+                .await
+                .unwrap();
+                assert_eq!(store.probes.lock().unwrap().len(), 2);
+                assert!(direct.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetcher_broken_dedicated_proxy_never_falls_back_to_account_or_direct() {
+        for profile in [
+            TurnStateProbeProfile::MinimalCompat,
+            TurnStateProbeProfile::CodexCore,
+        ] {
+            let server = MockServer::start().await;
+            mount(&server, &"x".repeat(292), 200).await;
+            let accounts = fetch_accounts(&server).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            *store.proxy.lock().unwrap() =
+                Some(OutboundProxy::parse("http://127.0.0.1:1").unwrap());
+            let config = valid_config();
+            let mut bundle = provider_openai::initialize(
+                config.config.clone(),
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                    .with_turn_state(store),
+            )
+            .await
+            .unwrap();
+            let mut selected = fetch_config();
+            selected.probe_profile = profile;
+            bundle
+                .admin_provider()
+                .configure_turn_state_fetcher(selected)
+                .await
+                .unwrap();
+            cycle(&fetch_worker(&mut bundle)).await;
+            let state = bundle.admin_provider().turn_state_fetcher().await.unwrap();
+            assert!(state.values.is_empty());
+            assert_eq!(state.attempts[0].status, "retrying");
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fetcher_honors_retry_after_and_config_change_cancels_inflight() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "600"))
@@ -1169,10 +1705,15 @@ mod turn_state_fetcher {
         cycle(&worker).await;
         let state = admin.turn_state_fetcher().await.unwrap();
         assert!(
-            (state.attempts[0].attempted_at + 9000..=state.attempts[0].attempted_at + 30000)
+            (state.attempts[0].attempted_at + 600_000..=state.attempts[0].attempted_at + 610_000)
                 .contains(&state.attempts[0].next_attempt_at),
-            "Retry-After must not create a long fetcher backoff"
+            "Retry-After must delay the next probe"
         );
+        assert_eq!(state.attempts[0].status, "cooldown");
+        assert_eq!(state.attempts[0].search_concurrency, Some(1));
+        assert!(admin.run_turn_state_fetcher(ACCOUNT, MODEL).await.is_err());
+        cycle(&worker).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
         server.reset().await;
         Mock::given(method("POST"))
             .respond_with(

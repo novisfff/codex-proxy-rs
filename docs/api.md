@@ -685,21 +685,25 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 312 字节 Turn State 时拦截。未启用获取器、其他模式、其他返回长度或已有有效缓存均保持原行为。
 下游尚未提交时返回 HTTP 503，错误码 `turn_state_unavailable`，提示不存在有效 Turn State、正在尝试获取。
 `Retry-After` 按同账号/模型连续拦截次数依次为 30、60、180、300、600 秒，之后保持 600 秒。
-获得有效 292 或获取器配置版本改变后重置；计数在内存中，服务重启也重置。后台获取器的 10 秒重试不受影响。
+获得有效 292 或获取器配置版本改变后重置；计数在内存中，服务重启也重置。后台获取器按自身出口调度和冷却规则重试。
 若流式响应已经开始，只能发送流内错误及文字重试提示，无法补发 HTTP 状态码和响应头；客户端是否自动重试由其实现决定。
 
 以下接口仅管理员可用：
 
 | 方法 | 路径 | 请求 / 响应 |
 | --- | --- | --- |
-| GET | `/api/admin/turn-state-fetcher` | `configs`、`values`、`attempts`、`running`、`dynamicEgress` |
-| POST | `/api/admin/turn-state-fetcher/configure` | `{accountId, enabled, models, proxyId, dynamicEgress, schedule, revision}` |
+| GET | `/api/admin/turn-state-fetcher` | `configs`、`values`、`attempts`、`recentProbes`、`running`、`dynamicEgress` |
+| POST | `/api/admin/turn-state-fetcher/configure` | `{accountId, enabled, models, proxyId, dynamicEgress, schedule, probeProfile, adaptiveConcurrency, revision}` |
 | POST | `/api/admin/turn-state-fetcher/run` | `{accountId, model}`，为已启用模型排队 |
 | POST | `/api/admin/turn-state-fetcher/egress` | `{revision, instances}`，instances 以实例 ID 为键，暂停动态获取后更新 |
 
 `models` 为最多 32 个不同的上游模型名，开启时不能为空；两个出口字段均为 null 时明确选择直连。
+`probeProfile` 为 `minimal_compat` 或 `codex_core`，前者对 OAuth 账号按 codex-state-kit `4307f98` 的获取请求发送 `ping`、`Reply with exactly: pong`、固定 `codex-tui/0.153.4` 身份和每次独立的 `session_id`，不携带历史、Turn State、压缩或 Responses Lite；后者保留完整 Codex Responses 请求；省略时兼容旧客户端使用 `codex_core`。
+`adaptiveConcurrency` 控制 SOCKS5 动态出口是否根据最近探测结果调整同账号、同模型的搜索并发；省略时兼容旧客户端保持关闭。初始搜索并发为 3，收到成功 HTTP 响应但返回 312 时逐步提高至 5、8；仍受实例最大并发约束。获取到有效新值后重置为 3，遇到 429/503 降回 1 并进入冷却。
+迁移 0022 将已有获取器配置设为 `minimal_compat` 并开启自适应并发；管理端新配置也使用这两个默认值，可在账号获取配置中切回完整模式。
 `dynamicEgress` 为 `{instance, family}`，family 只能是 `ipv4` 或 `ipv6`，与非空 `proxyId` 互斥。
 旧请求省略 `dynamicEgress` 等同 null。动态出口严格使用所选地址类型，不回退到其他出口。
+两种探测画像的静态与动态出口均使用独立 HTTP/1.1 连接，不复用连接、不自动重放或跟随重定向；配置了代理时，连接或认证失败不会回退到直连或账号业务代理。静态 SOCKS5 的目标域名由代理解析（`socks5://` 在探测中按 `socks5h://` 处理），未配置出口时才显式直连，环境代理不参与选择。兼容画像使用独立的 rustls/ring TLS 配置，不改变完整画像或正常业务的 TLS 配置。
 `schedule` 省略或为 null 表示全天；指定 `{startMinute, endMinute}` 表示每天北京时间的探测窗口。
 两个值均为 0–1439 的整数且不能相等；例如 `{startMinute:540,endMinute:60}` 表示 09:00–次日 01:00。
 开始时间包含、结束时间不包含；时段外不发起探测，结束时取消在途探测及动态 IP 申请。
@@ -711,7 +715,7 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 `port` 为 1–65535 的整数。新建实例必须提交用户名和密码；
 编辑相同实例 ID 时省略 `password` 或传空字符串保留原密码。状态返回 `passwordSet`，不返回 `password`；
 提交配置时不携带 `passwordSet`。认证信息由出口服务持久化，配置接口不再接受 `credentialRef`。
-所有出口实例接受 `maxConcurrent` 和 `intervalSeconds`，省略时分别为 1 和 10。
+所有出口实例接受 `maxConcurrent` 和 `intervalSeconds`，接口省略时分别为 1 和 10。管理端新建 SOCKS5 实例预填 5 和 1；已有实例保留其配置，需要在实例编辑中调整。
 `maxConcurrent` 为 1–16 的整数，Azure 只接受 1；`intervalSeconds` 为 0–3600 的整数，表示同一实例相邻尝试启动的最短秒数，0 表示不限间隔。
 同一实例下账号和模型共享并发与间隔限制；同一账号、同一模型允许并发搜索，获取到有效新值后取消其余搜索。
 账号自身并发限制、账号状态校验及动态出口的并发/间隔限制仍然生效。Azure 同一出口服务内仍串行管理公网 IP。
@@ -725,8 +729,8 @@ SOCKS5 实例沿用 `bindings:{ipv4:{}}` 选择入口，每个租约创建新连
 
 `values` 包含账号、模型、原值、来源 `traffic` / `fetcher`、`acquiredAt`、`lastSeenAt`、`expiresAt`；
 这些时间为 Unix 毫秒，过期值仍可在此接口查看。原值仅供管理员复制，不进入客户用量记录。
-获取器发出的每次探测请求都会在最前面的用户输入中加入新的随机数字前缀，随后才是固定的简短提示；
-前缀由随机种子和单调计数器共同生成，保证并发探测的请求体不重复，同时仍不携带 Turn State。
+`codex_core` 探测会在最前面的用户输入中加入新的随机数字前缀，随后才是固定的简短提示；前缀由随机种子和单调计数器共同生成，
+保证并发探测的请求体不重复。`minimal_compat` 使用固定的单字符输入以兼容轻量探测器；两种模式都不携带 Turn State。
 `attempts` 返回最近一次的状态、返回长度、输入/输出 token 数（无法获得时为 null）、耗时、下一次尝试时间和安全错误说明。
 `running` 为正在获取的 `[accountId, model]`，没有任务时为 null。
 `attempts.exitIp` 为本次租约分配且通过出站验证的地址，无租约时为 null。
@@ -737,10 +741,11 @@ SOCKS5 实例沿用 `bindings:{ipv4:{}}` 选择入口，每个租约创建新连
 实例保存只修改配置；网络预检和分配发生在下一次获取中。
 实例更新携带 `dynamicEgress.revision` 防止并发覆盖；首次为 0，保存成功后递增。
 
-全局并发为 1，复用账号并发限制，账号繁忙则延后。未返回可用的新 292 字节值时，静态出口从本次尝试结束起固定等待
-10 秒重试；动态出口按实例的 `intervalSeconds` 控制相邻尝试启动间隔。无论是连接、动态出口分配还是 429 等可重试错误，
-都不再按失败次数指数退避、不读取上游 `Retry-After`，也不附加随机延迟。任务每秒检查一次，排队及新 IP 就绪可能增加实际等待时间。
-手动排队可以立即重启失败的任务；账号、模型或专用代理配置无效会暂停，修复后重新保存配置恢复。
+静态出口保持单并发；动态 SOCKS5 出口按实例的 `maxConcurrent` 和 `intervalSeconds` 共享调度，并继续遵守账号自身并发限制。静态出口未获得有效新值时从尝试结束起等待 10 秒。
+开启 `adaptiveConcurrency` 后，探测器依据最近 HTTP 状态和返回长度在 1–8 路之间调整搜索并发；拿到 292 后取消同批次其余请求，返回 429/503 时取消同账号模型的在途请求，按
+`Retry-After`（至少 30 秒、最多 1 小时）冷却后再试。动态出口的其他连接错误按实例间隔重试，不增加随机等待。任务每秒检查一次，排队及出口准备可能增加实际等待时间。
+`recentProbes` 仅保留最近 200 条探测的状态、长度、耗时、请求配置和出口元数据，不保存请求正文、Token 或代理认证信息；可用于区分 292、312、重复值和连接失败。
+手动排队可以立即重启普通失败任务，但不能跳过限流冷却；账号、模型或专用代理配置无效会暂停，修复后重新保存配置恢复。
 动态 IP 分配阶段不占用账号并发；分配后重新核对配置、账号和额度。每次重试获得新租约。
 暂停或修改配置取消正在进行的请求。默认未启用，获取任务会消耗对应上游账号的额度。
 

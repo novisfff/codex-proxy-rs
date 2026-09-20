@@ -2,7 +2,7 @@
 import type { Account, OutboundProxyRecord } from '@/api'
 import type { EgressInstance, FetcherConfig, FetcherSnapshot } from '@/api/modules/turn-state-fetcher'
 import { Copy, Pencil, RefreshCw } from '@lucide/vue'
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { getAccountDetail, getAccountModels, getAccounts, getProxies } from '@/api'
 import { configureDynamicEgress, configureFetcher, getFetcher, runFetcher } from '@/api/modules/turn-state-fetcher'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -53,7 +53,7 @@ const instancesEditable = computed(() => !!snapshot.value.dynamicEgress?.availab
 const dynamicOptions = computed(() => snapshot.value.dynamicEgress?.instances.map(instance => ({ label: instance.name, value: instance.id })) ?? [])
 const familyOptions = computed(() => (snapshot.value.dynamicEgress?.instances.find(instance => instance.id === dynamicInstance.value)?.families ?? []).map(family => ({ label: family === 'ipv4' ? 'IPv4' : 'IPv6', value: family })))
 const editOpen = ref(false)
-const form = ref<FetcherConfig>({ accountId: '', enabled: false, models: [], proxyId: null, revision: 0 })
+const form = ref<FetcherConfig>({ accountId: '', enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, revision: 0 })
 const scheduleMode = ref('all')
 const scheduleStart = ref('09:00')
 const scheduleEnd = ref('01:00')
@@ -91,6 +91,35 @@ function editInstance(id = '') {
   }
   instanceOpen.value = true
 }
+watch(() => instanceForm.value.provider, (provider) => {
+  if (!originalInstanceId.value) {
+    instanceForm.value.maxConcurrent = provider === 'socks5' ? 5 : 1
+    instanceForm.value.intervalSeconds = provider === 'socks5' ? 1 : 10
+  }
+})
+
+const profileOptions = [
+  { label: '极简兼容（实验）', value: 'minimal_compat' },
+  { label: '完整 Codex 请求', value: 'codex_core' },
+]
+function profileLabel(profile?: string) {
+  return profile === 'minimal_compat' ? '极简兼容' : '完整 Codex'
+}
+const outcomeLabels: Record<string, string> = { captured: '已获取', non_target: '非目标长度', repeated: '重复旧值', failed: '未获取', cooldown: '冷却', paused: '需要处理', cancelled: '已取消', stale: '结果已失效' }
+const historyAccount = ref('')
+const historyModel = ref('')
+const historyAccountOptions = computed(() => [{ label: '全部账号', value: '' }, ...accounts.value.map(a => ({ label: a.name, value: a.id }))])
+const recentProbes = computed(() => (snapshot.value.recentProbes ?? []).filter(p => (!historyAccount.value || p.accountId === historyAccount.value) && (!historyModel.value.trim() || p.model.includes(historyModel.value.trim()))))
+const probeSummary = computed(() => profileOptions.map(({ value, label }) => {
+  const probes = recentProbes.value.filter(p => p.profile === value)
+  const responses = probes.filter(p => p.httpStatus !== null)
+  const count = (length: number) => responses.filter(p => p.httpStatus === 200 && p.byteLength === length).length
+  return { label, total: probes.length, responses: responses.length, good: count(292), other: count(312) }
+}))
+function accountName(id: string) {
+  return accounts.value.find(a => a.id === id)?.name ?? id
+}
+
 function instanceConfig(instance: EgressInstance): EgressInstance {
   const scheduling = { maxConcurrent: instance.provider === 'azure' ? 1 : instance.maxConcurrent ?? 1, intervalSeconds: instance.intervalSeconds ?? 10 }
   const config = ['socks5', 'novaproxy'].includes(instance.provider)
@@ -133,7 +162,7 @@ async function saveInstance(remove = false) {
 }
 
 function config(accountId: string): FetcherConfig {
-  return snapshot.value.configs.find(c => c.accountId === accountId) ?? { accountId, enabled: false, models: [], proxyId: null, revision: 0 }
+  return snapshot.value.configs.find(c => c.accountId === accountId) ?? { accountId, enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, revision: 0 }
 }
 function timeLabel(minute: number) {
   return `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`
@@ -164,8 +193,9 @@ function rows(accountId: string) {
     const attempt = snapshot.value.attempts.find(a => a.accountId === accountId && a.model === model && a.configRevision === selected.revision)
     const running = runningRequests.value.filter(([account, currentModel]) => account === accountId && currentModel === model).length
     const expired = !!value && value.expiresAt <= now.value
-    const status = !selected.enabled ? '已暂停' : !inSchedule(selected) ? '时段外 · 等待开启' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
-    return { model, value, attempt, running, expired, status }
+    const cooling = attempt?.status === 'cooldown' && attempt.nextAttemptAt > now.value
+    const status = !selected.enabled ? '已暂停' : !inSchedule(selected) ? '时段外 · 等待开启' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : cooling ? '限流冷却' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
+    return { model, value, attempt, running, expired, cooling, status }
   })
 }
 function date(value?: number) {
@@ -228,7 +258,7 @@ async function load() {
 }
 async function edit(account: Account) {
   const generation = ++formGeneration
-  form.value = { ...config(account.id), models: [...config(account.id).models] }
+  form.value = { ...config(account.id), probeProfile: config(account.id).probeProfile ?? 'minimal_compat', adaptiveConcurrency: config(account.id).adaptiveConcurrency ?? true, models: [...config(account.id).models] }
   scheduleMode.value = form.value.schedule ? 'custom' : 'all'
   scheduleStart.value = timeLabel(form.value.schedule?.startMinute ?? 540)
   scheduleEnd.value = timeLabel(form.value.schedule?.endMinute ?? 60)
@@ -307,7 +337,7 @@ async function run(accountId: string, model: string) {
   await action.run(async () => {
     await runFetcher({ accountId, model })
     await refresh()
-    toast.success('已排队，后台将依次获取')
+    toast.success('已排队，后台将按出口策略获取')
   })
 }
 onMounted(load)
@@ -334,7 +364,49 @@ onBeforeUnmount(() => {
       <BaseButton :variant="tab === 'egress' ? 'primary' : 'secondary'" @click="tab = 'egress'">
         动态出口
       </BaseButton>
+      <BaseButton :variant="tab === 'history' ? 'primary' : 'secondary'" @click="tab = 'history'">
+        探测记录
+      </BaseButton>
     </div>
+    <BaseCard v-if="tab === 'history'" title="最近探测" description="保留全站最近 200 条尝试。按账号、模型筛选后对照请求模式；不同时间和出口的结果不能直接视为等量实验。">
+      <div class="grid gap-3 sm:grid-cols-2">
+        <BaseSelect v-model="historyAccount" :options="historyAccountOptions" aria-label="筛选探测账号" />
+        <BaseInput v-model="historyModel" placeholder="筛选模型" aria-label="筛选探测模型" />
+      </div>
+      <div class="my-4 grid gap-3 sm:grid-cols-2">
+        <div v-for="summary in probeSummary" :key="summary.label" class="rounded-cp bg-cp-fill-quaternary p-3 text-cp-sm">
+          <strong>{{ summary.label }}</strong>
+          <p>{{ summary.total }} 次尝试 · {{ summary.responses }} 次收到 HTTP 响应</p>
+          <p>HTTP 200：292 × {{ summary.good }} · 312 × {{ summary.other }}</p>
+        </div>
+      </div>
+      <p v-if="!recentProbes.length" class="text-cp-sm text-cp-text-secondary">
+        暂无匹配的探测记录。
+      </p>
+      <div class="grid gap-3">
+        <section v-for="probe in recentProbes" :key="probe.id" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-3 text-cp-sm">
+          <div class="flex flex-wrap gap-2">
+            <strong class="break-all">{{ accountName(probe.accountId) }} · {{ probe.model }}</strong>
+            <span>{{ profileLabel(probe.profile) }}</span>
+            <span :class="probe.outcome === 'captured' ? 'text-cp-success' : 'text-cp-text-secondary'">{{ outcomeLabels[probe.outcome] ?? probe.outcome }}</span>
+          </div>
+          <p class="text-cp-text-secondary">
+            {{ date(probe.startedAt) }} · HTTP {{ probe.httpStatus ?? '未收到' }} · {{ probe.byteLength ?? '无' }} 字节 · {{ probe.durationMs }} ms<span v-if="probe.repeated"> · 重复票据</span>
+          </p>
+          <details class="text-cp-xs text-cp-text-secondary">
+            <summary class="cursor-pointer">
+              连接与批次详情
+            </summary>
+            <div class="mt-2 grid gap-1 break-all">
+              <span>批次：{{ probe.batchId }} · 配置版本：{{ probe.configRevision }}</span>
+              <span>请求：{{ probe.endpoint ?? '未发送' }} · {{ probe.httpVersion ?? '协议未知' }} · Lite {{ probe.responsesLite ? '开' : '关' }} · {{ probe.compressed ? 'zstd' : '普通 JSON' }}</span>
+              <span>出口：{{ probe.egressInstance ?? '静态 / 直连' }} · IP {{ probe.exitIp ?? '未验证' }} · {{ probe.freshConnection ? '独立连接' : '允许连接复用 / 尚未连接' }}</span>
+              <span>租约：{{ probe.leaseId ?? '无' }} · 尝试：{{ probe.id }}</span>
+            </div>
+          </details>
+        </section>
+      </div>
+    </BaseCard>
     <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；通用 SOCKS5 代理。仅用于 292 获取器。">
       <p :class="snapshot.dynamicEgress?.available ? 'text-cp-success' : 'text-cp-warning'">
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
@@ -371,7 +443,7 @@ onBeforeUnmount(() => {
     <template v-if="tab === 'accounts'">
       <BaseCard>
         <p class="m-0 text-cp-sm text-cp-text-secondary">
-          预计有效 60 分钟，剩余 20 分钟开始续期。全站一次获取一个任务；普通请求返回新值时自动顺延。相同值不会延长有效期。
+          预计有效 60 分钟，剩余 20 分钟开始续期。动态 SOCKS5 支持并发搜索；普通请求返回新值时自动顺延。相同值不会延长有效期。
         </p>
         <BaseInput v-model="search" class="mt-4 max-w-md" placeholder="搜索账号名称或邮箱" aria-label="搜索获取器账号" />
       </BaseCard>
@@ -397,7 +469,7 @@ onBeforeUnmount(() => {
           尚未选择模型。配置后可自动获取，也可手动触发一次。
         </p>
         <p class="text-cp-sm text-cp-text-secondary">
-          探测时段：{{ scheduleLabel(config(account.id)) }}
+          探测时段：{{ scheduleLabel(config(account.id)) }} · {{ profileLabel(config(account.id).probeProfile) }} · {{ config(account.id).adaptiveConcurrency ? '自适应并发' : '固定并发' }}
         </p>
         <div class="mt-4 grid gap-4">
           <section v-for="row in rows(account.id)" :key="row.model" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-4">
@@ -431,6 +503,7 @@ onBeforeUnmount(() => {
               <span v-if="row.attempt.exitIp" class="break-all">本次出口 IP：{{ row.attempt.exitIp }}</span>
               <span v-else-if="isSocks5(account.id)">本次出口 IP：未验证（SOCKS5）</span>
               <span>返回长度：{{ row.attempt.byteLength ?? '未返回' }} · 耗时：{{ row.attempt.durationMs }} ms · 输入 / 输出 token：{{ row.attempt.inputTokens ?? '未知' }} / {{ row.attempt.outputTokens ?? '未知' }}</span>
+              <span v-if="config(account.id).adaptiveConcurrency && isSocks5(account.id)">搜索目标并发：{{ row.attempt.searchConcurrency ?? 3 }}（仍受出口和账号上限约束）</span>
               <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.expiresAt - 1200000 : 0)) }}</span>
             </div>
           </section>
@@ -450,10 +523,10 @@ onBeforeUnmount(() => {
         </BaseFormItem>
         <div class="grid grid-cols-2 gap-4">
           <BaseFormItem :label="instanceForm.provider === 'azure' ? '最大并发数（Azure 固定 1）' : '最大并发数'">
-            <BaseInput :model-value="String(instanceForm.provider === 'azure' ? 1 : instanceForm.maxConcurrent ?? 1)" type="number" min="1" max="16" :disabled="saving || instanceForm.provider === 'azure'" @update:model-value="instanceForm.maxConcurrent = Number($event)" />
+            <BaseInput :model-value="String(instanceForm.provider === 'azure' ? 1 : instanceForm.maxConcurrent ?? 5)" type="number" min="1" max="16" :disabled="saving || instanceForm.provider === 'azure'" @update:model-value="instanceForm.maxConcurrent = Number($event)" />
           </BaseFormItem>
           <BaseFormItem label="尝试间隔（秒）">
-            <BaseInput :model-value="String(instanceForm.intervalSeconds ?? 10)" type="number" min="0" max="3600" :disabled="saving" @update:model-value="instanceForm.intervalSeconds = Number($event)" />
+            <BaseInput :model-value="String(instanceForm.intervalSeconds ?? (instanceForm.provider === 'socks5' ? 1 : 10))" type="number" min="0" max="3600" :disabled="saving" @update:model-value="instanceForm.intervalSeconds = Number($event)" />
           </BaseFormItem>
         </div>
         <template v-if="instanceForm.provider === 'socks5'">
@@ -513,6 +586,18 @@ onBeforeUnmount(() => {
         <div class="flex items-center justify-between">
           <span class="text-cp-text">自动获取</span><BaseSwitch v-model="form.enabled" label="开启自动获取" :disabled="saving" />
         </div>
+        <BaseFormItem label="探测请求模式">
+          <BaseSelect v-model="form.probeProfile" :options="profileOptions" :disabled="saving" />
+          <p class="text-cp-xs text-cp-text-secondary">
+            极简兼容用于 OAuth 账号的对照探测，可随时切回完整模式。API Key 账号沿用公开接口格式。模式不改变业务请求。
+          </p>
+        </BaseFormItem>
+        <div class="flex items-center justify-between gap-3">
+          <span>自适应并发（动态 SOCKS5）</span><BaseSwitch v-model="form.adaptiveConcurrency" label="启用自适应并发" :disabled="saving" />
+        </div>
+        <p class="text-cp-xs text-cp-text-secondary">
+          从 3 路开始，收到 312 后升至 5、8 路，始终受出口实例和账号上限约束。429/503 冷却后从 1 路恢复；命中后取消其他搜索。
+        </p>
         <BaseFormItem label="探测时段">
           <BaseSelect v-model="scheduleMode" :options="[{ label: '全天', value: 'all' }, { label: '固定时段', value: 'custom' }]" :disabled="saving" />
         </BaseFormItem>
@@ -560,7 +645,7 @@ onBeforeUnmount(() => {
           此账号的请求头模式不是“自动”。获取的值会保存，但不会用于正常请求；请在账号编辑中切换模式。
         </p>
         <p class="text-cp-xs text-cp-text-secondary">
-          使用无历史的简短请求，不携带 Turn State。动态出口按实例的并发数和启动间隔搜索，其他出口未获得有效新值时等待 10 秒重试；可重试错误不使用指数退避，账号或模型错误需处理。
+          使用无历史的简短请求，不携带 Turn State。动态出口按实例的并发数和启动间隔搜索，其他出口未获得有效新值时等待 10 秒重试；429/503 至少冷却 30 秒并遵循 Retry-After（最多 1 小时），账号或模型错误需处理。
         </p>
       </div>
       <template #footer>

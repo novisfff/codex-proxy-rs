@@ -95,6 +95,9 @@ pub enum CustomCaError {
     /// 使用系统根证书构建 reqwest client 失败。
     #[error("Failed to build HTTP client while using system root certificates: {0}")]
     BuildClientWithSystemRoots(reqwest::Error),
+    /// 兼容探测的 TLS 算法或协议配置无效。
+    #[error("Failed to configure probe TLS: {0}")]
+    ProbeTlsConfiguration(rustls::Error),
     /// 读取系统根证书失败。
     #[error("Failed to load native root certificates for custom CA transport: {0}")]
     LoadNativeRoots(io::Error),
@@ -108,6 +111,37 @@ pub fn build_reqwest_client_with_custom_ca(
     builder: reqwest::ClientBuilder,
 ) -> CustomCaResult<reqwest::Client> {
     build_reqwest_client_with_env(&ProcessEnv, builder)
+}
+
+/// 兼容探测使用与 codex-state-kit 相同的 ring 算法集合，不改变业务 aws-lc 默认值。
+pub(crate) fn build_turn_state_compat_client(
+    builder: reqwest::ClientBuilder,
+) -> CustomCaResult<reqwest::Client> {
+    let mut roots = native_root_store().map_err(CustomCaError::LoadNativeRoots)?;
+    if let Some(bundle) = ProcessEnv.configured_ca_bundle() {
+        for (idx, cert) in bundle.load_certificates()?.into_iter().enumerate() {
+            roots
+                .add(cert)
+                .map_err(|source| CustomCaError::RegisterRustlsCertificate {
+                    source_env: bundle.source_env,
+                    path: bundle.path.clone(),
+                    certificate_index: idx + 1,
+                    source,
+                })?;
+        }
+    }
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(CustomCaError::ProbeTlsConfiguration)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    // reqwest 不会为预构建配置填充 ALPN，须显式保留 HTTP/1.1 的协商画像。
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    builder
+        .use_preconfigured_tls(config)
+        .build()
+        .map_err(CustomCaError::BuildClientWithSystemRoots)
 }
 
 /// 返回当前自定义 CA 的缓存键。

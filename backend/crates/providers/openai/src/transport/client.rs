@@ -95,6 +95,42 @@ pub fn build_account_http_client(
     Ok(clients.entry(cache_key).or_insert(client).clone())
 }
 
+/// 探测不共享业务连接池，也不重放失败请求；显式代理失效时必须关闭失败。
+pub(crate) fn build_turn_state_http_client(
+    proxy: Option<reqwest::Proxy>,
+    minimal_compat: bool,
+) -> Result<Client, CustomCaError> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(25))
+        .connect_timeout(Duration::from_secs(8));
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    if minimal_compat {
+        // 兼容获取器使用 rustls；不能继承业务客户端的 native-tls 默认值。
+        return super::tls::build_turn_state_compat_client(builder);
+    }
+    build_reqwest_client_with_custom_ca(builder)
+}
+
+/// 与兼容获取器一致，由 SOCKS 服务端解析目标域名，避免本机 DNS 选择另一出口。
+pub(crate) fn turn_state_proxy(url: &str) -> Result<reqwest::Proxy, CustomCaError> {
+    let url = url.trim();
+    let remote_dns;
+    let url = if let Some(rest) = url.strip_prefix("socks5://") {
+        remote_dns = format!("socks5h://{rest}");
+        &remote_dns
+    } else {
+        url
+    };
+    reqwest::Proxy::all(url).map_err(|_| CustomCaError::ProxyConfiguration)
+}
+
 fn egress_key(account_id: &str, proxy: Option<&gateway_core::account::OutboundProxy>) -> String {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();

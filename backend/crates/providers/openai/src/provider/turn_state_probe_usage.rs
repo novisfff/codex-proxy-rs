@@ -29,11 +29,68 @@ use crate::transport::{
     CodexBackendStreamingResponse, CodexClientError, CodexUpstreamSendPhase,
     canonical::CodexCanonicalOutcome,
 };
+use gateway_core::provider_ports::turn_state::{TurnStateProbeRecord, TurnStateStore};
 
 pub(super) struct ProbeUsage {
     store: Option<Arc<dyn ExecutionStore>>,
     finalization: Option<ModelRequestFinalization>,
     started: Instant,
+}
+
+/// 与请求 future 同生命周期，取消和超时也保留已取得的安全诊断字段。
+pub(super) struct ProbeDiagnostics {
+    store: Arc<dyn TurnStateStore>,
+    pub(super) record: Option<TurnStateProbeRecord>,
+    started: Instant,
+}
+
+impl ProbeDiagnostics {
+    pub(super) fn new(store: Arc<dyn TurnStateStore>, record: TurnStateProbeRecord) -> Self {
+        Self {
+            store,
+            record: Some(record),
+            started: Instant::now(),
+        }
+    }
+
+    pub(super) fn record(&mut self) -> &mut TurnStateProbeRecord {
+        self.record
+            .as_mut()
+            .expect("probe diagnostics not finalized")
+    }
+
+    fn take(&mut self) -> Option<TurnStateProbeRecord> {
+        let mut record = self.record.take()?;
+        record.duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Some(record)
+    }
+
+    pub(super) async fn finish(mut self) {
+        if let Some(record) = self.take() {
+            self.persist(record).await;
+        }
+    }
+
+    async fn persist(&self, record: TurnStateProbeRecord) {
+        if let Err(error) = self.store.save_probe(record).await {
+            tracing::warn!(?error, "写入探测诊断失败");
+        }
+    }
+}
+
+impl Drop for ProbeDiagnostics {
+    fn drop(&mut self) {
+        if let Some(record) = self.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let store = self.store.clone();
+            runtime.spawn(async move {
+                if let Err(error) = store.save_probe(record).await {
+                    tracing::warn!(?error, "写入取消探测诊断失败");
+                }
+            });
+        }
+    }
 }
 
 impl ProbeUsage {

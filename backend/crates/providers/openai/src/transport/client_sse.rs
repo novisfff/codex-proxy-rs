@@ -94,7 +94,6 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
         let headers = self.request_headers_for_http_response(upstream_request, context)?;
-        let headers_started_at = Instant::now();
         // OAuth 请求遵循 Codex 压缩合同；API Key 上游使用普通 JSON。
         // Codex 上游只交付 SSE；即使下游请求 `stream: false`，也要上游流式执行，
         // 再由 API 层收集 canonical events 并返回完整 JSON。不能把下游的传输偏好
@@ -103,6 +102,71 @@ impl CodexBackendClient {
         upstream_body.insert("stream".to_owned(), serde_json::Value::Bool(true));
         let body =
             serde_json::to_vec(&upstream_body).map_err(CodexClientError::RequestBodyEncode)?;
+        self.send_response_stream_http_sse(
+            headers,
+            body,
+            context,
+            self.protocol == OpenAiUpstreamProtocol::Codex,
+        )
+        .await
+    }
+
+    /// 与 codex-state-kit 4307f98 的 fetch.rs 对齐；固定画像不能跟随业务身份更新。
+    /// 仅对齐探测请求，认证仍来自当前账号，响应沿用现有解码与用量记录。
+    /// 此路径只由显式选择兼容探测的 OAuth 获取任务调用，不改变业务请求协议。
+    pub(crate) async fn create_minimal_turn_state_probe(
+        &self,
+        model: &str,
+        context: CodexRequestContext<'_>,
+    ) -> CodexClientResult<CodexBackendStreamingResponse> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_str(context.authorization)?,
+        );
+        if let Some(account) = context.account_id {
+            headers.insert("chatgpt-account-id", HeaderValue::from_str(account)?);
+        }
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "openai-beta",
+            HeaderValue::from_static("responses=experimental"),
+        );
+        headers.insert("connection", HeaderValue::from_static("close"));
+        headers.insert("originator", HeaderValue::from_static("codex-tui"));
+        headers.insert("version", HeaderValue::from_static("0.153.4"));
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
+        );
+        headers.insert(
+            "session_id",
+            HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())?,
+        );
+        let mut body = serde_json::json!({
+            "model": model, "store": false, "stream": true,
+            "instructions": "Reply with exactly: pong",
+            "input": [{"role":"user", "content":[{"type":"input_text", "text":"ping"}]}]
+        });
+        // 对方独立获取器使用默认 serde_json 排序；不受本网关 preserve_order 影响。
+        body.sort_all_objects();
+        let body = serde_json::to_vec(&body).map_err(CodexClientError::RequestBodyEncode)?;
+        self.send_response_stream_http_sse(headers, body, context, false)
+            .await
+    }
+
+    async fn send_response_stream_http_sse(
+        &self,
+        headers: HeaderMap,
+        body: Vec<u8>,
+        context: CodexRequestContext<'_>,
+        compressed: bool,
+    ) -> CodexClientResult<CodexBackendStreamingResponse> {
+        let headers_started_at = Instant::now();
         let endpoint = endpoint_url(&self.base_url, self.protocol.responses_path());
         let trace = context
             .trace
@@ -120,7 +184,7 @@ impl CodexBackendClient {
         );
         trace.capture("upstream.request.body", &body);
         let mut outbound = self.client.post(endpoint).headers(headers);
-        let body = if self.protocol == OpenAiUpstreamProtocol::Codex {
+        let body = if compressed {
             outbound = outbound.header(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
             zstd::stream::encode_all(std::io::Cursor::new(body), 3)
                 .map_err(CodexClientError::RequestCompression)?

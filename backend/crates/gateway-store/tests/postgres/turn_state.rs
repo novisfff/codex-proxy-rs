@@ -24,6 +24,8 @@ async fn turn_state_schedule_roundtrip_update_clear_and_validation() {
             start_minute: 540,
             end_minute: 60,
         }),
+        probe_profile: TurnStateProbeProfile::CodexCore,
+        adaptive_concurrency: false,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -38,6 +40,8 @@ async fn turn_state_schedule_roundtrip_update_clear_and_validation() {
         ProviderStoreErrorKind::InvalidData
     );
     config.schedule = None;
+    config.probe_profile = TurnStateProbeProfile::MinimalCompat;
+    config.adaptive_concurrency = true;
     store.save_config(config.clone()).await.unwrap();
     config.revision = 2;
     assert_eq!(store.configs().await.unwrap(), vec![config]);
@@ -63,6 +67,8 @@ async fn turn_state_dynamic_egress_roundtrip_and_exclusive_static_proxy() {
             family: "ipv6".to_owned(),
         }),
         schedule: None,
+        probe_profile: TurnStateProbeProfile::CodexCore,
+        adaptive_concurrency: false,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -99,6 +105,8 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         proxy_id: None,
         dynamic_egress: None,
         schedule: None,
+        probe_profile: TurnStateProbeProfile::CodexCore,
+        adaptive_concurrency: false,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -140,6 +148,7 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         input_tokens: None,
         output_tokens: None,
         exit_ip: None,
+        search_concurrency: None,
     };
     store.save_attempt(attempt.clone()).await.unwrap();
     assert_eq!(store.attempts().await.unwrap().len(), 1);
@@ -202,6 +211,8 @@ async fn turn_state_proxy_must_be_tested_and_cannot_be_deleted_while_bound() {
         proxy_id: Some(saved.id.clone()),
         dynamic_egress: None,
         schedule: None,
+        probe_profile: TurnStateProbeProfile::CodexCore,
+        adaptive_concurrency: false,
         revision: 0,
     };
     assert!(
@@ -235,4 +246,68 @@ async fn turn_state_proxy_must_be_tested_and_cannot_be_deleted_while_bound() {
         "bound proxy must not become direct implicitly"
     );
     database.close().await;
+}
+
+#[tokio::test]
+async fn turn_state_probe_history_is_bounded_and_removed_with_config() {
+    let Some(database) = TestDatabase::create("turn_state_probes").await else {
+        return;
+    };
+    PgProviderAccountRepository::new(database.pool.clone())
+        .insert_provider_account(account("acct_probes", "user_probes"))
+        .await
+        .unwrap();
+    let store = PgTurnStateStore::new(database.pool.clone());
+    store
+        .save_config(TurnStateFetcherConfig {
+            account_id: "acct_probes".to_owned(),
+            enabled: true,
+            models: vec!["gpt-test".to_owned()],
+            proxy_id: None,
+            dynamic_egress: None,
+            schedule: None,
+            probe_profile: TurnStateProbeProfile::MinimalCompat,
+            adaptive_concurrency: true,
+            revision: 0,
+        })
+        .await
+        .unwrap();
+    for index in 0..205 {
+        store
+            .save_probe(TurnStateProbeRecord {
+                id: format!("probe-{index}"),
+                batch_id: "batch-test".to_owned(),
+                account_id: "acct_probes".to_owned(),
+                model: "gpt-test".to_owned(),
+                config_revision: 1,
+                profile: TurnStateProbeProfile::MinimalCompat,
+                started_at: index,
+                duration_ms: 10,
+                outcome: "non_target".to_owned(),
+                http_status: Some(200),
+                http_version: Some("HTTP/2".to_owned()),
+                byte_length: Some(312),
+                repeated: false,
+                endpoint: Some("/codex/responses".to_owned()),
+                responses_lite: false,
+                compressed: false,
+                egress_instance: None,
+                lease_id: None,
+                exit_ip: None,
+                fresh_connection: false,
+            })
+            .await
+            .unwrap();
+    }
+    let probes = store.recent_probes().await.unwrap();
+    assert_eq!(probes.len(), 200);
+    assert_eq!(probes.first().unwrap().started_at, 204);
+    assert_eq!(probes.last().unwrap().started_at, 5);
+    assert_eq!(probes[0].byte_length, Some(312));
+    sqlx::query("DELETE FROM turn_state_fetcher_configs WHERE account_id=$1")
+        .bind("acct_probes")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(store.recent_probes().await.unwrap().is_empty());
 }

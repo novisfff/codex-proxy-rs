@@ -241,6 +241,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "outbound_proxies",
             "provider_accounts",
             "runtime_settings",
+            "turn_state_probe_history",
             "turn_state_fetch_attempts",
             "turn_state_fetcher_configs",
             "turn_state_values",

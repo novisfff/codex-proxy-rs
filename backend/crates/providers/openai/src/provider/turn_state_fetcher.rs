@@ -1,13 +1,13 @@
 //! 独立低并发获取任务。凭据、账号额度与业务共用；连接池、出站代理与用量记录独立。
 
 use super::turn_state::{REFRESH_AFTER_MS, REFRESH_BEFORE_MS, TurnStateCache};
-use super::turn_state_probe_usage::ProbeUsage;
+use super::turn_state_probe_usage::{ProbeDiagnostics, ProbeUsage};
 use crate::transport::canonical::{CodexCanonicalDecoder, CodexCanonicalOutcome};
 use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
         CodexBackendClient, CodexCatalogCapabilityEvidence, CodexClientError, CodexRequestContext,
-        client::build_account_http_client,
+        client::{build_turn_state_http_client, turn_state_proxy},
         diagnostics::{CodexFailureCategory, CodexUpstreamFailure},
         encode_generate_request,
         profile::CodexWireProfileState,
@@ -154,6 +154,7 @@ fn build_probe_body(
 }
 
 struct Running {
+    batch_id: String,
     account: String,
     model: String,
     cancellation: CancellationToken,
@@ -298,6 +299,7 @@ impl TurnStateFetcher {
             attempts: self.store.attempts().await?,
             running: running_requests.first().cloned(),
             running_requests,
+            recent_probes: self.store.recent_probes().await?,
         })
     }
 
@@ -410,7 +412,7 @@ impl TurnStateFetcher {
             a.account_id == account
                 && a.model == model
                 && a.config_revision == config.revision
-                && a.paused
+                && (a.paused || (a.status == "cooldown" && a.next_attempt_at > now))
         }) {
             return Err(invalid());
         }
@@ -426,6 +428,7 @@ impl TurnStateFetcher {
                 status: "queued".to_owned(),
                 message: "已排队".to_owned(),
                 exit_ip: None,
+                search_concurrency: None,
                 byte_length: None,
                 duration_ms: 0,
                 input_tokens: None,
@@ -477,12 +480,26 @@ impl TurnStateFetcher {
                 for (config, model, policy) in self.due(&status).await? {
                     let id = uuid::Uuid::new_v4();
                     let stop = CancellationToken::new();
-                    self.running
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(
+                    let batch_id = {
+                        let mut running = self
+                            .running
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let batch_id = running
+                            .values()
+                            .find(|r| {
+                                r.account == config.account_id
+                                    && r.model == model
+                                    && !r.cancellation.is_cancelled()
+                            })
+                            .map_or_else(
+                                || uuid::Uuid::new_v4().to_string(),
+                                |r| r.batch_id.clone(),
+                            );
+                        running.insert(
                             id,
                             Running {
+                                batch_id: batch_id.clone(),
                                 account: config.account_id.clone(),
                                 model: model.clone(),
                                 cancellation: stop.clone(),
@@ -495,6 +512,8 @@ impl TurnStateFetcher {
                                     .map(|v| v.value.clone()),
                             },
                         );
+                        batch_id
+                    };
                     self.last_started
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -505,7 +524,8 @@ impl TurnStateFetcher {
                     };
                     tasks.push(async move {
                         let _guard = guard;
-                        self.run_attempt(config, model, stop, cancellation).await
+                        self.run_attempt(config, model, batch_id, stop, cancellation)
+                            .await
                     });
                 }
             }
@@ -601,8 +621,27 @@ impl TurnStateFetcher {
             {
                 continue;
             }
+            let previous = attempts.iter().find(|a| {
+                a.account_id == config.account_id
+                    && a.model == model
+                    && a.config_revision == config.revision
+            });
+            let model_capacity =
+                if config.adaptive_concurrency && policy.group.starts_with("socks5:") {
+                    previous
+                        .and_then(|a| a.search_concurrency)
+                        .unwrap_or(3)
+                        .clamp(1, 8)
+                        .min(policy.capacity)
+                } else {
+                    policy.capacity
+                };
+            let model_running = running
+                .values()
+                .filter(|r| r.account == config.account_id && r.model == model)
+                .count();
             let count = counts.entry(policy.group.clone()).or_default();
-            if *count < policy.capacity {
+            if *count < policy.capacity && model_running < model_capacity {
                 selected.push((config, model, policy.clone()));
                 // 非零间隔每轮只启动一个；零间隔在后续轮次补齐同一账号模型的槽位。
                 *count = if policy.interval.is_zero() {
@@ -619,6 +658,7 @@ impl TurnStateFetcher {
         &self,
         config: TurnStateFetcherConfig,
         model: String,
+        batch_id: String,
         stop: CancellationToken,
         cancellation: &CancellationToken,
     ) -> Result<(), ProviderStoreError> {
@@ -626,6 +666,31 @@ impl TurnStateFetcher {
         if !config.allows_probe_at(now) {
             return Ok(());
         }
+        let mut diagnostics = ProbeDiagnostics::new(
+            self.store.clone(),
+            TurnStateProbeRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                batch_id,
+                account_id: config.account_id.clone(),
+                model: model.clone(),
+                config_revision: config.revision,
+                profile: config.probe_profile,
+                started_at: now,
+                duration_ms: 0,
+                outcome: "cancelled".to_owned(),
+                http_status: None,
+                http_version: None,
+                byte_length: None,
+                repeated: false,
+                endpoint: None,
+                responses_lite: false,
+                compressed: false,
+                egress_instance: config.dynamic_egress.as_ref().map(|v| v.instance.clone()),
+                lease_id: None,
+                exit_ip: None,
+                fresh_connection: false,
+            },
+        );
         // 覆盖整个尝试（包括等待动态 IP）；时段结束后 Drop 负责释放在途租约。
         let window_end = async {
             if let Some(schedule) = &config.schedule {
@@ -646,7 +711,7 @@ impl TurnStateFetcher {
             () = cancellation.cancelled() => return Ok(()),
             () = stop.cancelled() => return Ok(()),
             () = window_end => return Ok(()),
-            result = self.fetch_with_egress(&config, &model) => result,
+            result = self.fetch_with_egress(&config, &model, diagnostics.record()) => result,
         };
         let _update = self.updates.lock().await;
         if stop.is_cancelled() {
@@ -663,6 +728,7 @@ impl TurnStateFetcher {
             return Ok(());
         }
         let finished = Utc::now().timestamp_millis();
+        diagnostics.record().outcome = "stale".to_owned();
         // 并发搜索或正常流量已获得新值时，迟到结果不能覆盖成功状态。
         if self.cache.values().iter().any(|v| {
             v.account_id == config.account_id
@@ -673,6 +739,9 @@ impl TurnStateFetcher {
             return Ok(());
         }
         if let Some(value) = &outcome.value {
+            diagnostics.record().repeated = self.cache.values().iter().any(|v| {
+                v.account_id == config.account_id && v.model == model && v.value == *value
+            });
             self.cache.observe_at(
                 &config.account_id,
                 &model,
@@ -695,7 +764,14 @@ impl TurnStateFetcher {
                 outcome.message = "返回了相同旧值，未延长有效期".to_owned();
             }
         }
-        let failures = if outcome.success {
+        let previous = self.store.attempts().await?.into_iter().find(|a| {
+            a.account_id == config.account_id
+                && a.model == model
+                && a.config_revision == config.revision
+        });
+        let throttled = matches!(outcome.http_status, Some(429 | 503));
+        // 命中、限流和不可恢复错误均收敛同组任务，迟到失败不得覆盖成功或冷却状态。
+        if outcome.success || throttled || outcome.paused {
             for r in self
                 .running
                 .lock()
@@ -706,22 +782,36 @@ impl TurnStateFetcher {
                     r.cancellation.cancel();
                 }
             }
+        }
+        let failures = if outcome.success {
             0
         } else {
-            self.store
-                .attempts()
-                .await?
-                .iter()
-                .find(|a| {
-                    a.account_id == config.account_id
-                        && a.model == model
-                        && a.config_revision == config.revision
-                })
+            previous
+                .as_ref()
                 .map_or(1, |a| a.failures.saturating_add(1))
         };
-        // 获取器失败后不使用指数退避、上游 Retry-After 或随机抖动。静态出口仍以
-        // 10 秒为固定重试间隔；动态出口由对应实例的 intervalSeconds 控制实际间隔。
-        let delay: u64 = if outcome.success || outcome.paused || config.dynamic_egress.is_some() {
+        let current_concurrency = previous
+            .as_ref()
+            .and_then(|a| a.search_concurrency)
+            .unwrap_or(3);
+        let search_concurrency = if outcome.success {
+            3
+        } else if throttled {
+            1
+        } else if outcome.byte_length == Some(312)
+            && outcome.http_status.is_some_and(|s| (200..300).contains(&s))
+        {
+            match current_concurrency {
+                0..=2 => 3,
+                3..=4 => 5,
+                _ => 8,
+            }
+        } else {
+            current_concurrency
+        };
+        let delay = if throttled {
+            outcome.retry_after.clamp(30, 3600)
+        } else if outcome.success || outcome.paused || config.dynamic_egress.is_some() {
             0
         } else {
             10
@@ -737,6 +827,21 @@ impl TurnStateFetcher {
         } else {
             finished.saturating_add(i64::try_from(delay.saturating_mul(1000)).unwrap_or(i64::MAX))
         };
+        diagnostics.record().outcome = if outcome.success {
+            "captured"
+        } else if throttled {
+            "cooldown"
+        } else if outcome.paused {
+            "paused"
+        } else if diagnostics.record().repeated {
+            "repeated"
+        } else if outcome.byte_length == Some(312) {
+            "non_target"
+        } else {
+            "failed"
+        }
+        .to_owned();
+        diagnostics.finish().await;
         self.store
             .save_attempt(TurnStateFetchAttempt {
                 account_id: config.account_id,
@@ -748,6 +853,8 @@ impl TurnStateFetcher {
                 paused: outcome.paused,
                 status: if outcome.success {
                     "success"
+                } else if throttled {
+                    "cooldown"
                 } else if outcome.paused {
                     "paused"
                 } else {
@@ -760,6 +867,7 @@ impl TurnStateFetcher {
                 input_tokens: outcome.input_tokens,
                 output_tokens: outcome.output_tokens,
                 exit_ip: outcome.exit_ip,
+                search_concurrency: Some(search_concurrency),
             })
             .await
     }
@@ -768,6 +876,7 @@ impl TurnStateFetcher {
         &self,
         config: &TurnStateFetcherConfig,
         model: &str,
+        diagnostics: &mut TurnStateProbeRecord,
     ) -> FetchOutcome {
         if config.dynamic_egress.is_some() {
             let Ok(id) = ProviderAccountId::new(config.account_id.clone()) else {
@@ -793,22 +902,25 @@ impl TurnStateFetcher {
             let Some(service) = &self.dynamic_egress else {
                 return FetchOutcome::paused("未配置动态出口服务");
             };
-            match service.acquire(selection).await {
+            match service.acquire(selection, config.probe_profile).await {
                 Ok(lease) => Some(lease),
                 Err(()) => return FetchOutcome::retry("动态出口分配失败，未发送 OpenAI 请求", 60),
             }
         } else {
             None
         };
+        diagnostics.lease_id = lease.as_ref().map(|v| v.id.clone());
+        diagnostics.exit_ip = lease.as_ref().and_then(|v| v.ip.clone());
         // 申请出口可能耗时数分钟；进入 fetch 后重新读取账号、配置和调度状态。
         let mut outcome = tokio::time::timeout(
             Duration::from_secs(45),
-            self.fetch(config, model, lease.as_ref()),
+            self.fetch(config, model, lease.as_ref(), diagnostics),
         )
         .await
         .unwrap_or_else(|_| FetchOutcome::retry("获取超时", 60));
         outcome.exit_ip = lease.as_ref().and_then(|lease| lease.ip.clone());
-        if outcome.byte_length == Some(292)
+        // 只保留成功响应中通过校验的票据；错误响应里的同长度头不能保留出口。
+        if outcome.value.is_some()
             && let Some(lease) = lease.as_mut()
         {
             lease.retain_ip();
@@ -821,6 +933,7 @@ impl TurnStateFetcher {
         config: &TurnStateFetcherConfig,
         model: &str,
         dynamic: Option<&super::dynamic_egress::Lease>,
+        diagnostics: &mut TurnStateProbeRecord,
     ) -> FetchOutcome {
         let Ok(id) = ProviderAccountId::new(config.account_id.clone()) else {
             return FetchOutcome::paused("账号无效");
@@ -912,17 +1025,25 @@ impl TurnStateFetcher {
             Ok(ProviderLeaseAcquisition::Acquired(guard)) => guard,
             _ => return FetchOutcome::retry("账号繁忙，延后获取", 60),
         };
-        // 专用缓存键隔离 HTTP 连接池；代理未配置时显式直连，不使用环境代理。
+        let oauth = runtime.authentication.oauth().is_some();
+        let minimal = oauth && config.probe_profile == TurnStateProbeProfile::MinimalCompat;
+        // 静态与动态出口都使用独立连接；明确未配置代理才允许直连。
         let http = if let Some(dynamic) = dynamic {
             let Some(http) = dynamic.http.clone() else {
                 return FetchOutcome::retry("动态出口连接未就绪", 60);
             };
             http
         } else {
-            let Ok(http) = build_account_http_client(
-                &format!("turn-state-fetcher:{}", config.account_id),
-                egress.proxy.as_ref(),
-            ) else {
+            let proxy = match egress
+                .proxy
+                .as_ref()
+                .map(|p| turn_state_proxy(p.expose_url()))
+                .transpose()
+            {
+                Ok(proxy) => proxy,
+                Err(_) => return FetchOutcome::paused("专用代理配置无效"),
+            };
+            let Ok(http) = build_turn_state_http_client(proxy, minimal) else {
                 return FetchOutcome::retry("专用连接初始化失败", 60);
             };
             http
@@ -963,7 +1084,22 @@ impl TurnStateFetcher {
             "turn_started_at_unix_ms": turn_started_at_unix_ms
         })
         .to_string();
-        let responses_lite = runtime.authentication.oauth().is_some();
+        let responses_lite = oauth && !minimal;
+        diagnostics.profile = if minimal {
+            TurnStateProbeProfile::MinimalCompat
+        } else {
+            TurnStateProbeProfile::CodexCore
+        };
+        diagnostics.responses_lite = responses_lite;
+        diagnostics.compressed = oauth && !minimal;
+        diagnostics.endpoint = Some(
+            if oauth {
+                "/codex/responses"
+            } else {
+                "/responses"
+            }
+            .to_owned(),
+        );
         let mut body = build_probe_body(
             model,
             nonce,
@@ -1047,11 +1183,15 @@ impl TurnStateFetcher {
             &id,
             model,
             egress.config_revision,
-            request
-                .body()
-                .get("reasoning")
-                .and_then(|value| value.get("effort"))
-                .and_then(Value::as_str),
+            if minimal {
+                None
+            } else {
+                request
+                    .body()
+                    .get("reasoning")
+                    .and_then(|value| value.get("effort"))
+                    .and_then(Value::as_str)
+            },
         )
         .await;
         let mut context = CodexRequestContext::auxiliary(
@@ -1067,13 +1207,26 @@ impl TurnStateFetcher {
         context.codex_window_id = Some(&window_id);
         context.turn_id = Some(&turn_id);
         context.turn_metadata = Some(&turn_metadata);
-        let mut response = match client
-            .create_response_stream_with_pool_account(&request, context, None)
-            .await
-        {
+        diagnostics.fresh_connection = true;
+        let result = if minimal {
+            client.create_minimal_turn_state_probe(model, context).await
+        } else {
+            client
+                .create_response_stream_with_pool_account(&request, context, None)
+                .await
+        };
+        let mut response = match result {
             Ok(response) => response,
             Err(error) => {
                 let outcome = FetchOutcome::from_error(&error);
+                diagnostics.http_status = outcome.http_status;
+                diagnostics.byte_length = outcome.byte_length;
+                if let CodexClientError::Upstream {
+                    transport_metrics, ..
+                } = &error
+                {
+                    diagnostics.http_version = transport_metrics.http_version.clone();
+                }
                 usage.opening_error(&error);
                 usage.finish().await;
                 return outcome;
@@ -1081,8 +1234,12 @@ impl TurnStateFetcher {
         };
         let mut outcome = FetchOutcome::retry("未返回 292 字节值", 0);
         usage.response(&response);
+        outcome.http_status = response.diagnostics.status_code;
+        diagnostics.http_status = outcome.http_status;
+        diagnostics.http_version = response.transport_metrics.http_version.clone();
         if let Some(value) = response.turn_state {
             outcome.capture(&value);
+            diagnostics.byte_length = outcome.byte_length;
         }
         let mut decoder = CodexCanonicalDecoder::new(model)
             .with_reported_model(response.response_metadata.effective_model.as_deref());
@@ -1230,6 +1387,7 @@ mod probe_body_tests {
 }
 
 struct FetchOutcome {
+    http_status: Option<u16>,
     value: Option<String>,
     received_at: i64,
     success: bool,
@@ -1244,6 +1402,7 @@ struct FetchOutcome {
 impl FetchOutcome {
     fn retry(message: &str, retry_after: u64) -> Self {
         Self {
+            http_status: None,
             value: None,
             received_at: 0,
             success: false,
@@ -1277,6 +1436,7 @@ impl FetchOutcome {
             } else {
                 Self::retry("上游请求失败", upstream.retry_after_seconds.unwrap_or(60))
             };
+            result.http_status = status;
             result.message = fetch_failure_message(&upstream);
             if let CodexClientError::Upstream {
                 client_response: Some(client_response),
@@ -1287,7 +1447,8 @@ impl FetchOutcome {
                     if name.eq_ignore_ascii_case("x-codex-turn-state")
                         && let Ok(value) = std::str::from_utf8(value)
                     {
-                        result.capture(value);
+                        // 错误响应仅记录长度，不将票据写入自动缓存。
+                        result.byte_length = Some(value.len());
                     }
                 }
             }

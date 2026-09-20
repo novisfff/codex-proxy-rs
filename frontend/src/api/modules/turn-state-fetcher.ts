@@ -24,6 +24,8 @@ export interface EgressInstance {
   bindings: Record<string, Partial<EgressBinding>>
 }
 
+export type ProbeProfile = 'codex_core' | 'minimal_compat'
+
 export interface FetcherConfig {
   accountId: string
   enabled: boolean
@@ -31,6 +33,8 @@ export interface FetcherConfig {
   proxyId: string | null
   dynamicEgress?: { instance: string, family: string } | null
   schedule?: { startMinute: number, endMinute: number } | null
+  probeProfile: ProbeProfile
+  adaptiveConcurrency: boolean
   revision: number
 }
 export interface FetcherValue {
@@ -57,11 +61,35 @@ export interface FetcherAttempt {
   inputTokens: number | null
   outputTokens: number | null
   exitIp?: string | null
+  searchConcurrency?: number | null
+}
+export interface ProbeRecord {
+  id: string
+  batchId: string
+  accountId: string
+  model: string
+  configRevision: number
+  profile: ProbeProfile
+  startedAt: number
+  durationMs: number
+  outcome: string
+  httpStatus: number | null
+  httpVersion: string | null
+  byteLength: number | null
+  repeated: boolean
+  endpoint: string | null
+  responsesLite: boolean
+  compressed: boolean
+  egressInstance: string | null
+  leaseId: string | null
+  exitIp: string | null
+  freshConnection: boolean
 }
 export interface FetcherSnapshot {
   configs: FetcherConfig[]
   values: FetcherValue[]
   attempts: FetcherAttempt[]
+  recentProbes?: ProbeRecord[]
   running: [string, string] | null
   runningRequests?: [string, string][]
   dynamicEgress?: {

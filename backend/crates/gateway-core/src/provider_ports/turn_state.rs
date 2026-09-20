@@ -17,7 +17,19 @@ pub struct TurnStateFetcherConfig {
     pub dynamic_egress: Option<DynamicEgressSelection>,
     #[serde(default)]
     pub schedule: Option<TurnStateFetcherSchedule>,
+    #[serde(default)]
+    pub probe_profile: TurnStateProbeProfile,
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
     pub revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStateProbeProfile {
+    #[default]
+    CodexCore,
+    MinimalCompat,
 }
 
 /// 每日北京时间探测窗口；空配置表示全天，起止分钟使用半开区间并允许跨午夜。
@@ -110,6 +122,34 @@ pub struct TurnStateFetchAttempt {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub exit_ip: Option<String>,
+    #[serde(default)]
+    pub search_concurrency: Option<usize>,
+}
+
+/// 有界探测历史，仅保留诊断元数据，不保存票据、正文或代理认证信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeRecord {
+    pub id: String,
+    pub batch_id: String,
+    pub account_id: String,
+    pub model: String,
+    pub config_revision: i64,
+    pub profile: TurnStateProbeProfile,
+    pub started_at: i64,
+    pub duration_ms: u64,
+    pub outcome: String,
+    pub http_status: Option<u16>,
+    pub http_version: Option<String>,
+    pub byte_length: Option<usize>,
+    pub repeated: bool,
+    pub endpoint: Option<String>,
+    pub responses_lite: bool,
+    pub compressed: bool,
+    pub egress_instance: Option<String>,
+    pub lease_id: Option<String>,
+    pub exit_ip: Option<String>,
+    pub fresh_connection: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,6 +161,7 @@ pub struct TurnStateFetcherSnapshot {
     pub running: Option<(String, String)>,
     pub running_requests: Vec<(String, String)>,
     pub dynamic_egress: serde_json::Value,
+    pub recent_probes: Vec<TurnStateProbeRecord>,
 }
 
 #[derive(Debug)]
@@ -132,6 +173,12 @@ pub struct TurnStateFetchEgress {
 }
 
 pub trait TurnStateStore: Send + Sync {
+    fn recent_probes(&self)
+    -> BoxFuture<'_, Result<Vec<TurnStateProbeRecord>, ProviderStoreError>>;
+    fn save_probe(
+        &self,
+        probe: TurnStateProbeRecord,
+    ) -> BoxFuture<'_, Result<(), ProviderStoreError>>;
     fn configs(&self) -> BoxFuture<'_, Result<Vec<TurnStateFetcherConfig>, ProviderStoreError>>;
     fn save_config(
         &self,
