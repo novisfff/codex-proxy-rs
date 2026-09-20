@@ -197,14 +197,14 @@ fn fetch_policy(config: &TurnStateFetcherConfig, status: &Value) -> Option<Fetch
         .as_array()?
         .iter()
         .find(|i| i["id"].as_str() == Some(&selection.instance))?;
-    let nova = instance["provider"] == "novaproxy";
+    let socks5 = matches!(instance["provider"].as_str(), Some("socks5" | "novaproxy"));
     Some(FetchPolicy {
-        group: if nova {
-            format!("nova:{}", selection.instance)
+        group: if socks5 {
+            format!("socks5:{}", selection.instance)
         } else {
             "azure".to_owned()
         },
-        capacity: if nova {
+        capacity: if socks5 {
             usize::try_from(instance["maxConcurrent"].as_u64().unwrap_or(1).clamp(1, 16)).ok()?
         } else {
             1

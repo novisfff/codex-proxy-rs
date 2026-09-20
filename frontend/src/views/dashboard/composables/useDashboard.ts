@@ -200,6 +200,7 @@ const metricSparklineBuckets = 12
 
 const emptyCards: DashboardSummary['cards'] = {
   credentials: {
+    validTurnStateAccounts: 0,
     total: '0',
     totalValue: 0,
     available: '0',
@@ -318,6 +319,11 @@ function metricCards(
           label: '不可用',
           value: credentials.unavailable,
           tone: 'danger',
+        },
+        {
+          label: '有效 292',
+          value: credentials.validTurnStateAccounts === undefined ? '—' : formatInteger(credentials.validTurnStateAccounts),
+          tone: credentials.validTurnStateAccounts > 0 ? 'success' : credentials.validTurnStateAccounts === 0 ? 'danger' : 'normal',
         },
       ],
     },

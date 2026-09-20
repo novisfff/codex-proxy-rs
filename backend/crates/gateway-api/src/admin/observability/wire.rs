@@ -338,6 +338,7 @@ pub struct DashboardCardsView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DashboardCredentialsCardView {
+    pub valid_turn_state_accounts: u64,
     pub total: String,
     pub total_value: u64,
     pub available: String,

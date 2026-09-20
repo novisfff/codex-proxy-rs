@@ -38,6 +38,52 @@ fn external_observability_range_accepts_exactly_366_days() {
     assert_eq!(range.end, end);
 }
 
+#[tokio::test]
+async fn dashboard_counts_valid_turn_state_accounts_once_and_refreshes_cached_summary() {
+    use super::accounts::{FakeAccountStore, FakeProviderAdmin, account_record};
+    use gateway_admin::model::settings::AutomaticTurnState;
+
+    let now = Utc::now();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let account = account_record("openai");
+    let provider = FakeProviderAdmin::new("openai", events.clone());
+    *provider.turn_states.lock().expect("turn states") = [
+        (account.id.as_str(), "model-a"),
+        (account.id.as_str(), "model-b"),
+        ("deleted-account", "model-a"),
+    ]
+    .into_iter()
+    .map(|(account, model)| AutomaticTurnState {
+        account_id: account.to_owned(),
+        model: model.to_owned(),
+        value: "x".repeat(292),
+        acquired_at: now,
+    })
+    .collect();
+    let services = super::AdminHarness::new()
+        .accounts(FakeAccountStore::with_account(account, events))
+        .observability(Arc::new(FixtureObservabilityStore::new(observation_range(
+            now,
+        ))))
+        .settings(Arc::new(FixtureSettingsStore))
+        .provider(provider.clone())
+        .build()
+        .await;
+    let summary = services
+        .observability()
+        .dashboard_summary(observation_range(now), TrendKind::Usage)
+        .await
+        .expect("summary");
+    assert_eq!(summary.valid_turn_state_accounts, 1);
+    provider.turn_states.lock().expect("turn states").clear();
+    let summary = services
+        .observability()
+        .dashboard_summary(observation_range(now), TrendKind::Usage)
+        .await
+        .expect("summary after expiration");
+    assert_eq!(summary.valid_turn_state_accounts, 0);
+}
+
 #[test]
 fn external_observability_range_rejects_over_366_days_and_reversed_range() {
     let end = Utc::now();

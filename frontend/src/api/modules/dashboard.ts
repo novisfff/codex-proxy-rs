@@ -55,6 +55,7 @@ export interface DashboardTrendResponse {
 
 export interface DashboardCards {
   credentials: {
+    validTurnStateAccounts: number
     total: string
     totalValue: number
     available: string

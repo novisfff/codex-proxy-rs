@@ -75,7 +75,7 @@ const visible = computed(() => accounts.value.filter(a => `${a.name} ${a.email ?
 const modelOptions = computed(() => [...new Map([...catalog.value, ...form.value.models.map(id => ({ id, label: id }))].map(m => [m.id, m])).values()])
 const proxyOptions = computed(() => [
   { label: '直连 · 不使用代理', value: 'direct' },
-  { label: '动态出口 · Azure / NovaProxy', value: 'dynamic' },
+  { label: '动态出口 · Azure / SOCKS5', value: 'dynamic' },
   ...proxies.value.map(p => ({ label: `${p.name} · ${p.endpoint}${p.lastTest?.success ? '' : '（未通过测试）'}`, value: p.id, disabled: !p.lastTest?.success })),
 ])
 
@@ -84,7 +84,7 @@ function editInstance(id = '') {
   instanceId.value = id
   originalInstanceId.value = id
   instanceRevision.value = snapshot.value.dynamicEgress?.revision ?? 0
-  instanceForm.value = existing ? { ...instanceConfig(existing), password: '', passwordSet: existing.passwordSet, bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', host: 'residential-gateway.novaproxy.io', port: 1111, username: '', password: '', bindings: {} }
+  instanceForm.value = existing ? { ...instanceConfig(existing), password: '', passwordSet: existing.passwordSet, bindings: JSON.parse(JSON.stringify(existing.bindings)) } : { provider: 'azure', name: '', subscription: '', resourceGroup: '', location: '', host: '', port: 1080, username: '', password: '', bindings: {} }
   editingFamilies.value = Object.keys(instanceForm.value.bindings)
   for (const family of ['ipv4', 'ipv6']) {
     instanceForm.value.bindings[family] ??= { resourceGroup: '', nic: '', ipConfiguration: '', sourceIp: '', dedicated: true }
@@ -93,27 +93,27 @@ function editInstance(id = '') {
 }
 function instanceConfig(instance: EgressInstance): EgressInstance {
   const scheduling = { maxConcurrent: instance.provider === 'azure' ? 1 : instance.maxConcurrent ?? 1, intervalSeconds: instance.intervalSeconds ?? 10 }
-  const config = instance.provider === 'novaproxy'
-    ? { provider: 'novaproxy', name: instance.name, host: instance.host, port: instance.port, username: instance.username, ...(instance.password ? { password: instance.password } : {}), bindings: { ipv4: {} } }
+  const config = ['socks5', 'novaproxy'].includes(instance.provider)
+    ? { provider: 'socks5', name: instance.name, host: instance.host?.trim(), port: instance.port, username: instance.username, ...(instance.password ? { password: instance.password } : {}), bindings: { ipv4: {} } }
     : { provider: 'azure', name: instance.name, subscription: instance.subscription, resourceGroup: instance.resourceGroup, location: instance.location, bindings: instance.bindings }
   return { ...config, ...scheduling }
 }
-function isNova(accountId: string) {
+function isSocks5(accountId: string) {
   const id = config(accountId).dynamicEgress?.instance
-  return snapshot.value.dynamicEgress?.instances.some(instance => instance.id === id && instance.provider === 'novaproxy')
+  return snapshot.value.dynamicEgress?.instances.some(instance => instance.id === id && ['socks5', 'novaproxy'].includes(instance.provider))
 }
 function toggleFamily(family: string, enabled: boolean) {
   editingFamilies.value = enabled ? [...new Set([...editingFamilies.value, family])] : editingFamilies.value.filter(value => value !== family)
 }
 async function saveInstance(remove = false) {
-  const nova = instanceForm.value
-  if (!remove && (!Number.isInteger(nova.maxConcurrent ?? 1) || (nova.maxConcurrent ?? 1) < 1 || (nova.maxConcurrent ?? 1) > 16 || !Number.isInteger(nova.intervalSeconds ?? 10) || (nova.intervalSeconds ?? 10) < 0 || (nova.intervalSeconds ?? 10) > 3600)) {
+  const proxy = instanceForm.value
+  if (!remove && (!Number.isInteger(proxy.maxConcurrent ?? 1) || (proxy.maxConcurrent ?? 1) < 1 || (proxy.maxConcurrent ?? 1) > 16 || !Number.isInteger(proxy.intervalSeconds ?? 10) || (proxy.intervalSeconds ?? 10) < 0 || (proxy.intervalSeconds ?? 10) > 3600)) {
     toast.warning('并发数需为 1–16 的整数，尝试间隔需为 0–3600 秒的整数')
     return
   }
-  const validNova = /^[a-z0-9-]+\.novaproxy\.io$/i.test(nova.host ?? '') && Number.isInteger(nova.port) && (nova.port ?? 0) >= 1 && (nova.port ?? 0) <= 65535 && !!nova.username && (!!nova.password || nova.passwordSet)
-  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || (nova.provider === 'azure' ? !editingFamilies.value.length : !validNova))) {
-    toast.warning(nova.provider === 'novaproxy' ? '填写有效的实例 ID、NovaProxy 地址、端口、用户名和密码' : '填写实例 ID 并至少选择一种地址类型')
+  const validSocks5 = !!proxy.host?.trim() && Number.isInteger(proxy.port) && (proxy.port ?? 0) >= 1 && (proxy.port ?? 0) <= 65535 && !!proxy.username && (!!proxy.password || proxy.passwordSet)
+  if (!remove && (!/^[\w-]{1,64}$/.test(instanceId.value) || (proxy.provider === 'azure' ? !editingFamilies.value.length : !validSocks5))) {
+    toast.warning(proxy.provider === 'socks5' ? '填写有效的实例 ID、SOCKS5 地址、端口、用户名和密码' : '填写实例 ID 并至少选择一种地址类型')
     return
   }
   await action.run(async () => {
@@ -335,12 +335,12 @@ onBeforeUnmount(() => {
         动态出口
       </BaseButton>
     </div>
-    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；NovaProxy Rotating 住宅代理。仅用于 292 获取器。">
+    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；通用 SOCKS5 代理。仅用于 292 获取器。">
       <p :class="snapshot.dynamicEgress?.available ? 'text-cp-success' : 'text-cp-warning'">
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
       </p>
       <p class="text-cp-sm text-cp-text-secondary">
-        Azure 获取到 292 时保留 IP 并优先复用，未获取到时换 IP，新申请避免连续重复。NovaProxy 每次通过 SOCKS5 新建连接，实际出口未验证，可能重复。
+        Azure 获取到 292 时保留 IP 并优先复用，未获取到时换 IP，新申请避免连续重复。SOCKS5 代理每次新建连接，实际出口未验证，可能重复。
       </p>
       <BaseButton :disabled="!instancesEditable || saving" @click="editInstance()">
         添加出口实例
@@ -358,7 +358,7 @@ onBeforeUnmount(() => {
       <div class="mt-4 grid gap-3">
         <section v-for="entry in snapshot.dynamicEgress?.history" :key="entry.id" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-3 text-cp-sm">
           <div class="flex flex-wrap gap-3">
-            <strong class="break-all">{{ entry.ip || (entry.provider === 'novaproxy' ? '轮换出口 · IP 未验证' : '等待分配') }}</strong><span>{{ entry.family }}</span><span>{{ ({ provisioning: '正在分配', ready: '等待请求', connected: '请求进行中', released: '已释放', failed: '失败' } as Record<string, string>)[entry.state] || entry.state }}</span>
+            <strong class="break-all">{{ entry.ip || (['socks5', 'novaproxy'].includes(entry.provider ?? '') ? '代理出口 · IP 未验证' : '等待分配') }}</strong><span>{{ entry.family }}</span><span>{{ ({ provisioning: '正在分配', ready: '等待请求', connected: '请求进行中', released: '已释放', failed: '失败' } as Record<string, string>)[entry.state] || entry.state }}</span>
           </div>
           <p class="text-cp-text-secondary">
             {{ date(entry.created * 1000) }} · {{ entry.instance }}
@@ -429,7 +429,7 @@ onBeforeUnmount(() => {
             <div v-if="row.attempt" class="mt-3 grid gap-1 text-cp-xs text-cp-text-secondary">
               <span>最近尝试：{{ date(row.attempt.attemptedAt) }} · {{ row.attempt.message }}</span>
               <span v-if="row.attempt.exitIp" class="break-all">本次出口 IP：{{ row.attempt.exitIp }}</span>
-              <span v-else-if="isNova(account.id)">本次出口 IP：未验证（NovaProxy Rotating）</span>
+              <span v-else-if="isSocks5(account.id)">本次出口 IP：未验证（SOCKS5）</span>
               <span>返回长度：{{ row.attempt.byteLength ?? '未返回' }} · 耗时：{{ row.attempt.durationMs }} ms · 输入 / 输出 token：{{ row.attempt.inputTokens ?? '未知' }} / {{ row.attempt.outputTokens ?? '未知' }}</span>
               <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.expiresAt - 1200000 : 0)) }}</span>
             </div>
@@ -443,10 +443,10 @@ onBeforeUnmount(() => {
     <BaseModal v-model="instanceOpen" title="动态出口实例" size="md" :dismissible="!saving">
       <div class="grid gap-4">
         <BaseFormItem label="出口供应商">
-          <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'NovaProxy Rotating', value: 'novaproxy' }]" :disabled="saving || !!originalInstanceId" />
+          <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'SOCKS5', value: 'socks5' }]" :disabled="saving || !!originalInstanceId" />
         </BaseFormItem>
         <BaseFormItem label="实例 ID">
-          <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" :placeholder="instanceForm.provider === 'novaproxy' ? 'nova-us' : 'azure-main'" />
+          <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" :placeholder="instanceForm.provider === 'socks5' ? 'socks5-main' : 'azure-main'" />
         </BaseFormItem>
         <div class="grid grid-cols-2 gap-4">
           <BaseFormItem :label="instanceForm.provider === 'azure' ? '最大并发数（Azure 固定 1）' : '最大并发数'">
@@ -456,12 +456,12 @@ onBeforeUnmount(() => {
             <BaseInput :model-value="String(instanceForm.intervalSeconds ?? 10)" type="number" min="0" max="3600" :disabled="saving" @update:model-value="instanceForm.intervalSeconds = Number($event)" />
           </BaseFormItem>
         </div>
-        <template v-if="instanceForm.provider === 'novaproxy'">
+        <template v-if="instanceForm.provider === 'socks5'">
           <BaseFormItem label="名称">
             <BaseInput v-model="instanceForm.name" :disabled="saving" />
           </BaseFormItem>
           <BaseFormItem label="代理地址">
-            <BaseInput v-model="instanceForm.host" placeholder="residential-gateway.novaproxy.io" :disabled="saving" />
+            <BaseInput v-model="instanceForm.host" placeholder="代理域名或 IP，如 us.novproxy.io" :disabled="saving" />
           </BaseFormItem>
           <BaseFormItem label="端口">
             <BaseInput :model-value="String(instanceForm.port ?? '')" type="number" min="1" max="65535" :disabled="saving" @update:model-value="instanceForm.port = Number($event)" />
@@ -473,7 +473,7 @@ onBeforeUnmount(() => {
             <BaseInput v-model="instanceForm.password" type="password" autocomplete="new-password" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-sm text-cp-warning">
-            Residential Premium · IPv4 · 每次独立 SOCKS5 连接；不保证出口不重复，实际 IP 未验证。
+            每次建立独立 SOCKS5 连接；出口是否轮换由代理服务决定，实际 IP 未验证。
           </p>
         </template>
         <template v-else>
@@ -540,7 +540,7 @@ onBeforeUnmount(() => {
             <BaseSelect v-model="dynamicFamily" :options="familyOptions" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-xs text-cp-text-secondary">
-            Azure 等待新 IP 就绪；NovaProxy 每次新建代理连接。仅请求官方 OpenAI，不使用账号自定义网关或业务代理。
+            Azure 等待新 IP 就绪；SOCKS5 每次新建代理连接。仅请求官方 OpenAI，不使用账号自定义网关或业务代理。
           </p>
         </template>
         <BaseFormItem label="获取模型（最多 32 个）">

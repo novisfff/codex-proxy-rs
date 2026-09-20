@@ -1009,6 +1009,7 @@ pub struct DashboardPeriodMetrics {
 /// 仪表盘聚合结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardResult {
+    pub valid_turn_state_accounts: u64,
     pub observation: DashboardObservation,
     pub today: DashboardPeriodMetrics,
     pub yesterday: DashboardPeriodMetrics,

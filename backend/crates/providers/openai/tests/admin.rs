@@ -479,14 +479,14 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
-    async fn nova_parallel_searches_same_model_respect_interval_capacity_and_cancel_together() {
+    async fn socks5_parallel_searches_same_model_respect_interval_capacity_and_cancel_together() {
         for fresh_from_traffic in [false, true] {
             let control = MockServer::start().await;
             let upstream = MockServer::start().await;
             let starts = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
             Mock::given(method("GET")).and(path("/v1/status"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"available":true,"instances":[{
-                "id":"nova","provider":"novaproxy","families":["ipv4"],"maxConcurrent":2,"intervalSeconds":1
+                "id":"nova","provider":if fresh_from_traffic { "novaproxy" } else { "socks5" },"families":["ipv4"],"maxConcurrent":2,"intervalSeconds":1
             }]}))).mount(&control).await;
             let observed = starts.clone();
             Mock::given(method("POST"))

@@ -64,6 +64,7 @@ use serde_json::{Map, json};
 pub(super) type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
 pub(super) struct FakeProviderAdmin {
+    pub(super) turn_states: Mutex<Vec<gateway_admin::model::settings::AutomaticTurnState>>,
     kind: ProviderKind,
     events: EventLog,
     failure: Mutex<Option<ProviderAdminError>>,
@@ -88,6 +89,7 @@ pub(super) struct FakeProviderAdmin {
 impl FakeProviderAdmin {
     pub(super) fn new(kind: &str, events: EventLog) -> Arc<Self> {
         Arc::new(Self {
+            turn_states: Mutex::new(Vec::new()),
             kind: ProviderKind::new(kind).expect("provider kind"),
             events,
             failure: Mutex::new(None),
@@ -258,6 +260,10 @@ impl FakeProviderAdmin {
 
 #[async_trait]
 impl ProviderAdmin for FakeProviderAdmin {
+    fn automatic_turn_state(&self) -> Vec<gateway_admin::model::settings::AutomaticTurnState> {
+        self.turn_states.lock().expect("turn states").clone()
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }

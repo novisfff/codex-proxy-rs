@@ -183,6 +183,7 @@ function previewUsageRecord(options: PreviewUsageRecordOptions): UsageListRecord
 export const themeDashboardSummary: DashboardSummaryResponse = {
   cards: {
     credentials: {
+      validTurnStateAccounts: 2,
       total: '52',
       totalValue: 52,
       available: '47',

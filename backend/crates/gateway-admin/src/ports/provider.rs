@@ -311,6 +311,15 @@ pub struct ProviderAdminRegistry {
 }
 
 impl ProviderAdminRegistry {
+    /// 复用 Provider 的有效期判断，跨模型去重；不向首页传输状态令牌。
+    pub(crate) fn valid_turn_state_accounts(&self) -> std::collections::BTreeSet<String> {
+        self.providers
+            .values()
+            .flat_map(|provider| provider.automatic_turn_state())
+            .map(|state| state.account_id)
+            .collect()
+    }
+
     #[must_use]
     pub fn pricing_catalog(&self) -> gateway_core::metering::PricingOverrides {
         self.providers

@@ -20,7 +20,7 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 import h11
-from novaproxy import NovaProxy
+from socks5 import Socks5Proxy
 
 
 class EgressError(Exception):
@@ -277,7 +277,7 @@ class Azure:
 class Service:
     def __init__(self, config, journal, provider):
         self.config, self.journal, self.provider = config, journal, provider
-        self.novaproxy = NovaProxy()
+        self.socks5 = Socks5Proxy()
         self.jobs = {}
         self.last_started = {}
         self.ready = False
@@ -291,7 +291,7 @@ class Service:
         for instance in self.config["instances"].values():
             if instance.get("provider") == "novaproxy" and "credentialRef" in instance:
                 try:
-                    credentials = self.novaproxy.credentials(instance["credentialRef"])
+                    credentials = self.socks5.credentials(instance["credentialRef"])
                 except (OSError, ValueError):
                     # 文件缺失时仍允许管理员进入页面补填，不阻断其他实例。
                     continue
@@ -316,7 +316,7 @@ class Service:
         for key, config in self.config["instances"].items():
             public = {k: v for k, v in config.items() if k not in ("password", "credentialRef")}
             public.update(maxConcurrent=config.get("maxConcurrent", 1), intervalSeconds=config.get("intervalSeconds", 10))
-            if config["provider"] == "novaproxy":
+            if config["provider"] in ("socks5", "novaproxy"):
                 public.update(host=config.get("host", "residential-gateway.novaproxy.io"),
                               port=config.get("port", 1111), username=config.get("username", ""),
                               passwordSet=bool(config.get("password")))
@@ -334,12 +334,12 @@ class Service:
             raise web.HTTPBadRequest()
         instances = copy.deepcopy(instances)
         for key, instance in instances.items():
-            if isinstance(instance, dict) and instance.get("provider") == "novaproxy":
+            if isinstance(instance, dict) and instance.get("provider") in ("socks5", "novaproxy"):
                 if "credentialRef" in instance:
                     raise web.HTTPBadRequest()
                 if instance.get("password", "") == "":
                     previous = self.config["instances"].get(key, {})
-                    instance["password"] = previous.get("password", "") if previous.get("provider") == "novaproxy" else ""
+                    instance["password"] = previous.get("password", "") if previous.get("provider") in ("socks5", "novaproxy") else ""
         validate_instances(instances)
         if getattr(self.provider, "retained", None):
             # 清理期间暂停新租约；仍使用旧配置解绑，不能先覆盖 NIC 信息。
@@ -388,7 +388,7 @@ class Service:
 
     def present(self, row):
         result = {k: row[k] for k in ("id", "state", "ip", "message")}
-        result.update(provider=row["provider"], ipVerification="unverified" if row["provider"] == "novaproxy" else "verified")
+        result.update(provider=row["provider"], ipVerification="unverified" if row["provider"] in ("socks5", "novaproxy") else "verified")
         if row["state"] == "ready":
             result.update(proxyUrl=self.config["proxyUrl"], secret=row["secret"])
         return result
@@ -396,7 +396,7 @@ class Service:
     async def run(self, job_id, instance, family):
         job = self.jobs[job_id]
         try:
-            if self.config["instances"][instance]["provider"] == "novaproxy":
+            if self.config["instances"][instance]["provider"] in ("socks5", "novaproxy"):
                 address = None
             else:
                 address, job["source"] = await self.provider.allocate(instance, family)
@@ -478,8 +478,8 @@ class Service:
                 job["tunnel"] = asyncio.current_task()
                 accepted = True
                 proxy_trailing = b""
-                if row["provider"] == "novaproxy":
-                    upstream_reader, upstream_writer, proxy_trailing = await self.novaproxy.connect(job["credentials"], event.target)
+                if row["provider"] in ("socks5", "novaproxy"):
+                    upstream_reader, upstream_writer, proxy_trailing = await self.socks5.connect(job["credentials"], event.target)
                 else:
                     family = socket.AF_INET if row["family"] == "ipv4" else socket.AF_INET6
                     host = event.target.decode().split(":")[0]
@@ -589,8 +589,8 @@ def validate_instances(instances):
                 or (config.get("provider") == "azure" and concurrency != 1)):
             raise web.HTTPBadRequest()
         fields_present = set(config) - {"maxConcurrent", "intervalSeconds"}
-        if config.get("provider") == "novaproxy":
-            legacy = "credentialRef" in config
+        if config.get("provider") in ("socks5", "novaproxy"):
+            legacy = config.get("provider") == "novaproxy" and "credentialRef" in config
             fields = {"credentialRef"} if legacy else {"host", "port", "username", "password"}
             if (fields_present != {"provider", "name", "bindings"} | fields
                     or not isinstance(config["name"], str) or not 1 <= len(config["name"]) <= 128
@@ -602,7 +602,7 @@ def validate_instances(instances):
                     raise web.HTTPBadRequest()
             else:
                 try:
-                    NovaProxy.validate(config)
+                    Socks5Proxy.validate(config)
                 except ValueError:
                     raise web.HTTPBadRequest() from None
             continue

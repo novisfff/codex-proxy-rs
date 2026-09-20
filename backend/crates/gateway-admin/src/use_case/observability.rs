@@ -217,6 +217,7 @@ impl DefaultObservabilityService {
         );
         let used_slots = runtime_slots.and_then(|slots| slots.used_slots);
         Ok(DashboardResult {
+            valid_turn_state_accounts: 0,
             capacity: DashboardCapacity {
                 max_concurrent_per_account,
                 total_slots,
@@ -253,6 +254,18 @@ impl ObservabilityService for DefaultObservabilityService {
             .await
             .clone()?;
         result.trend = trend(kind, result.observation.trend.clone())?;
+        // 状态有效期不受用量快照缓存影响；已删除账号的残留缓存不计入数量。
+        for account_id in self.providers.valid_turn_state_accounts() {
+            if self
+                .accounts
+                .load_account(&account_id, Default::default())
+                .await
+                .map_err(|error| map_store_error(error, "dashboard turn state"))?
+                .is_some()
+            {
+                result.valid_turn_state_accounts += 1;
+            }
+        }
         Ok(result)
     }
 

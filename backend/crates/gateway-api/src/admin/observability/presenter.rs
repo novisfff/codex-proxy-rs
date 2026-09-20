@@ -871,6 +871,7 @@ pub(crate) fn dashboard_view(
     kind: TrendKind,
 ) -> DashboardDataView {
     let domain::DashboardResult {
+        valid_turn_state_accounts,
         observation,
         today,
         yesterday,
@@ -956,6 +957,7 @@ pub(crate) fn dashboard_view(
     DashboardDataView {
         cards: DashboardCardsView {
             credentials: DashboardCredentialsCardView {
+                valid_turn_state_accounts,
                 total: provider_accounts.total.to_string(),
                 total_value: provider_accounts.total,
                 available: provider_accounts.normal.to_string(),

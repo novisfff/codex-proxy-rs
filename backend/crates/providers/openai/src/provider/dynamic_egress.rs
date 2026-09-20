@@ -173,7 +173,7 @@ impl DynamicEgress {
 }
 
 fn lease_ip(body: &LeaseResponse, family: &str) -> Result<Option<String>, ()> {
-    if body.provider.as_deref() == Some("novaproxy") {
+    if matches!(body.provider.as_deref(), Some("socks5" | "novaproxy")) {
         return if family == "ipv4"
             && body.ip.is_none()
             && body.ip_verification.as_deref() == Some("unverified")
@@ -239,11 +239,13 @@ mod tests {
     }
 
     #[test]
-    fn novaproxy_requires_explicit_unverified_ipv4_lease() {
+    fn socks5_requires_explicit_unverified_ipv4_lease() {
         let mut body: LeaseResponse = serde_json::from_value(
             json!({"state":"ready", "provider":"novaproxy", "ipVerification":"unverified"}),
         )
         .unwrap();
+        assert_eq!(lease_ip(&body, "ipv4"), Ok(None));
+        body.provider = Some("socks5".to_owned());
         assert_eq!(lease_ip(&body, "ipv4"), Ok(None));
         assert!(lease_ip(&body, "ipv6").is_err());
         body.ip = Some("203.0.113.1".to_owned());

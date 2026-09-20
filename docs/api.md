@@ -705,9 +705,10 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 开始时间包含、结束时间不包含；时段外不发起探测，结束时取消在途探测及动态 IP 申请。
 手动排队也遵守时段限制，已有有效 292 缓存仍可供普通请求使用。
 
-动态出口实例除 Azure 外支持 `novaproxy`：配置为
-`{provider:"novaproxy",name:"名称",host:"residential-gateway.novaproxy.io",port:1111,username:"YOUR_USERNAME",password:"YOUR_PASSWORD",bindings:{ipv4:{}}}`。
-`host` 限定为 `*.novaproxy.io` 单级子域名，`port` 为 1–65535 的整数。新增实例必须提交密码；
+动态出口实例除 Azure 外支持通用 `socks5` 代理（兼容旧 `novaproxy` 类型）：配置为
+`{provider:"socks5",name:"名称",host:"proxy.example.com",port:1080,username:"YOUR_USERNAME",password:"YOUR_PASSWORD",bindings:{ipv4:{}}}`。
+`host` 接受任意合法域名、IPv4 或不带方括号的 IPv6 地址，不包含协议、端口或路径；
+`port` 为 1–65535 的整数。新建实例必须提交用户名和密码；
 编辑相同实例 ID 时省略 `password` 或传空字符串保留原密码。状态返回 `passwordSet`，不返回 `password`；
 提交配置时不携带 `passwordSet`。认证信息由出口服务持久化，配置接口不再接受 `credentialRef`。
 所有出口实例接受 `maxConcurrent` 和 `intervalSeconds`，省略时分别为 1 和 10。
@@ -715,10 +716,10 @@ Responses 的 OAuth 账号选择在同权重、可调度的候选之间优先使
 同一实例下账号和模型共享并发与间隔限制；同一账号、同一模型允许并发搜索，获取到有效新值后取消其余搜索。
 账号自身并发限制、账号状态校验及动态出口的并发/间隔限制仍然生效。Azure 同一出口服务内仍串行管理公网 IP。
 获取器状态新增 `runningRequests`，每项为 `[accountId, model]`，同一账号模型可重复出现；旧 `running` 保留其中一项，空闲时为 null。
-NovaProxy Rotating 仅支持 IPv4，每个租约创建新连接，由供应商轮换，
-不保证 24 小时内出口唯一。此类就绪租约返回 `provider:"novaproxy",ip:null,ipVerification:"unverified"`，
+SOCKS5 实例沿用 `bindings:{ipv4:{}}` 选择入口，每个租约创建新连接，是否轮换及实际出口地址由代理服务决定。
+此类就绪租约返回 `provider:"socks5",ip:null,ipVerification:"unverified"`（旧实例可能返回 `novaproxy`），
 获取记录 `exitIp` 为空，不能将独立探测的 IP 当作 OpenAI 出口；Azure 仍要求经过校验的实际 IP。
-配置与旧凭据迁移见 [动态出口部署](../deploy/dynamic-egress/README.md#novaproxy-rotating)。
+配置与旧凭据迁移见 [动态出口部署](../deploy/dynamic-egress/README.md#socks5-代理)。
 选定代理必须测试成功，连接失败不会回退到业务代理或直连。被引用代理须先解除获取器绑定才能删除。
 首次保存 `revision: 0`，后续携带 GET 返回版本；并发修改返回 409。重新保存清除失败暂停并重置尝试状态。
 
@@ -1322,7 +1323,7 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 
 | 方法 | 路由 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/admin/dashboard/summary` | Dashboard 汇总；支持 `kind`、`startTime`、`endTime` |
+| `GET` | `/api/admin/dashboard/summary` | Dashboard 汇总；支持 `kind`、`startTime`、`endTime`；`cards.credentials.validTurnStateAccounts` 为当前持有有效 292 的账号数，跨模型去重，排除已删除账号，不受查询日期影响 |
 | `GET` | `/api/admin/dashboard/trend` | Dashboard 趋势；`kind=usage|latency|errors` |
 | `GET` | `/api/admin/usage/records` | 请求记录分页列表 |
 | `GET` | `/api/admin/usage/records/detail` | 按 `id` 查询请求详情 |

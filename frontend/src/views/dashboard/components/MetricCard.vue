@@ -72,7 +72,7 @@ const sparklineOption = computed<EChartsOption | null>(() => {
 </script>
 
 <template>
-  <BaseCard as="article" padding="compact" class="relative h-38.5 w-full">
+  <BaseCard as="article" padding="compact" class="relative min-h-38.5 w-full">
     <div class="flex items-start gap-3">
       <BaseMotionIcon
         class="inline-flex size-8.5 shrink-0 items-center justify-center rounded-cp-lg"
@@ -103,30 +103,10 @@ const sparklineOption = computed<EChartsOption | null>(() => {
       <BaseChart :option="sparklineOption" :height="64" />
     </div>
 
-    <div
-      class="mt-3 grid h-7.5 w-full grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-center rounded-cp-lg bg-cp-fill-alter/70 px-3"
-    >
-      <span class="inline-grid min-w-0 w-full grid-cols-[auto_minmax(0,1fr)] items-baseline gap-2.5">
-        <span class="shrink-0 text-cp-xs leading-none font-emphasis text-cp-text-quaternary">
-          {{ metric.details[0]?.label }}
-        </span>
-        <b
-          class="min-w-0 truncate font-mono text-xs leading-none font-bold tabular-nums"
-          :class="metric.details[0]?.tone ? metricToneValueClasses[metric.details[0].tone] : undefined"
-        >
-          {{ metric.details[0]?.value }}
-        </b>
-      </span>
-      <span class="inline-grid min-w-0 w-full grid-cols-[auto_minmax(0,auto)] items-baseline justify-end gap-2.5">
-        <span class="shrink-0 text-cp-xs leading-none font-emphasis text-cp-text-quaternary">
-          {{ metric.details[1]?.label }}
-        </span>
-        <b
-          class="min-w-0 truncate font-mono text-xs leading-none font-bold tabular-nums"
-          :class="metric.details[1]?.tone ? metricToneValueClasses[metric.details[1].tone] : undefined"
-        >
-          {{ metric.details[1]?.value }}
-        </b>
+    <div class="mt-3 flex min-h-7.5 w-full flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-cp-lg bg-cp-fill-alter/70 px-3 py-2">
+      <span v-for="detail in metric.details" :key="detail.label" class="inline-flex min-w-0 items-baseline gap-2">
+        <span class="shrink-0 text-cp-xs leading-none font-emphasis text-cp-text-quaternary">{{ detail.label }}</span>
+        <b class="min-w-0 truncate font-mono text-xs leading-none font-bold tabular-nums" :class="detail.tone ? metricToneValueClasses[detail.tone] : undefined">{{ detail.value }}</b>
       </span>
     </div>
   </BaseCard>

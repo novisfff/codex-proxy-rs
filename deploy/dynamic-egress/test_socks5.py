@@ -9,35 +9,44 @@ from unittest.mock import patch
 
 from aiohttp import web
 from egress import Service, validate_instances
-from novaproxy import NovaProxy
+from socks5 import Socks5Proxy
 import test_egress
 
 
 def instance():
-    return {"provider": "novaproxy", "name": "Nova test", "host": "residential-gateway.novaproxy.io", "port": 1111,
+    return {"provider": "socks5", "name": "SOCKS5 test", "host": "residential-gateway.novaproxy.io", "port": 1111,
             "username": "test-country-us", "password": "private-password", "bindings": {"ipv4": {}}}
 
 
-class NovaTests(unittest.IsolatedAsyncioTestCase):
+class Socks5Tests(unittest.IsolatedAsyncioTestCase):
     def test_configuration_rejects_ipv6_credentials_and_paths(self):
         validate_instances({"nova": instance()})
         for change in ({"bindings": {"ipv6": {}}}, {"password": ""}, {"credentialRef": "../secret"},
-                       {"host": "novaproxy.io.evil.example"}, {"port": True}, {"port": 0},
+                       {"host": "https://proxy.example/path"}, {"port": True}, {"port": 0},
                        {"username": "bad\r\nuser"}, {"password": "x" * 256}):
             with self.assertRaises(web.HTTPBadRequest):
                 validate_instances({"nova": dict(instance(), **change)})
+
+    def test_arbitrary_proxy_hosts_and_legacy_provider(self):
+        for host in ("us.novproxy.io", "proxy.example.org", "localhost", "127.0.0.1", "2001:db8::1"):
+            for provider in ("socks5", "novaproxy"):
+                with self.subTest(host=host, provider=provider):
+                    validate_instances({"proxy": dict(instance(), host=host, provider=provider)})
+        for host in ("", "bad host", "user@host", "host/path", "host:1080", "[::1]", "-bad.example"):
+            with self.subTest(host=host), self.assertRaises(web.HTTPBadRequest):
+                validate_instances({"proxy": dict(instance(), host=host)})
 
     def test_credentials_permissions_and_validation(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, EGRESS_NOVAPROXY_CREDENTIALS_DIR=directory):
             path = Path(directory) / "test-us.json"
             path.write_text(json.dumps({"username": "test-country-us", "password": "test-password"}))
             path.chmod(0o600)
-            self.assertEqual(NovaProxy().credentials("test-us")["username"], "test-country-us")
+            self.assertEqual(Socks5Proxy().credentials("test-us")["username"], "test-country-us")
             path.chmod(0o644)
             with self.assertRaises(ValueError):
-                NovaProxy().credentials("test-us")
+                Socks5Proxy().credentials("test-us")
             with self.assertRaises(ValueError):
-                NovaProxy().credentials("../test-us")
+                Socks5Proxy().credentials("../test-us")
 
     async def test_connect_auth_tunnel_and_rejection(self):
         requests = []
@@ -68,26 +77,23 @@ class NovaTests(unittest.IsolatedAsyncioTestCase):
                 writer.close()
                 await writer.wait_closed()
         server = await asyncio.start_server(gateway, "127.0.0.1", 0)
-        original = asyncio.open_connection
-        async def dial(host, port):
-            self.assertEqual((host, port), ("residential-gateway.novaproxy.io", 1111))
-            return await original("127.0.0.1", server.sockets[0].getsockname()[1])
+        config = dict(instance(), host="127.0.0.1", port=server.sockets[0].getsockname()[1],
+                      username="test", password="secret")
         try:
-            with patch("novaproxy.asyncio.open_connection", dial):
-                reader, writer, trailing = await NovaProxy().connect(dict(instance(), username="test", password="secret"), b"api.openai.com:443")
-                self.assertEqual(trailing + await reader.read(), b"hello")
-                writer.close()
-                await writer.wait_closed()
-                self.assertEqual(requests[0], (b"test", b"secret", b"api.openai.com", b"\x01\xbb"))
-                with self.assertRaisesRegex(ConnectionError, "^NovaProxy SOCKS5 CONNECT rejected$"):
-                    await NovaProxy().connect(dict(instance(), username="test", password="secret"), b"api.openai.com:443")
-                self.assertEqual(len(requests), 2)
+            reader, writer, trailing = await Socks5Proxy().connect(config, b"api.openai.com:443")
+            self.assertEqual(trailing + await reader.read(), b"hello")
+            writer.close()
+            await writer.wait_closed()
+            self.assertEqual(requests[0], (b"test", b"secret", b"api.openai.com", b"\x01\xbb"))
+            with self.assertRaisesRegex(ConnectionError, "^SOCKS5 CONNECT rejected$"):
+                await Socks5Proxy().connect(config, b"api.openai.com:443")
+            self.assertEqual(len(requests), 2)
         finally:
             server.close()
             await server.wait_closed()
 
 
-class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
+class Socks5ServiceTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = test_egress.ServiceTests.asyncSetUp
     asyncTearDown = test_egress.ServiceTests.asyncTearDown
     ready = test_egress.ServiceTests.ready
@@ -119,7 +125,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.acquire(second, "nova", "ipv4")
         self.assertEqual(len(self.service.jobs), 2)
 
-    async def test_parallel_tunnels_are_independent_and_each_uses_novaproxy(self):
+    async def test_parallel_tunnels_are_independent_and_each_uses_socks5(self):
         await self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
         ids = [self.id, "22222222-2222-4222-8222-222222222222"]
         for job_id in ids:
@@ -142,7 +148,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             return reader, writer, b""
         streams = []
         try:
-            with patch.object(self.service.novaproxy, "connect", connect):
+            with patch.object(self.service.socks5, "connect", connect):
                 for job_id in ids:
                     reader, writer = await asyncio.open_connection("127.0.0.1", proxy.sockets[0].getsockname()[1])
                     streams.append((reader, writer))
@@ -197,6 +203,19 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.configure({"nova": dict(edited, password="stale")}, 2)
         self.assertEqual(self.service.config["instances"]["nova"]["password"], "replacement")
 
+    async def test_legacy_provider_can_be_saved_as_socks5_without_losing_password(self):
+        await self.service.configure({"nova": dict(instance(), provider="novaproxy")}, 0)
+        edited = dict(instance(), host="us.novproxy.io")
+        edited.pop("password")
+        await self.service.configure({"nova": edited}, 1)
+        self.assertEqual(self.service.config["instances"]["nova"]["password"], "private-password")
+        await self.service.acquire(self.id, "nova", "ipv4")
+        await self.ready()
+        lease = self.service.present(self.journal.job(self.id))
+        self.assertEqual(lease["provider"], "socks5")
+        self.assertEqual(lease["ipVerification"], "unverified")
+        self.assertEqual(self.provider.cleanups, 0)
+
     async def test_new_instance_requires_password_and_cannot_reuse_other_instance_secret(self):
         await self.service.configure({"nova": instance()}, 0)
         incomplete = instance()
@@ -207,7 +226,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_credentials_migrate_once_without_file_dependency(self):
         legacy = {"provider": "novaproxy", "name": "Legacy", "credentialRef": "legacy", "bindings": {"ipv4": {}}}
         self.journal.execute("INSERT OR REPLACE INTO settings VALUES(1,?,?)", (json.dumps({"nova": legacy}), 5))
-        with patch.object(NovaProxy, "credentials", return_value={"username": "legacy-user", "password": "legacy-secret"}) as read:
+        with patch.object(Socks5Proxy, "credentials", return_value={"username": "legacy-user", "password": "legacy-secret"}) as read:
             migrated = Service(test_egress.configuration(), self.journal, self.provider)
             self.assertEqual(migrated.revision, 6)
             self.assertEqual(migrated.config["instances"]["nova"]["password"], "legacy-secret")
@@ -216,9 +235,9 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("legacy-secret", json.dumps(restarted.snapshot()))
             self.assertNotIn("credentialRef", restarted.config["instances"]["nova"])
 
-    async def test_nova_single_use_tunnel_and_no_azure_allocation(self):
+    async def test_socks5_single_use_tunnel_and_no_azure_allocation(self):
         await self.service.configure({"nova": instance()}, 0)
-        with patch.object(self.service.novaproxy, "credentials", return_value={"username": "test", "password": "secret"}):
+        with patch.object(self.service.socks5, "credentials", return_value={"username": "test", "password": "secret"}):
             await self.service.acquire(self.id, "nova", "ipv4")
             await self.ready()
         connections = []
@@ -258,7 +277,7 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
         auth = base64.b64encode(f"{self.id}:{secret}".encode()).decode()
         request = f"CONNECT api.openai.com:443 HTTP/1.1\r\nHost: api.openai.com\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode()
         try:
-            with patch("novaproxy.asyncio.open_connection", dial):
+            with patch("socks5.asyncio.open_connection", dial):
                 reader, writer = await original("127.0.0.1", proxy.sockets[0].getsockname()[1])
                 writer.write(request)
                 await writer.drain()
@@ -284,9 +303,9 @@ class NovaServiceTests(unittest.IsolatedAsyncioTestCase):
             await proxy.wait_closed()
             await upstream.wait_closed()
 
-    async def test_nova_lease_has_no_claimed_ip_or_exposed_credentials(self):
+    async def test_socks5_lease_has_no_claimed_ip_or_exposed_credentials(self):
         await self.service.configure({"nova": instance()}, 0)
-        with patch.object(self.service.novaproxy, "credentials", return_value={"username": "test", "password": "private-password"}):
+        with patch.object(self.service.socks5, "credentials", return_value={"username": "test", "password": "private-password"}):
             await self.service.acquire(self.id, "nova", "ipv4")
             await self.ready()
         lease = self.service.present(self.journal.job(self.id))
