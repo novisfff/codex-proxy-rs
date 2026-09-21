@@ -407,12 +407,12 @@ onBeforeUnmount(() => {
         </section>
       </div>
     </BaseCard>
-    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；通用 SOCKS5 代理。仅用于 292 获取器。">
+    <BaseCard v-if="tab === 'egress'" title="专用动态出口" description="Azure 独占 IP；SOCKS5H sticky 代理。仅用于 292 获取器。">
       <p :class="snapshot.dynamicEgress?.available ? 'text-cp-success' : 'text-cp-warning'">
         {{ snapshot.dynamicEgress?.available ? '出口服务已就绪' : snapshot.dynamicEgress?.message || '尚未配置出口服务' }}
       </p>
       <p class="text-cp-sm text-cp-text-secondary">
-        Azure 获取到 292 时保留 IP 并优先复用，未获取到时换 IP，新申请避免连续重复。SOCKS5 代理每次新建连接，实际出口未验证，可能重复。
+        Azure 获取到 292 时保留 IP 并优先复用，未获取到时换 IP，新申请避免连续重复。SOCKS5H 使用用户名 SID 维持 sticky 会话，实际出口未验证。
       </p>
       <BaseButton :disabled="!instancesEditable || saving" @click="editInstance()">
         添加出口实例
@@ -487,6 +487,12 @@ onBeforeUnmount(() => {
                   <Copy class="size-4" />
                 </BaseIconButton>
               </div>
+              <div v-if="row.value.proxyUrl" class="flex min-w-0 flex-wrap items-center gap-2">
+                <span class="break-all">探测代理（含认证信息）：{{ row.value.proxyUrl }}</span><BaseIconButton :label="`复制 ${row.model} 的探测代理`" @click="copyText(row.value.proxyUrl, { successText: '探测代理已复制' })">
+                  <Copy class="size-4" />
+                </BaseIconButton>
+              </div>
+              <span v-else class="text-cp-text-tertiary">探测代理：未绑定（该值来自正常请求或旧版本数据）</span>
               <span>首次获取：{{ date(row.value.acquiredAt) }} · 最近收到：{{ date(row.value.lastSeenAt) }}</span>
               <span>预计到期：{{ date(row.value.expiresAt) }}</span>
               <details>
@@ -516,7 +522,7 @@ onBeforeUnmount(() => {
     <BaseModal v-model="instanceOpen" title="动态出口实例" size="md" :dismissible="!saving">
       <div class="grid gap-4">
         <BaseFormItem label="出口供应商">
-          <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'SOCKS5', value: 'socks5' }]" :disabled="saving || !!originalInstanceId" />
+          <BaseSelect v-model="instanceForm.provider" :options="[{ label: 'Azure', value: 'azure' }, { label: 'SOCKS5H（sticky）', value: 'socks5' }]" :disabled="saving || !!originalInstanceId" />
         </BaseFormItem>
         <BaseFormItem label="实例 ID">
           <BaseInput v-model="instanceId" :disabled="saving || !!originalInstanceId" :placeholder="instanceForm.provider === 'socks5' ? 'socks5-main' : 'azure-main'" />
@@ -539,14 +545,17 @@ onBeforeUnmount(() => {
           <BaseFormItem label="端口">
             <BaseInput :model-value="String(instanceForm.port ?? '')" type="number" min="1" max="65535" :disabled="saving" @update:model-value="instanceForm.port = Number($event)" />
           </BaseFormItem>
-          <BaseFormItem label="代理用户名">
-            <BaseInput v-model="instanceForm.username" autocomplete="off" :disabled="saving" />
+          <BaseFormItem label="代理用户名模板">
+            <BaseInput v-model="instanceForm.username" placeholder="例如 r_xxx-sid-__CPR_292_SID__-ttl-1440m" autocomplete="off" :disabled="saving" />
+            <p class="text-cp-xs text-cp-text-secondary">
+              使用 `__CPR_292_SID__` 占位符；每次 292 探测会替换成新的 12 位小写字母和数字 SID，并保持供应商 sticky 会话。
+            </p>
           </BaseFormItem>
           <BaseFormItem :label="instanceForm.passwordSet ? '代理密码（已配置，留空保留）' : '代理密码'">
             <BaseInput v-model="instanceForm.password" type="password" autocomplete="new-password" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-sm text-cp-warning">
-            每次建立独立 SOCKS5 连接；出口是否轮换由代理服务决定，实际 IP 未验证。
+            每次建立独立 SOCKS5H 连接；出口由用户名 SID 维持 sticky 会话，实际 IP 未验证。
           </p>
         </template>
         <template v-else>
@@ -625,7 +634,7 @@ onBeforeUnmount(() => {
             <BaseSelect v-model="dynamicFamily" :options="familyOptions" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-xs text-cp-text-secondary">
-            Azure 等待新 IP 就绪；SOCKS5 每次新建代理连接。仅请求官方 OpenAI，不使用账号自定义网关或业务代理。
+            Azure 等待新 IP 就绪；SOCKS5H 每次新建代理连接并使用远程 DNS。仅请求官方 OpenAI，不使用账号自定义网关或业务代理。
           </p>
         </template>
         <BaseFormItem label="获取模型（最多 32 个）">

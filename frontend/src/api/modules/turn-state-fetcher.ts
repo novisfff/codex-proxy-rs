@@ -45,6 +45,7 @@ export interface FetcherValue {
   lastSeenAt: number
   expiresAt: number
   source: string
+  proxyUrl: string | null
 }
 export interface FetcherAttempt {
   accountId: string
