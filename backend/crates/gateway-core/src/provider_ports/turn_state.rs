@@ -92,6 +92,8 @@ pub struct TurnStateValue {
     pub last_seen_at: i64,
     pub expires_at: i64,
     pub source: String,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 impl std::fmt::Debug for TurnStateValue {

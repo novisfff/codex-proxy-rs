@@ -747,6 +747,7 @@ impl TurnStateFetcher {
                 &model,
                 value,
                 "fetcher",
+                outcome.proxy_url.as_deref(),
                 outcome.received_at,
             );
             self.persist().await?;
@@ -919,6 +920,12 @@ impl TurnStateFetcher {
         .await
         .unwrap_or_else(|_| FetchOutcome::retry("获取超时", 60));
         outcome.exit_ip = lease.as_ref().and_then(|lease| lease.ip.clone());
+        attach_probe_proxy(
+            &mut outcome,
+            lease
+                .as_ref()
+                .and_then(|lease| lease.upstream_proxy_url.as_deref()),
+        );
         // 只保留成功响应中通过校验的票据；错误响应里的同长度头不能保留出口。
         if outcome.value.is_some()
             && let Some(lease) = lease.as_mut()
@@ -1398,7 +1405,14 @@ struct FetchOutcome {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     exit_ip: Option<String>,
+    proxy_url: Option<String>,
 }
+fn attach_probe_proxy(outcome: &mut FetchOutcome, proxy_url: Option<&str>) {
+    if outcome.value.is_some() {
+        outcome.proxy_url = proxy_url.map(str::to_owned);
+    }
+}
+
 impl FetchOutcome {
     fn retry(message: &str, retry_after: u64) -> Self {
         Self {
@@ -1413,6 +1427,7 @@ impl FetchOutcome {
             input_tokens: None,
             output_tokens: None,
             exit_ip: None,
+            proxy_url: None,
         }
     }
 
@@ -1540,5 +1555,23 @@ mod diagnostic_tests {
             assert!(!result.contains("user@example.com"));
             assert!(!result.contains("<html>"));
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_proxy_tests {
+    use super::{FetchOutcome, attach_probe_proxy};
+
+    #[test]
+    fn only_valid_captured_value_receives_probe_proxy() {
+        let mut captured = FetchOutcome::retry("pending", 0);
+        captured.capture(&"a".repeat(292));
+        attach_probe_proxy(&mut captured, Some("socks5h://probe"));
+        assert_eq!(captured.proxy_url.as_deref(), Some("socks5h://probe"));
+
+        let mut non_target = FetchOutcome::retry("pending", 0);
+        non_target.capture(&"b".repeat(291));
+        attach_probe_proxy(&mut non_target, Some("socks5h://probe"));
+        assert_eq!(non_target.proxy_url, None);
     }
 }

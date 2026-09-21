@@ -117,6 +117,7 @@ impl TurnStateCache {
         model: &str,
         value: &str,
         source: &str,
+        proxy_url: Option<&str>,
         now: i64,
     ) {
         if !valid_value(value) {
@@ -133,6 +134,9 @@ impl TurnStateCache {
             }
             if previous.value == value {
                 previous.last_seen_at = now;
+                if let Some(proxy_url) = proxy_url {
+                    previous.proxy_url = Some(proxy_url.to_owned());
+                }
                 return;
             }
         }
@@ -146,6 +150,7 @@ impl TurnStateCache {
                 last_seen_at: now,
                 expires_at: expiration(value, now),
                 source: source.to_owned(),
+                proxy_url: proxy_url.map(str::to_owned),
             },
         );
         if expiration(value, now) > now {
@@ -220,6 +225,7 @@ impl ScopedTurnState {
             &self.key.1,
             value,
             "traffic",
+            None,
             Utc::now().timestamp_millis(),
         );
     }
@@ -270,18 +276,74 @@ mod timestamp_tests {
         let cache = TurnStateCache::default();
         let value = token((generated / 1000) as u64);
         assert_eq!(value.len(), 292);
-        cache.observe_at("account", "model", &value, "fetcher", acquired);
+        cache.observe_at("account", "model", &value, "fetcher", None, acquired);
         let entry = cache.values().remove(0);
         assert_eq!(entry.acquired_at, acquired);
         assert_eq!(entry.expires_at, generated + STATE_TTL_MS);
         assert!(entry.expires_at - REFRESH_BEFORE_MS < acquired);
-        cache.observe_at("account", "model", &value, "traffic", acquired + 1000);
+        cache.observe_at("account", "model", &value, "traffic", None, acquired + 1000);
         assert_eq!(cache.values()[0].expires_at, entry.expires_at);
         let mut old = entry;
         old.expires_at = acquired + STATE_TTL_MS;
         let restored = TurnStateCache::default();
         restored.restore(vec![old]);
         assert_eq!(restored.values()[0].expires_at, generated + STATE_TTL_MS);
+    }
+
+    #[test]
+    fn probe_proxy_updates_for_same_value_without_renewing_expiry() {
+        let acquired = 1_800_000_000_000;
+        let cache = TurnStateCache::default();
+        let value = token((acquired / 1000) as u64);
+        let other = token((acquired / 1000 + 1) as u64);
+
+        cache.observe_at(
+            "account",
+            "model",
+            &value,
+            "fetcher",
+            Some("socks5h://first"),
+            acquired,
+        );
+        let original_expiry = cache.values()[0].expires_at;
+        cache.observe_at(
+            "account",
+            "model",
+            &value,
+            "fetcher",
+            Some("socks5h://latest"),
+            acquired + 1_000,
+        );
+        assert_eq!(
+            cache.values()[0].proxy_url.as_deref(),
+            Some("socks5h://latest")
+        );
+        assert_eq!(cache.values()[0].expires_at, original_expiry);
+
+        cache.observe_at(
+            "account",
+            "model",
+            &other,
+            "traffic",
+            None,
+            acquired + 2_000,
+        );
+        assert_eq!(cache.values()[0].proxy_url, None);
+    }
+
+    #[test]
+    fn old_turn_state_json_defaults_probe_proxy_to_none() {
+        let value = serde_json::json!({
+            "accountId": "account",
+            "model": "model",
+            "value": "a".repeat(292),
+            "acquiredAt": 1000,
+            "lastSeenAt": 1000,
+            "expiresAt": 3601000,
+            "source": "traffic"
+        });
+        let restored: TurnStateValue = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.proxy_url, None);
     }
 
     #[test]
@@ -293,6 +355,7 @@ mod timestamp_tests {
             "model-a",
             &token((now / 1000) as u64),
             "traffic",
+            None,
             now,
         );
         cache.observe_at(
@@ -300,6 +363,7 @@ mod timestamp_tests {
             "model-a",
             &token((now / 1000 - 3601) as u64),
             "traffic",
+            None,
             now,
         );
         cache.observe_at(
@@ -307,6 +371,7 @@ mod timestamp_tests {
             "model-b",
             &token((now / 1000) as u64),
             "traffic",
+            None,
             now,
         );
         assert_eq!(

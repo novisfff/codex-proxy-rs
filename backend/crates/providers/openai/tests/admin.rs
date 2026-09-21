@@ -1226,6 +1226,7 @@ mod turn_state_fetcher {
                 last_seen_at: acquired,
                 expires_at: acquired + 3600000,
                 source: "traffic".to_owned(),
+                proxy_url: None,
             };
             store.values.lock().unwrap().push(previous.clone());
             let config = valid_config();
@@ -1774,6 +1775,7 @@ mod turn_state_fetcher {
             last_seen_at: acquired,
             expires_at: acquired + 3_600_000,
             source: "traffic".to_owned(),
+            proxy_url: None,
         });
         let config = valid_config();
         let bundle = provider_openai::initialize(

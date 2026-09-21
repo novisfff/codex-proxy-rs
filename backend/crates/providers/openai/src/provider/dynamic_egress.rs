@@ -26,6 +26,7 @@ struct LeaseResponse {
     ip: Option<String>,
     proxy_url: Option<String>,
     secret: Option<String>,
+    upstream_proxy_url: Option<String>,
     provider: Option<String>,
     ip_verification: Option<String>,
 }
@@ -35,6 +36,7 @@ pub(super) struct Lease {
     pub(super) id: String,
     pub(super) ip: Option<String>,
     pub(super) http: Option<Client>,
+    pub(super) upstream_proxy_url: Option<String>,
     retain_ip: bool,
 }
 
@@ -133,6 +135,7 @@ impl DynamicEgress {
             id: uuid::Uuid::new_v4().to_string(),
             ip: None,
             http: None,
+            upstream_proxy_url: None,
             retain_ip: false,
         };
         let result = tokio::time::timeout(Duration::from_secs(900), async {
@@ -164,6 +167,7 @@ impl DynamicEgress {
                             Some(proxy), profile == TurnStateProbeProfile::MinimalCompat,
                         ).map_err(|_| ())?);
                         lease.ip = ip;
+                        lease.upstream_proxy_url = body.upstream_proxy_url;
                         return Ok(());
                     }
                     _ => return Err(()),
@@ -212,6 +216,7 @@ mod tests {
                 id: "test-lease".to_owned(),
                 ip: None,
                 http: None,
+                upstream_proxy_url: None,
                 retain_ip: false,
             };
             if retain {
@@ -239,6 +244,20 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[test]
+    fn lease_response_preserves_upstream_proxy_url() {
+        let body: LeaseResponse = serde_json::from_value(json!({
+            "state": "ready",
+            "proxyUrl": "http://127.0.0.1:19081",
+            "upstreamProxyUrl": "socks5h://user:password@proxy.example:1111"
+        }))
+        .unwrap();
+        assert_eq!(
+            body.upstream_proxy_url.as_deref(),
+            Some("socks5h://user:password@proxy.example:1111")
+        );
     }
 
     #[test]
