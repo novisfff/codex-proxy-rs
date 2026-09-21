@@ -134,6 +134,44 @@ class Socks5ServiceTests(unittest.IsolatedAsyncioTestCase):
     asyncTearDown = test_egress.ServiceTests.asyncTearDown
     ready = test_egress.ServiceTests.ready
 
+    async def test_sticky_lease_returns_unique_upstream_proxy_urls(self):
+        template = "r_country-sid-__CPR_292_SID__-ttl-1440m"
+        config = dict(instance(), username=template, maxConcurrent=2, intervalSeconds=0)
+        second = "22222222-2222-4222-8222-222222222222"
+
+        with patch("secrets.choice", side_effect=list("a" * 12 + "b" * 12)):
+            await self.service.configure({"nova": config}, 0)
+            await self.service.acquire(self.id, "nova", "ipv4")
+            await self.service.acquire(second, "nova", "ipv4")
+
+        await self.ready()
+        for _ in range(100):
+            if self.journal.job(second)["state"] == "ready":
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(self.journal.job(second)["state"], "ready")
+        first_lease = self.service.present(self.journal.job(self.id))
+        second_lease = self.service.present(self.journal.job(second))
+
+        self.assertRegex(first_lease["upstreamProxyUrl"], r"^socks5h://r_country-sid-[a-z0-9]{12}-ttl-1440m:")
+        self.assertRegex(second_lease["upstreamProxyUrl"], r"^socks5h://r_country-sid-[a-z0-9]{12}-ttl-1440m:")
+        self.assertNotEqual(first_lease["upstreamProxyUrl"], second_lease["upstreamProxyUrl"])
+        self.assertEqual(self.service.config["instances"]["nova"]["username"], template)
+        snapshot = json.dumps(self.service.snapshot())
+        self.assertNotIn("private-password", snapshot)
+        self.assertNotIn("upstreamProxyUrl", snapshot)
+
+    async def test_idempotent_sticky_lease_keeps_upstream_proxy_url(self):
+        config = dict(instance(), username="r_country-sid-__CPR_292_SID__-ttl-1440m", intervalSeconds=0)
+        with patch("secrets.choice", side_effect=list("c" * 12)):
+            await self.service.configure({"nova": config}, 0)
+            await self.service.acquire(self.id, "nova", "ipv4")
+            await self.ready()
+            first_lease = self.service.present(self.journal.job(self.id))
+            second_lease = await self.service.acquire(self.id, "nova", "ipv4")
+
+        self.assertEqual(first_lease["upstreamProxyUrl"], second_lease["upstreamProxyUrl"])
+
     async def test_concurrency_limit_and_independent_release(self):
         await self.service.configure({"nova": dict(instance(), maxConcurrent=2, intervalSeconds=0)}, 0)
         second = "22222222-2222-4222-8222-222222222222"

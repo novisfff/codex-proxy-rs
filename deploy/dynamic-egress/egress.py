@@ -377,8 +377,14 @@ class Service:
         if now - self.last_started.get(instance, float("-inf")) < config.get("intervalSeconds", 10):
             raise web.HTTPConflict()
         self.journal.execute("DELETE FROM jobs WHERE created<? AND state IN ('released','failed')", (time.time() - 7 * 86400,))
+        credentials, upstream_proxy_url = (
+            self.socks5.prepare_credentials(config)
+            if config["provider"] in ("socks5", "novaproxy")
+            else (config, None)
+        )
         job = {"instance": instance, "provider": config["provider"], "released": asyncio.Event(),
-               "tunnel": None, "source": None, "credentials": config, "retain_ip": False}
+               "tunnel": None, "source": None, "credentials": credentials,
+               "upstream_proxy_url": upstream_proxy_url, "retain_ip": False}
         self.jobs[job_id] = job
         self.last_started[instance] = now
         self.journal.execute("INSERT INTO jobs(id,instance,family,state,created,provider) VALUES(?,?,?,'provisioning',?,?)",
@@ -391,6 +397,9 @@ class Service:
         result.update(provider=row["provider"], ipVerification="unverified" if row["provider"] in ("socks5", "novaproxy") else "verified")
         if row["state"] == "ready":
             result.update(proxyUrl=self.config["proxyUrl"], secret=row["secret"])
+            job = self.jobs.get(row["id"])
+            if job and job.get("upstream_proxy_url"):
+                result["upstreamProxyUrl"] = job["upstream_proxy_url"]
         return result
 
     async def run(self, job_id, instance, family):
