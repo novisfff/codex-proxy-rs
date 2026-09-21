@@ -126,7 +126,7 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         last_seen_at: 2000,
         expires_at: 3601000,
         source: "fetcher".to_owned(),
-        proxy_url: None,
+        proxy_url: Some("socks5h://user:password@proxy.example:1111".to_owned()),
     };
     store.save_values(vec![value.clone()]).await.unwrap();
     let mut older = value.clone();

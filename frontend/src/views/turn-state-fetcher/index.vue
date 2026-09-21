@@ -492,7 +492,7 @@ onBeforeUnmount(() => {
                   <Copy class="size-4" />
                 </BaseIconButton>
               </div>
-              <span v-else class="text-cp-text-tertiary">探测代理：未绑定（该值来自正常请求或旧版本数据）</span>
+              <span v-else class="text-cp-text-tertiary">探测代理：未绑定</span>
               <span>首次获取：{{ date(row.value.acquiredAt) }} · 最近收到：{{ date(row.value.lastSeenAt) }}</span>
               <span>预计到期：{{ date(row.value.expiresAt) }}</span>
               <details>
@@ -548,7 +548,7 @@ onBeforeUnmount(() => {
           <BaseFormItem label="代理用户名模板">
             <BaseInput v-model="instanceForm.username" placeholder="例如 r_xxx-sid-__CPR_292_SID__-ttl-1440m" autocomplete="off" :disabled="saving" />
             <p class="text-cp-xs text-cp-text-secondary">
-              使用 `__CPR_292_SID__` 占位符；每次 292 探测会替换成新的 12 位小写字母和数字 SID，并保持供应商 sticky 会话。
+              使用 <code>__CPR_292_SID__</code> 占位符；每次 292 探测会替换成新的 12 位小写字母和数字 SID，并保持供应商 sticky 会话。
             </p>
           </BaseFormItem>
           <BaseFormItem :label="instanceForm.passwordSet ? '代理密码（已配置，留空保留）' : '代理密码'">
