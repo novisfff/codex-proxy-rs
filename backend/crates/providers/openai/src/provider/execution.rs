@@ -588,9 +588,25 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         mut session_capture,
     } = response;
     Box::pin(async_stream::try_stream! {
-        let turn_state = turn_state.scope(lease.account_id().as_str(), request.model());
+        let mut turn_state = turn_state.scope(lease.account_id().as_str(), request.model());
         let automatic_turn_state = lease.codex_turn_state().mode == gateway_core::policy::CodexTurnStateMode::Auto;
-        turn_state.apply(&mut request, lease.codex_turn_state());
+        let proxy = turn_state.apply(&mut request, lease.codex_turn_state()).map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let mut active_account = lease.account().clone();
+        if automatic_turn_state && request.turn_state.is_some() {
+            active_account = active_account.with_outbound_proxy(proxy);
+        }
+        turn_state.bind_request(&request, active_account.outbound_proxy());
+        // 使用实际出口构造 HTTP 客户端及 WebSocket 池键；失败不回退到账号出口或直连。
+        let client = client.for_account(&active_account).map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let client = if automatic_turn_state {
+            client.with_turn_state_session(turn_state.session())
+        } else {
+            client
+        };
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let failure_context = OpenAiFailureContext {
@@ -602,7 +618,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             allows_account_state_mutation,
             allows_capacity_feedback: !context.is_diagnostic_required_account(),
         };
-        let mut active_account = lease.account().clone();
         let cookie_header = build_cookie_header(lease.cookies())?;
         let authorization = lease
             .authentication()
@@ -757,7 +772,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 && let Ok(current) = selector.current_account(active_account.id()).await
                 && current.revision().get() == revision
         {
-            active_account = current;
+            active_account = current.with_outbound_proxy(active_account.outbound_proxy().cloned());
         }
         let response_transport = response.transport;
         let websocket_connection_id = response.websocket_connection_id;

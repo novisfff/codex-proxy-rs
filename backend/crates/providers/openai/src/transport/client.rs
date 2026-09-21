@@ -710,6 +710,29 @@ pub struct CodexBackendClient {
 }
 
 impl CodexBackendClient {
+    pub(crate) fn with_turn_state_session(
+        mut self,
+        session: Option<&gateway_core::provider_ports::turn_state::TurnStateSession>,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        if let Some(session) = session {
+            // 仅自动 State 的探测会话分代；普通客户端的线程变化仍遵循原有连接复用合同。
+            let mut hash = Sha256::new();
+            for value in [&session.session_id, &session.thread_id, &session.window_id] {
+                hash.update(value.len().to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+            self.egress_key
+                .push_str(&format!(":session:{}", hex::encode(hash.finalize())));
+            self.websocket_origin_key = format!(
+                "{}:{}",
+                websocket_origin_key(&self.base_url),
+                self.egress_key
+            );
+        }
+        self
+    }
+
     pub(crate) fn with_base_url(mut self, base_url: Option<&str>) -> Self {
         if let Some(base_url) = base_url {
             self.base_url = base_url.trim_end_matches('/').to_owned();

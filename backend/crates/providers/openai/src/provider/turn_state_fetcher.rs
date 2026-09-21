@@ -6,7 +6,7 @@ use crate::transport::canonical::{CodexCanonicalDecoder, CodexCanonicalOutcome};
 use crate::{
     credential::{CodexCredentialCatalogService, CodexCredentialCodec},
     transport::{
-        CodexBackendClient, CodexCatalogCapabilityEvidence, CodexClientError, CodexRequestContext,
+        CodexBackendClient, CodexCatalogCapabilityEvidence, CodexClientError,
         client::{build_turn_state_http_client, turn_state_proxy},
         diagnostics::{CodexFailureCategory, CodexUpstreamFailure},
         encode_generate_request,
@@ -28,7 +28,6 @@ use gateway_core::{
     routing::{ProviderKind, UpstreamModelId},
     task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
-use secrecy::ExposeSecret;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -221,6 +220,7 @@ pub(crate) struct TurnStateFetcher {
     cooldowns: Arc<dyn ProviderCooldownPort>,
     execution: Option<Arc<dyn ExecutionStore>>,
     catalog: Arc<CodexCredentialCatalogService>,
+    selector: Arc<crate::credential::CodexCredentialSelector>,
     cache: TurnStateCache,
     profile: CodexWireProfileState,
     base_url: String,
@@ -245,6 +245,7 @@ impl TurnStateFetcher {
         cooldowns: Arc<dyn ProviderCooldownPort>,
         execution: Option<Arc<dyn ExecutionStore>>,
         catalog: Arc<CodexCredentialCatalogService>,
+        selector: Arc<crate::credential::CodexCredentialSelector>,
         cache: TurnStateCache,
         profile: CodexWireProfileState,
         base_url: String,
@@ -257,6 +258,7 @@ impl TurnStateFetcher {
             cooldowns,
             execution,
             catalog,
+            selector,
             cache,
             profile,
             base_url,
@@ -743,11 +745,11 @@ impl TurnStateFetcher {
                 v.account_id == config.account_id && v.model == model && v.value == *value
             });
             self.cache.observe_at(
-                &config.account_id,
-                &model,
+                (&config.account_id, &model),
                 value,
                 "fetcher",
                 outcome.proxy_url.as_deref(),
+                outcome.session.as_ref(),
                 outcome.received_at,
             );
             self.persist().await?;
@@ -1184,6 +1186,15 @@ impl TurnStateFetcher {
             return FetchOutcome::paused("凭据格式无效");
         };
         let request_id = format!("req_turn_state_fetch_{}", uuid::Uuid::new_v4());
+        let Ok(response_origin) = client.request_url(crate::transport::CODEX_RESPONSES_PATH) else {
+            return FetchOutcome::paused("请求地址无效");
+        };
+        let cookies = self
+            .selector
+            .replay_cookies(runtime.cookies, &response_origin);
+        let Ok(cookie_header) = super::observation::build_cookie_header(&cookies) else {
+            return FetchOutcome::paused("账号 Cookie 无效");
+        };
         let mut usage = ProbeUsage::start(
             self.execution.clone(),
             &request_id,
@@ -1201,14 +1212,16 @@ impl TurnStateFetcher {
             },
         )
         .await;
-        let mut context = CodexRequestContext::auxiliary(
-            authorization.expose_secret(),
-            account.upstream_account_id(),
+        let mut context = super::observation::codex_request_context(
+            &request,
             &request_id,
-            Some(&runtime.installation_id),
+            account,
+            &runtime.installation_id,
+            &authorization,
+            cookie_header.as_ref(),
+            Default::default(),
         );
-        // 与普通 Codex turn 一样，将正文中的会话身份投影到协议请求头；这些 ID 只
-        // 属于本次探测，不携带用户历史，也不会改变账号 + 模型的 Turn State 缓存键。
+        // 将探测会话身份投影到协议头；成功后随票据保存，供自动模式延续会话。
         context.session_id = Some(&session_id);
         context.thread_id = Some(&thread_id);
         context.codex_window_id = Some(&window_id);
@@ -1240,13 +1253,44 @@ impl TurnStateFetcher {
             }
         };
         let mut outcome = FetchOutcome::retry("未返回 292 字节值", 0);
+        // 探测和正式流量共用 Cookie 域、路径及凭据版本校验，不重放请求级身份头。
+        let mut credential_revision = account.revision().get();
+        if !response.set_cookie_headers.is_empty() {
+            match self
+                .selector
+                .capture_response_cookies(account, &response_origin, &response.set_cookie_headers)
+                .await
+            {
+                Ok(captured) => {
+                    credential_revision =
+                        captured.credential_revision.unwrap_or(credential_revision);
+                }
+                Err(_) => {
+                    usage.response(&response);
+                    usage.fail("probe cookie persistence failed");
+                    usage.finish().await;
+                    return FetchOutcome::retry("探测 Cookie 保存失败", 60);
+                }
+            }
+        }
         usage.response(&response);
         outcome.http_status = response.diagnostics.status_code;
         diagnostics.http_status = outcome.http_status;
         diagnostics.http_version = response.transport_metrics.http_version.clone();
         if let Some(value) = response.turn_state {
             outcome.capture(&value);
+            outcome.session = outcome.value.as_ref().map(|_| TurnStateSession {
+                session_id,
+                thread_id,
+                window_id,
+            });
             diagnostics.byte_length = outcome.byte_length;
+        }
+        if dynamic.is_none() {
+            attach_probe_proxy(
+                &mut outcome,
+                egress.proxy.as_ref().map(|proxy| proxy.expose_url()),
+            );
         }
         let mut decoder = CodexCanonicalDecoder::new(model)
             .with_reported_model(response.response_metadata.effective_model.as_deref());
@@ -1300,7 +1344,7 @@ impl TurnStateFetcher {
             .accounts
             .load_current_credential(&id)
             .await
-            .is_ok_and(|fresh| fresh.account.revision() == account.revision())
+            .is_ok_and(|fresh| fresh.account.revision().get() == credential_revision)
         {
             outcome.value = None;
             outcome.received_at = 0;
@@ -1406,10 +1450,13 @@ struct FetchOutcome {
     output_tokens: Option<u64>,
     exit_ip: Option<String>,
     proxy_url: Option<String>,
+    session: Option<TurnStateSession>,
 }
 fn attach_probe_proxy(outcome: &mut FetchOutcome, proxy_url: Option<&str>) {
-    if outcome.value.is_some() {
-        outcome.proxy_url = proxy_url.map(str::to_owned);
+    if outcome.value.is_some()
+        && let Some(proxy_url) = proxy_url
+    {
+        outcome.proxy_url = Some(proxy_url.to_owned());
     }
 }
 
@@ -1428,6 +1475,7 @@ impl FetchOutcome {
             output_tokens: None,
             exit_ip: None,
             proxy_url: None,
+            session: None,
         }
     }
 

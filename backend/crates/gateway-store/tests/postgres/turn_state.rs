@@ -127,6 +127,11 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         expires_at: 3601000,
         source: "fetcher".to_owned(),
         proxy_url: Some("socks5h://user:password@proxy.example:1111".to_owned()),
+        session: Some(TurnStateSession {
+            session_id: "probe-session".to_owned(),
+            thread_id: "probe-thread".to_owned(),
+            window_id: "probe-window".to_owned(),
+        }),
     };
     store.save_values(vec![value.clone()]).await.unwrap();
     let mut older = value.clone();

@@ -143,10 +143,14 @@ impl CodexBackendClient {
             reqwest::header::USER_AGENT,
             HeaderValue::from_static("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
         );
-        headers.insert(
-            "session_id",
-            HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())?,
-        );
+        let session_id = context
+            .session_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        headers.insert("session_id", HeaderValue::from_str(&session_id)?);
+        if let Some(cookie) = context.cookie_header {
+            headers.insert(reqwest::header::COOKIE, HeaderValue::from_str(cookie)?);
+        }
         let mut body = serde_json::json!({
             "model": model, "store": false, "stream": true,
             "instructions": "Reply with exactly: pong",

@@ -163,7 +163,7 @@ pub async fn initialize(
     ));
     let core_provider = Arc::new(
         CodexProvider::new(
-            selector,
+            Arc::clone(&selector),
             Arc::clone(&catalog),
             Arc::clone(&quota),
             account_feedback,
@@ -230,6 +230,7 @@ pub async fn initialize(
                 ports.cooldowns(),
                 ports.execution(),
                 Arc::clone(&catalog),
+                Arc::clone(&selector),
                 cache,
                 profile.clone(),
                 config.base_url().to_owned(),

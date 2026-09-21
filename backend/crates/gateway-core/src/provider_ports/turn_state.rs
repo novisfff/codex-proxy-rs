@@ -94,6 +94,17 @@ pub struct TurnStateValue {
     pub source: String,
     #[serde(default)]
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub session: Option<TurnStateSession>,
+}
+
+/// 随票据保存的上游会话身份；请求及 turn 身份不跨请求复用。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateSession {
+    pub session_id: String,
+    pub thread_id: String,
+    pub window_id: String,
 }
 
 impl std::fmt::Debug for TurnStateValue {

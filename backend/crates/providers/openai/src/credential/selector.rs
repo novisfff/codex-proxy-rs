@@ -713,22 +713,10 @@ impl CodexCredentialSelector {
                             ))
                             .ok()
                         });
-                        let cookies = runtime
-                            .cookies
-                            .into_iter()
-                            .filter(|cookie| {
-                                cookie
-                                    .expires_at
-                                    .is_none_or(|expires| expires > chrono::Utc::now())
-                                    && self.cookie_policy.may_replay(
-                                        request_url.as_ref().unwrap_or(request.request_url),
-                                        &cookie.domain,
-                                        &cookie.path,
-                                        cookie.host_only,
-                                        cookie.secure,
-                                    )
-                            })
-                            .collect();
+                        let cookies = self.replay_cookies(
+                            runtime.cookies,
+                            request_url.as_ref().unwrap_or(request.request_url),
+                        );
                         if !diagnostic
                             && observed_affinity_account.as_ref() == Some(account.id())
                             && let Some(key) = request.session_affinity_key
@@ -1192,6 +1180,28 @@ impl CodexCredentialSelector {
             .await
             .map_err(|_| CredentialSelectionError::Store)?
             .ok_or(CredentialSelectionError::InvalidCredential)
+    }
+
+    pub(crate) fn replay_cookies(
+        &self,
+        cookies: Vec<RuntimeCodexCookie>,
+        request_url: &Url,
+    ) -> Vec<RuntimeCodexCookie> {
+        cookies
+            .into_iter()
+            .filter(|cookie| {
+                cookie
+                    .expires_at
+                    .is_none_or(|expires| expires > chrono::Utc::now())
+                    && self.cookie_policy.may_replay(
+                        request_url,
+                        &cookie.domain,
+                        &cookie.path,
+                        cookie.host_only,
+                        cookie.secure,
+                    )
+            })
+            .collect()
     }
 
     pub async fn capture_response_cookies(

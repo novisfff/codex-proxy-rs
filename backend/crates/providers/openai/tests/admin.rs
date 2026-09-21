@@ -965,6 +965,12 @@ mod turn_state_fetcher {
             let session =
                 uuid::Uuid::parse_str(request.headers["session_id"].to_str().unwrap()).unwrap();
             assert!(sessions.insert(session));
+            if length == 292 {
+                assert_eq!(
+                    snapshot.values[0].session.as_ref().unwrap().session_id,
+                    session.to_string()
+                );
+            }
             assert!(probe.fresh_connection);
             assert_eq!(probe.http_version.as_deref(), Some("HTTP/1.1"));
             assert_eq!(body["model"], MODEL);
@@ -1227,6 +1233,7 @@ mod turn_state_fetcher {
                 expires_at: acquired + 3600000,
                 source: "traffic".to_owned(),
                 proxy_url: None,
+                session: None,
             };
             store.values.lock().unwrap().push(previous.clone());
             let config = valid_config();
@@ -1764,6 +1771,335 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
+    async fn automatic_state_routes_business_request_through_captured_socks_proxy() {
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        for websocket in [false, true] {
+            let upstream = MockServer::start().await;
+            mount(&upstream, &"b".repeat(292), 200).await;
+            let accounts = fetch_accounts(&upstream).await;
+            accounts
+                .set_turn_state(
+                    ACCOUNT,
+                    CodexTurnStateConfig {
+                        mode: CodexTurnStateMode::Auto,
+                        value: String::new(),
+                    },
+                )
+                .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = format!(
+                "socks5h://probe-user:probe-password@{}",
+                listener.local_addr().unwrap()
+            );
+            let destination = *upstream.address();
+            let (sent, received) = tokio::sync::oneshot::channel();
+            let tunnel = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let target = accept_probe_socks(&mut socket).await;
+                sent.send(target).unwrap();
+                if websocket {
+                    use futures::SinkExt;
+                    use tokio_tungstenite::tungstenite::Message;
+                    let mut ws = crate::transport::accept_codex_test_websocket_with(
+                        socket,
+                        |request, _response| {
+                            assert_eq!(request.headers()["x-codex-turn-state"], "a".repeat(292));
+                            assert_eq!(request.headers()["session-id"], "probe-session");
+                            assert_eq!(request.headers()["thread-id"], "probe-thread");
+                        },
+                    )
+                    .await;
+                    let frame = ws.next().await.unwrap().unwrap();
+                    let body: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                    assert_eq!(body["client_metadata"]["session_id"], "probe-session");
+                    assert_eq!(body["client_metadata"]["thread_id"], "probe-thread");
+                    assert_eq!(body["client_metadata"]["x-codex-window-id"], "probe-window");
+                    ws.send(Message::Text(json!({"type":"response.metadata","headers":{"x-codex-turn-state":["b".repeat(292)]}}).to_string().into())).await.unwrap();
+                    ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"resp_auto_proxy_ws","model":MODEL,"status":"completed","output":[]}}).to_string().into())).await.unwrap();
+                    return;
+                }
+                let mut remote = tokio::net::TcpStream::connect(destination).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut socket, &mut remote).await;
+            });
+            accounts
+                .set_openai_base_url(
+                    ACCOUNT,
+                    Some(format!("http://localhost:{}", destination.port())),
+                )
+                .await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let now = Utc::now().timestamp_millis();
+            store.values.lock().unwrap().push(TurnStateValue {
+                account_id: ACCOUNT.to_owned(),
+                model: MODEL.to_owned(),
+                value: "a".repeat(292),
+                acquired_at: now,
+                last_seen_at: now,
+                expires_at: now + 3_600_000,
+                source: "fetcher".to_owned(),
+                proxy_url: Some(proxy.clone()),
+                session: Some(TurnStateSession {
+                    session_id: "probe-session".to_owned(),
+                    thread_id: "probe-thread".to_owned(),
+                    window_id: "probe-window".to_owned(),
+                }),
+            });
+            let bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                    .with_turn_state(store),
+            )
+            .await
+            .unwrap();
+            let payload = ProtocolPayload::json_object(
+                "openai",
+                serde_json::from_value(json!({"model":MODEL,"input":"test"})).unwrap(),
+            )
+            .unwrap()
+            .with_context(Map::from_iter([(
+                "use_websocket".to_owned(),
+                json!(websocket),
+            )]));
+            let mut stream = bundle
+                .core_provider()
+                .execute(
+                    initialized_provider_request(
+                        Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                        ACCOUNT,
+                    ),
+                    initialized_attempt_context("req_auto_proxy", ACCOUNT),
+                )
+                .await
+                .unwrap();
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), received)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                ("localhost".to_owned(), destination.port())
+            );
+            let requests = upstream.received_requests().await.unwrap();
+            if !websocket {
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].headers["x-codex-turn-state"], "a".repeat(292));
+                assert_eq!(requests[0].headers["session-id"], "probe-session");
+            } else {
+                assert!(requests.is_empty());
+            }
+            let values = bundle
+                .admin_provider()
+                .turn_state_fetcher()
+                .await
+                .unwrap()
+                .values;
+            assert_eq!(values[0].value, "b".repeat(292));
+            assert_eq!(values[0].proxy_url.as_deref(), Some(proxy.as_str()));
+            assert_eq!(
+                values[0].session.as_ref().unwrap().session_id,
+                "probe-session"
+            );
+            tunnel.abort();
+            let _ = tunnel.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_egress_uses_direct_probe_and_never_falls_back_from_failed_proxy() {
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        for captured_proxy in [None, Some("socks5h://127.0.0.1:1")] {
+            let upstream = MockServer::start().await;
+            mount(&upstream, &"b".repeat(292), 200).await;
+            let accounts = fetch_accounts(&upstream).await;
+            accounts
+                .set_turn_state(
+                    ACCOUNT,
+                    CodexTurnStateConfig {
+                        mode: CodexTurnStateMode::Auto,
+                        value: String::new(),
+                    },
+                )
+                .await;
+            // 直连票据必须覆盖不可达的账号代理；坏票据代理不能退回可达的账号直连。
+            accounts.set_egress(
+                ACCOUNT,
+                captured_proxy
+                    .is_none()
+                    .then(|| OutboundProxy::parse("socks5h://127.0.0.1:1").unwrap()),
+                None,
+            );
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let now = Utc::now().timestamp_millis();
+            store.values.lock().unwrap().push(TurnStateValue {
+                account_id: ACCOUNT.to_owned(),
+                model: MODEL.to_owned(),
+                value: "a".repeat(292),
+                acquired_at: now,
+                last_seen_at: now,
+                expires_at: now + 3_600_000,
+                source: "fetcher".to_owned(),
+                proxy_url: captured_proxy.map(str::to_owned),
+                session: None,
+            });
+            let bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                    .with_turn_state(store),
+            )
+            .await
+            .unwrap();
+            let payload = ProtocolPayload::json_object(
+                "openai",
+                serde_json::from_value(json!({"model":MODEL, "input":"test"})).unwrap(),
+            )
+            .unwrap()
+            .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+            let mut stream = bundle
+                .core_provider()
+                .execute(
+                    initialized_provider_request(
+                        Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                        ACCOUNT,
+                    ),
+                    initialized_attempt_context("req_auto_egress", ACCOUNT),
+                )
+                .await
+                .unwrap();
+            let mut failed = false;
+            while let Some(event) = stream.next().await {
+                if event.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            assert_eq!(failed, captured_proxy.is_some());
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len(),
+                usize::from(captured_proxy.is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_cookies_and_proxy_are_replayed_by_automatic_business_requests() {
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        let proxy = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-codex-turn-state", "a".repeat(292))
+                    .append_header("set-cookie", "__cf_bm=test-cookie; Path=/; HttpOnly")
+                    .append_header("set-cookie", "untrusted=test; Path=/")
+                    .set_body_string(COMPLETED_SESSION_SSE),
+            )
+            .mount(&proxy)
+            .await;
+        let accounts = fetch_accounts(&proxy).await;
+        accounts.set_openai_base_url(ACCOUNT, None).await;
+        accounts
+            .set_turn_state(
+                ACCOUNT,
+                CodexTurnStateConfig {
+                    mode: CodexTurnStateMode::Auto,
+                    value: String::new(),
+                },
+            )
+            .await;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        *store.proxy.lock().unwrap() = Some(OutboundProxy::parse(&proxy.uri()).unwrap());
+        store.configs.lock().unwrap().push(fetch_config());
+        let mut config = valid_config().config;
+        // 仅在测试中使用明文代理捕获官方域名请求；生产配置仍要求非本地地址使用 HTTPS。
+        config.api.base_url = "http://chatgpt.com".to_owned();
+        let mut bundle = provider_openai::initialize(
+            config,
+            provider_ports_with(accounts, Arc::new(TestOAuthPending::default()))
+                .with_turn_state(store),
+        )
+        .await
+        .unwrap();
+        cycle(&fetch_worker(&mut bundle)).await;
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            serde_json::from_value(json!({"model":MODEL,"input":"test"})).unwrap(),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+        let mut stream = bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request(
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                    ACCOUNT,
+                ),
+                initialized_attempt_context("req_probe_cookie_replay", ACCOUNT),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+        let requests = proxy.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].headers.contains_key("cookie"));
+        assert_eq!(requests[1].headers["cookie"], "__cf_bm=test-cookie");
+        assert_eq!(requests[1].headers["x-codex-turn-state"], "a".repeat(292));
+        for name in [
+            "user-agent",
+            "originator",
+            "authorization",
+            "chatgpt-account-id",
+            "x-codex-installation-id",
+            "session-id",
+            "thread-id",
+            "x-codex-window-id",
+        ] {
+            assert_eq!(
+                requests[0].headers.get(name),
+                requests[1].headers.get(name),
+                "{name}"
+            );
+        }
+        let bodies: Vec<Value> = requests
+            .iter()
+            .map(|request| {
+                let decoded =
+                    zstd::stream::decode_all(std::io::Cursor::new(&request.body)).unwrap();
+                serde_json::from_slice(&decoded).unwrap()
+            })
+            .collect();
+        for key in ["session_id", "thread_id", "x-codex-window-id"] {
+            assert_eq!(
+                bodies[0]["client_metadata"][key],
+                bodies[1]["client_metadata"][key]
+            );
+        }
+        assert_eq!(bodies[0]["prompt_cache_key"], bodies[1]["prompt_cache_key"]);
+        assert_ne!(
+            requests[0].headers["x-client-request-id"],
+            requests[1].headers["x-client-request-id"]
+        );
+        assert_ne!(
+            bodies[0]["client_metadata"]["turn_id"],
+            bodies[1]["client_metadata"]["turn_id"]
+        );
+        let metadata: Value = serde_json::from_str(
+            requests[1].headers["x-codex-turn-metadata"]
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            metadata["session_id"],
+            bodies[0]["client_metadata"]["session_id"]
+        );
+        assert_eq!(metadata["turn_id"], bodies[1]["client_metadata"]["turn_id"]);
+    }
+
+    #[tokio::test]
     async fn fetcher_restored_expired_values_are_visible_to_admin_but_not_used_in_auto_mode() {
         let store = Arc::new(MemoryTurnStateStore::default());
         let acquired = Utc::now().timestamp_millis() - 3_700_000;
@@ -1776,6 +2112,7 @@ mod turn_state_fetcher {
             expires_at: acquired + 3_600_000,
             source: "traffic".to_owned(),
             proxy_url: None,
+            session: None,
         });
         let config = valid_config();
         let bundle = provider_openai::initialize(

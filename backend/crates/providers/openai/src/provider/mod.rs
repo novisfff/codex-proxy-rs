@@ -610,10 +610,7 @@ impl Provider for CodexProvider {
         };
         let client = self
             .client
-            .for_account(lease.account())
-            .map_err(|_| {
-                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
-            })?
+            .clone()
             .with_base_url(lease.openai_base_url())
             .with_authentication(lease.authentication());
         let response_origin = client.request_url(CODEX_RESPONSES_PATH).map_err(|_| {
