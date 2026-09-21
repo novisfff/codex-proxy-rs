@@ -6,10 +6,40 @@ import ipaddress
 import json
 import os
 import re
+import secrets
+import string
+from urllib.parse import quote
 from pathlib import Path
 
 
+SESSION_MARKER = "__CPR_292_SID__"
+_SESSION_ALPHABET = string.ascii_lowercase + string.digits
+_SESSION_LENGTH = 12
+
+
 class Socks5Proxy:
+    @classmethod
+    def prepare_credentials(cls, config):
+        credentials = dict(config)
+        username = credentials["username"]
+        if SESSION_MARKER in username:
+            sid = "".join(secrets.choice(_SESSION_ALPHABET) for _ in range(_SESSION_LENGTH))
+            credentials["username"] = username.replace(SESSION_MARKER, sid)
+
+        host = credentials["host"]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            host = host.encode("idna").decode("ascii").removesuffix(".")
+        else:
+            if address.version == 6:
+                host = f"[{host}]"
+        proxy_url = (
+            f"socks5h://{quote(credentials['username'], safe='')}:"
+            f"{quote(credentials['password'], safe='')}@{host}:{credentials['port']}"
+        )
+        return credentials, proxy_url
+
     @staticmethod
     def validate(config):
         host = config.get("host")

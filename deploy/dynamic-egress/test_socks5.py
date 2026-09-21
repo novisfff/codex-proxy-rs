@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,41 @@ def instance():
 
 
 class Socks5Tests(unittest.IsolatedAsyncioTestCase):
+    def test_prepare_credentials_replaces_marker_without_mutating_instance(self):
+        config = dict(instance(), username="r_country-sid-__CPR_292_SID__-ttl-1440m")
+
+        with patch("secrets.choice", side_effect=list("a" * 12)):
+            credentials, proxy_url = Socks5Proxy.prepare_credentials(config)
+
+        self.assertRegex(credentials["username"], r"^r_country-sid-[a-z0-9]{12}-ttl-1440m$")
+        self.assertEqual(config["username"], "r_country-sid-__CPR_292_SID__-ttl-1440m")
+        self.assertEqual(
+            proxy_url,
+            f"socks5h://{credentials['username']}:private-password@residential-gateway.novaproxy.io:1111",
+        )
+
+    def test_prepare_credentials_generates_new_sid_per_call(self):
+        config = dict(instance(), username="r_country-sid-__CPR_292_SID__-ttl-1440m")
+
+        with patch("secrets.choice", side_effect=list("a" * 12 + "b" * 12)):
+            first, _ = Socks5Proxy.prepare_credentials(config)
+            second, _ = Socks5Proxy.prepare_credentials(config)
+
+        first_sid = re.search(r"sid-([a-z0-9]{12})-", first["username"]).group(1)
+        second_sid = re.search(r"sid-([a-z0-9]{12})-", second["username"]).group(1)
+        self.assertEqual(first_sid, "a" * 12)
+        self.assertEqual(second_sid, "b" * 12)
+        self.assertNotEqual(first_sid, second_sid)
+
+    def test_prepare_credentials_escapes_url_credentials(self):
+        config = dict(instance(), username="r-sid-__CPR_292_SID__", password="p@ss")
+
+        with patch("secrets.choice", side_effect=list("z" * 12)):
+            _, proxy_url = Socks5Proxy.prepare_credentials(config)
+
+        self.assertIn("p%40ss@", proxy_url)
+        self.assertNotIn("p@ss@", proxy_url)
+
     def test_configuration_rejects_ipv6_credentials_and_paths(self):
         validate_instances({"nova": instance()})
         for change in ({"bindings": {"ipv6": {}}}, {"password": ""}, {"credentialRef": "../secret"},
