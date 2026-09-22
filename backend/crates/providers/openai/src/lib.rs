@@ -233,7 +233,6 @@ pub async fn initialize(
             provider::turn_state_fetcher::TurnStateFetcher::new(
                 store,
                 Arc::clone(&accounts),
-                Arc::clone(&leases),
                 ports.cooldowns(),
                 ports.execution(),
                 Arc::clone(&catalog),

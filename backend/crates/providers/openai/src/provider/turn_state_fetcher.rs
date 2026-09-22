@@ -21,17 +21,15 @@ use gateway_core::{
     lifecycle::CancellationToken,
     operation::{GenerateRequest, ProtocolPayload},
     provider_ports::{
-        ProviderCooldownPort, ProviderCooldownScope, ProviderLeaseAcquisition, ProviderLeasePort,
-        ProviderLeaseRequest, ProviderSchedulingLeaseRequest, ProviderStoreError,
-        ProviderStoreErrorKind, turn_state::*,
+        ProviderCooldownPort, ProviderCooldownScope, ProviderStoreError, ProviderStoreErrorKind,
+        turn_state::*,
     },
-    routing::{ProviderKind, UpstreamModelId},
+    routing::UpstreamModelId,
     task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    num::NonZeroU32,
     sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
@@ -152,6 +150,18 @@ fn build_probe_body(
     body
 }
 
+// 旧版本将这些 HTTP 拒绝持久化为暂停；升级后自动恢复，不要求重新保存配置。
+fn legacy_http_pause(attempt: &TurnStateFetchAttempt) -> bool {
+    attempt.paused
+        && ["HTTP 400：", "HTTP 401：", "HTTP 403：", "HTTP 404："]
+            .iter()
+            .any(|prefix| attempt.message.starts_with(prefix))
+}
+
+fn attempt_requires_pause(attempt: &TurnStateFetchAttempt) -> bool {
+    attempt.paused && !legacy_http_pause(attempt)
+}
+
 fn refresh_at(value: &TurnStateValue, config: &TurnStateFetcherConfig) -> i64 {
     value
         .expires_at
@@ -223,7 +233,6 @@ fn fetch_policy(config: &TurnStateFetcherConfig, status: &Value) -> Option<Fetch
 pub(crate) struct TurnStateFetcher {
     store: Arc<dyn TurnStateStore>,
     accounts: Arc<dyn ProviderAccountStore>,
-    leases: Arc<dyn ProviderLeasePort>,
     cooldowns: Arc<dyn ProviderCooldownPort>,
     execution: Option<Arc<dyn ExecutionStore>>,
     catalog: Arc<CodexCredentialCatalogService>,
@@ -248,7 +257,6 @@ impl TurnStateFetcher {
     pub(crate) fn new(
         store: Arc<dyn TurnStateStore>,
         accounts: Arc<dyn ProviderAccountStore>,
-        leases: Arc<dyn ProviderLeasePort>,
         cooldowns: Arc<dyn ProviderCooldownPort>,
         execution: Option<Arc<dyn ExecutionStore>>,
         catalog: Arc<CodexCredentialCatalogService>,
@@ -261,7 +269,6 @@ impl TurnStateFetcher {
         Self {
             store,
             accounts,
-            leases,
             cooldowns,
             execution,
             catalog,
@@ -424,7 +431,8 @@ impl TurnStateFetcher {
             a.account_id == account
                 && a.model == model
                 && a.config_revision == config.revision
-                && (a.paused || (a.status == "cooldown" && a.next_attempt_at > now))
+                && (attempt_requires_pause(a)
+                    || (a.status == "cooldown" && a.next_attempt_at > now))
         }) {
             return Err(invalid());
         }
@@ -573,7 +581,9 @@ impl TurnStateFetcher {
                         && a.model == *model
                         && a.config_revision == config.revision
                 });
-                if previous.is_some_and(|a| a.paused || a.next_attempt_at > now) {
+                if previous.is_some_and(|a| {
+                    attempt_requires_pause(a) || (!legacy_http_pause(a) && a.next_attempt_at > now)
+                }) {
                     continue;
                 }
                 let value = values
@@ -1025,29 +1035,7 @@ impl TurnStateFetcher {
         let Ok(runtime) = CodexCredentialCodec::decode(&current.credential) else {
             return FetchOutcome::paused("凭据格式无效");
         };
-        let Ok(provider) = ProviderKind::new("openai") else {
-            return FetchOutcome::paused("Provider 无效");
-        };
-        let Some(capacity) = NonZeroU32::new(egress.max_concurrent) else {
-            return FetchOutcome::paused("账号并发配置无效");
-        };
-        let lease = self
-            .leases
-            .try_acquire(ProviderLeaseRequest::Scheduling(
-                ProviderSchedulingLeaseRequest::new(
-                    provider,
-                    id.clone(),
-                    account.revision(),
-                    capacity,
-                    Duration::from_millis(egress.request_interval_ms),
-                    SystemTime::now() + Duration::from_secs(45),
-                ),
-            ))
-            .await;
-        let _lease = match lease {
-            Ok(ProviderLeaseAcquisition::Acquired(guard)) => guard,
-            _ => return FetchOutcome::retry("账号繁忙，延后获取", 60),
-        };
+        // 探测独立于账号业务配额的并发与启动间隔，只由获取器出口策略准入。
         let oauth = runtime.authentication.oauth().is_some();
         let minimal = oauth && config.probe_profile == TurnStateProbeProfile::MinimalCompat;
         // 静态与动态出口都使用独立连接；明确未配置代理才允许直连。
@@ -1509,11 +1497,9 @@ impl FetchOutcome {
     fn from_error(error: &CodexClientError) -> Self {
         if let Some(upstream) = error.upstream_failure() {
             let status = upstream.status.map(|s| s.as_u16());
-            let mut result = if matches!(status, Some(401 | 403 | 404 | 400)) {
-                Self::paused("上游拒绝请求，请检查账号、模型或网关配置")
-            } else {
-                Self::retry("上游请求失败", upstream.retry_after_seconds.unwrap_or(60))
-            };
+            // 单次 HTTP 拒绝不能终止出口搜索；保留诊断并交由调度器按间隔或冷却继续。
+            let mut result =
+                Self::retry("上游请求失败", upstream.retry_after_seconds.unwrap_or(60));
             result.http_status = status;
             result.message = fetch_failure_message(&upstream);
             if let CodexClientError::Upstream {

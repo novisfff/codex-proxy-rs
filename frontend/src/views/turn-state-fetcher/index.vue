@@ -610,7 +610,7 @@ onBeforeUnmount(() => {
           <span>自适应并发（动态 SOCKS5）</span><BaseSwitch v-model="form.adaptiveConcurrency" label="启用自适应并发" :disabled="saving" />
         </div>
         <p class="text-cp-xs text-cp-text-secondary">
-          从 3 路开始，收到 312 后升至 5、8 路，始终受出口实例和账号上限约束。429/503 冷却后从 1 路恢复；命中后取消其他搜索。
+          从 3 路开始，收到 312 后升至 5、8 路，只受出口实例上限约束，不占用账号业务并发。429/503 冷却后从 1 路恢复；命中后取消其他搜索。
         </p>
         <div class="grid gap-3 sm:grid-cols-2">
           <BaseFormItem label="重新探测间距（分钟）">

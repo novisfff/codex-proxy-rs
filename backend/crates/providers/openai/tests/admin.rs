@@ -869,6 +869,94 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
+    async fn turn_state_probe_ignores_busy_account_business_leases() {
+        let server = MockServer::start().await;
+        mount(&server, &"a".repeat(292), 200).await;
+        let scheduling = Arc::new(TestLeaseCoordinator::default());
+        *scheduling.busy.lock().unwrap() = true;
+        let store = Arc::new(MemoryTurnStateStore::default());
+        let ports = ProviderStorePorts::new(
+            fetch_accounts(&server).await,
+            scheduling.clone(),
+            Arc::new(MemorySessionAffinity::default()),
+            Arc::new(MemorySessionExclusions::default()),
+            Arc::new(TestCatalogCache::default()),
+            Arc::new(TestArtifactProfiles),
+            Arc::new(TestCredentialState),
+            Arc::new(TestCooldown),
+            Arc::new(TestRuntimePolicy),
+            Arc::new(TestOAuthPending::default()),
+        )
+        .with_turn_state(store);
+        let mut bundle = provider_openai::initialize(valid_config().config, ports)
+            .await
+            .unwrap();
+        bundle
+            .admin_provider()
+            .configure_turn_state_fetcher(fetch_config())
+            .await
+            .unwrap();
+        cycle(&fetch_worker(&mut bundle)).await;
+        let state = bundle.admin_provider().turn_state_fetcher().await.unwrap();
+        assert_eq!(state.values[0].value, "a".repeat(292));
+        assert!(scheduling.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_state_http_rejections_continue_probing_and_resume_legacy_pause() {
+        for status in [400, 401, 403, 404] {
+            let server = MockServer::start().await;
+            mount(&server, &"x".repeat(292), status).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let mut bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(
+                    fetch_accounts(&server).await,
+                    Arc::new(TestOAuthPending::default()),
+                )
+                .with_turn_state(store.clone()),
+            )
+            .await
+            .unwrap();
+            let admin = bundle.admin_provider();
+            admin
+                .configure_turn_state_fetcher(fetch_config())
+                .await
+                .unwrap();
+            let worker = fetch_worker(&mut bundle);
+            cycle(&worker).await;
+            let snapshot = admin.turn_state_fetcher().await.unwrap();
+            assert!(!snapshot.attempts[0].paused);
+            assert_eq!(snapshot.attempts[0].status, "retrying");
+            assert!(
+                snapshot.attempts[0]
+                    .message
+                    .starts_with(&format!("HTTP {status}："))
+            );
+            assert_eq!(snapshot.recent_probes[0].outcome, "failed");
+            assert!(
+                snapshot.values.is_empty(),
+                "error responses must not become tickets"
+            );
+            {
+                let mut attempts = store.attempts.lock().unwrap();
+                // 模拟旧版已持久化的暂停，且下次时间尚未到达。
+                attempts[0].paused = true;
+                attempts[0].status = "paused".to_owned();
+                attempts[0].next_attempt_at = Utc::now().timestamp_millis() + 900_000;
+            }
+            server.reset().await;
+            mount(&server, &"a".repeat(292), 200).await;
+            cycle(&worker).await;
+            let snapshot = admin.turn_state_fetcher().await.unwrap();
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(snapshot.values[0].value, "a".repeat(292));
+            assert!(!snapshot.attempts[0].paused);
+            assert_eq!(snapshot.attempts[0].status, "success");
+        }
+    }
+
+    #[tokio::test]
     async fn turn_state_configured_refresh_and_lifetime_control_scheduling_and_restore() {
         for refresh in [10, 30] {
             let server = MockServer::start().await;
