@@ -216,6 +216,13 @@ pub async fn initialize(
     );
     let fetcher = if let Some(store) = ports.turn_state() {
         let cache = core_provider.turn_state_cache();
+        for config in store
+            .configs()
+            .await
+            .map_err(|_| OpenAiInitializeError::Transport)?
+        {
+            cache.set_lifetime(&config.account_id, config.state_ttl_ms());
+        }
         cache.restore(
             store
                 .values()

@@ -53,7 +53,7 @@ const instancesEditable = computed(() => !!snapshot.value.dynamicEgress?.availab
 const dynamicOptions = computed(() => snapshot.value.dynamicEgress?.instances.map(instance => ({ label: instance.name, value: instance.id })) ?? [])
 const familyOptions = computed(() => (snapshot.value.dynamicEgress?.instances.find(instance => instance.id === dynamicInstance.value)?.families ?? []).map(family => ({ label: family === 'ipv4' ? 'IPv4' : 'IPv6', value: family })))
 const editOpen = ref(false)
-const form = ref<FetcherConfig>({ accountId: '', enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, revision: 0 })
+const form = ref<FetcherConfig>({ accountId: '', enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, refreshIntervalMinutes: 40, stateTtlMinutes: 60, revision: 0 })
 const scheduleMode = ref('all')
 const scheduleStart = ref('09:00')
 const scheduleEnd = ref('01:00')
@@ -162,7 +162,7 @@ async function saveInstance(remove = false) {
 }
 
 function config(accountId: string): FetcherConfig {
-  return snapshot.value.configs.find(c => c.accountId === accountId) ?? { accountId, enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, revision: 0 }
+  return snapshot.value.configs.find(c => c.accountId === accountId) ?? { accountId, enabled: false, models: [], proxyId: null, probeProfile: 'minimal_compat', adaptiveConcurrency: true, refreshIntervalMinutes: 40, stateTtlMinutes: 60, revision: 0 }
 }
 function timeLabel(minute: number) {
   return `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`
@@ -194,7 +194,7 @@ function rows(accountId: string) {
     const running = runningRequests.value.filter(([account, currentModel]) => account === accountId && currentModel === model).length
     const expired = !!value && value.expiresAt <= now.value
     const cooling = attempt?.status === 'cooldown' && attempt.nextAttemptAt > now.value
-    const status = !selected.enabled ? '已暂停' : !inSchedule(selected) ? '时段外 · 等待开启' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : cooling ? '限流冷却' : !value ? '等待获取' : expired ? '已过期' : value.expiresAt - now.value <= 1200000 ? '待续期' : '有效'
+    const status = !selected.enabled ? '已暂停' : !inSchedule(selected) ? '时段外 · 等待开启' : running ? `获取中 · ${running}` : attempt?.paused ? '需要处理' : cooling ? '限流冷却' : !value ? '等待获取' : expired ? '已过期' : now.value >= value.expiresAt - (selected.stateTtlMinutes - selected.refreshIntervalMinutes) * 60000 ? '待续期' : '有效'
     return { model, value, attempt, running, expired, cooling, status }
   })
 }
@@ -301,6 +301,11 @@ function addModel() {
   }
 }
 async function save() {
+  const { refreshIntervalMinutes, stateTtlMinutes } = form.value
+  if (!Number.isInteger(stateTtlMinutes) || stateTtlMinutes < 1 || stateTtlMinutes > 1440 || !Number.isInteger(refreshIntervalMinutes) || refreshIntervalMinutes < 1 || refreshIntervalMinutes > stateTtlMinutes) {
+    toast.warning('有效期需为 1–1440 分钟的整数，重新探测间距需为 1 至有效期分钟的整数')
+    return
+  }
   const startMinute = timeMinute(scheduleStart.value)
   const endMinute = timeMinute(scheduleEnd.value)
   if (scheduleMode.value === 'custom' && (startMinute === null || endMinute === null || startMinute === endMinute)) {
@@ -443,7 +448,7 @@ onBeforeUnmount(() => {
     <template v-if="tab === 'accounts'">
       <BaseCard>
         <p class="m-0 text-cp-sm text-cp-text-secondary">
-          预计有效 60 分钟，剩余 20 分钟开始续期。动态 SOCKS5 支持并发搜索；普通请求返回新值时自动顺延。相同值不会延长有效期。
+          重新探测间距和有效期可按账号配置。动态 SOCKS5 支持并发搜索；票据与代理成组更新，相同值不会延长有效期。
         </p>
         <BaseInput v-model="search" class="mt-4 max-w-md" placeholder="搜索账号名称或邮箱" aria-label="搜索获取器账号" />
       </BaseCard>
@@ -469,7 +474,7 @@ onBeforeUnmount(() => {
           尚未选择模型。配置后可自动获取，也可手动触发一次。
         </p>
         <p class="text-cp-sm text-cp-text-secondary">
-          探测时段：{{ scheduleLabel(config(account.id)) }} · {{ profileLabel(config(account.id).probeProfile) }} · {{ config(account.id).adaptiveConcurrency ? '自适应并发' : '固定并发' }}
+          探测时段：{{ scheduleLabel(config(account.id)) }} · 每 {{ config(account.id).refreshIntervalMinutes }} 分钟重新探测 · 有效期 {{ config(account.id).stateTtlMinutes }} 分钟 · {{ profileLabel(config(account.id).probeProfile) }} · {{ config(account.id).adaptiveConcurrency ? '自适应并发' : '固定并发' }}
         </p>
         <div class="mt-4 grid gap-4">
           <section v-for="row in rows(account.id)" :key="row.model" class="min-w-0 rounded-cp bg-cp-fill-quaternary p-4">
@@ -510,7 +515,7 @@ onBeforeUnmount(() => {
               <span v-else-if="isSocks5(account.id)">本次出口 IP：未验证（SOCKS5）</span>
               <span>返回长度：{{ row.attempt.byteLength ?? '未返回' }} · 耗时：{{ row.attempt.durationMs }} ms · 输入 / 输出 token：{{ row.attempt.inputTokens ?? '未知' }} / {{ row.attempt.outputTokens ?? '未知' }}</span>
               <span v-if="config(account.id).adaptiveConcurrency && isSocks5(account.id)">搜索目标并发：{{ row.attempt.searchConcurrency ?? 3 }}（仍受出口和账号上限约束）</span>
-              <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.expiresAt - 1200000 : 0)) }}</span>
+              <span v-if="config(account.id).enabled && !row.attempt.paused">下次检查：{{ date(Math.max(row.attempt.nextAttemptAt, row.value && row.attempt.status !== 'queued' ? row.value.expiresAt - (config(account.id).stateTtlMinutes - config(account.id).refreshIntervalMinutes) * 60000 : 0)) }}</span>
             </div>
           </section>
         </div>
@@ -546,16 +551,16 @@ onBeforeUnmount(() => {
             <BaseInput :model-value="String(instanceForm.port ?? '')" type="number" min="1" max="65535" :disabled="saving" @update:model-value="instanceForm.port = Number($event)" />
           </BaseFormItem>
           <BaseFormItem label="代理用户名模板">
-            <BaseInput v-model="instanceForm.username" placeholder="例如 r_xxx-sid-__CPR_292_SID__-ttl-1440m" autocomplete="off" :disabled="saving" />
+            <BaseInput v-model="instanceForm.username" placeholder="供应商用户名；可包含 __CPR_292_SID__" autocomplete="off" :disabled="saving" />
             <p class="text-cp-xs text-cp-text-secondary">
-              使用 <code>__CPR_292_SID__</code> 占位符；每次 292 探测会替换成新的 12 位小写字母和数字 SID，并保持供应商 sticky 会话。
+              用户名和密码均支持 <code>__CPR_292_SID__</code>；同一次探测替换为同一个随机 SID，正式请求复用该 SID。
             </p>
           </BaseFormItem>
-          <BaseFormItem :label="instanceForm.passwordSet ? '代理密码（已配置，留空保留）' : '代理密码'">
-            <BaseInput v-model="instanceForm.password" type="password" autocomplete="new-password" :disabled="saving" />
+          <BaseFormItem :label="instanceForm.passwordSet ? '代理密码模板（已配置，留空保留）' : '代理密码模板'">
+            <BaseInput v-model="instanceForm.password" placeholder="密码前缀_session-__CPR_292_SID___lifetime-3600s" type="password" autocomplete="new-password" :disabled="saving" />
           </BaseFormItem>
           <p class="text-cp-sm text-cp-warning">
-            每次建立独立 SOCKS5H 连接；出口由用户名 SID 维持 sticky 会话，实际 IP 未验证。
+            每次建立独立 SOCKS5H 连接；出口由凭据中的 SID 维持 sticky 会话，实际 IP 未验证。
           </p>
         </template>
         <template v-else>
@@ -606,6 +611,17 @@ onBeforeUnmount(() => {
         </div>
         <p class="text-cp-xs text-cp-text-secondary">
           从 3 路开始，收到 312 后升至 5、8 路，始终受出口实例和账号上限约束。429/503 冷却后从 1 路恢复；命中后取消其他搜索。
+        </p>
+        <div class="grid gap-3 sm:grid-cols-2">
+          <BaseFormItem label="重新探测间距（分钟）">
+            <BaseInput :model-value="String(form.refreshIntervalMinutes)" type="number" min="1" :max="form.stateTtlMinutes" aria-label="重新探测间距（分钟）" :disabled="saving" @update:model-value="form.refreshIntervalMinutes = Number($event)" />
+          </BaseFormItem>
+          <BaseFormItem label="292 有效期（分钟）">
+            <BaseInput :model-value="String(form.stateTtlMinutes)" type="number" min="1" max="1440" aria-label="292 有效期（分钟）" :disabled="saving" @update:model-value="form.stateTtlMinutes = Number($event)" />
+          </BaseFormItem>
+        </div>
+        <p class="text-cp-xs text-cp-text-secondary">
+          从票据生成时间计算；未知格式从获取时间计算。默认 40 分钟后重新探测、60 分钟后停用。间距不能超过有效期；有效期只控制本地使用，不延长上游有效时间。失败重试仍遵守出口间隔和冷却。
         </p>
         <BaseFormItem label="探测时段">
           <BaseSelect v-model="scheduleMode" :options="[{ label: '全天', value: 'all' }, { label: '固定时段', value: 'custom' }]" :disabled="saving" />

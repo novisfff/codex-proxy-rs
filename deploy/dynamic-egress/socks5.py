@@ -21,10 +21,11 @@ class Socks5Proxy:
     @classmethod
     def prepare_credentials(cls, config):
         credentials = dict(config)
-        username = credentials["username"]
-        if SESSION_MARKER in username:
+        if any(SESSION_MARKER in credentials[field] for field in ("username", "password")):
             sid = "".join(secrets.choice(_SESSION_ALPHABET) for _ in range(_SESSION_LENGTH))
-            credentials["username"] = username.replace(SESSION_MARKER, sid)
+            # 同一租约只生成一次 SID，连接和回传地址共用替换后的凭据。
+            for field in ("username", "password"):
+                credentials[field] = credentials[field].replace(SESSION_MARKER, sid)
 
         host = credentials["host"]
         try:

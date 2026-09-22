@@ -33,6 +33,22 @@ class Socks5Tests(unittest.IsolatedAsyncioTestCase):
             f"socks5h://{credentials['username']}:private-password@residential-gateway.novaproxy.io:1111",
         )
 
+    def test_password_session_template_is_bound_to_returned_url(self):
+        from urllib.parse import urlsplit, unquote
+        for username in ("test-user", "test-__CPR_292_SID__"):
+            config = dict(instance(), host="residential.novaproxy.io", port=32325,
+                          username=username, password="test-secret_session-__CPR_292_SID___lifetime-3600s")
+            with patch("secrets.choice", side_effect=list("a" * 12 + "b" * 12)):
+                first, first_url = Socks5Proxy.prepare_credentials(config)
+                second, second_url = Socks5Proxy.prepare_credentials(config)
+            self.assertNotEqual(first_url, second_url)
+            for credentials, url, sid in ((first, first_url, "a" * 12), (second, second_url, "b" * 12)):
+                self.assertEqual(credentials["password"], f"test-secret_session-{sid}_lifetime-3600s")
+                parsed = urlsplit(url)
+                self.assertEqual(unquote(parsed.password), credentials["password"])
+                self.assertEqual(unquote(parsed.username), username.replace("__CPR_292_SID__", sid))
+            self.assertIn("__CPR_292_SID__", config["password"])
+
     def test_prepare_credentials_generates_new_sid_per_call(self):
         config = dict(instance(), username="r_country-sid-__CPR_292_SID__-ttl-1440m")
 

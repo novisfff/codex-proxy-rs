@@ -183,6 +183,8 @@ mod turn_state_fetcher {
             schedule: None,
             probe_profile: TurnStateProbeProfile::CodexCore,
             adaptive_concurrency: false,
+            refresh_interval_minutes: 40,
+            state_ttl_minutes: 60,
             revision: 0,
         }
     }
@@ -862,6 +864,93 @@ mod turn_state_fetcher {
                 assert_eq!(body["error"]["retry_after"], expected.unwrap());
                 assert!(response.headers().iter().any(|h| h.name() == "retry-after"
                     && h.value() == expected.unwrap().to_string().as_bytes()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_state_configured_refresh_and_lifetime_control_scheduling_and_restore() {
+        for refresh in [10, 30] {
+            let server = MockServer::start().await;
+            mount(&server, &"b".repeat(292), 200).await;
+            let store = Arc::new(MemoryTurnStateStore::default());
+            let acquired = Utc::now().timestamp_millis() - 20 * 60_000;
+            store.values.lock().unwrap().push(TurnStateValue {
+                account_id: ACCOUNT.to_owned(),
+                model: MODEL.to_owned(),
+                value: "a".repeat(292),
+                acquired_at: acquired,
+                last_seen_at: acquired,
+                expires_at: acquired + 3_600_000,
+                source: "fetcher".to_owned(),
+                proxy_url: None,
+                session: None,
+            });
+            let mut config = fetch_config();
+            config.refresh_interval_minutes = refresh;
+            config.state_ttl_minutes = 90;
+            store.configs.lock().unwrap().push(config.clone());
+            let mut bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(
+                    fetch_accounts(&server).await,
+                    Arc::new(TestOAuthPending::default()),
+                )
+                .with_turn_state(store.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                bundle
+                    .admin_provider()
+                    .turn_state_fetcher()
+                    .await
+                    .unwrap()
+                    .values[0]
+                    .expires_at,
+                acquired + 90 * 60_000
+            );
+            cycle(&fetch_worker(&mut bundle)).await;
+            let snapshot = bundle.admin_provider().turn_state_fetcher().await.unwrap();
+            let value = &snapshot.values[0];
+            if refresh == 10 {
+                assert_eq!(value.value, "b".repeat(292));
+                assert_eq!(value.expires_at, value.acquired_at + 90 * 60_000);
+                assert_eq!(
+                    snapshot.attempts[0].next_attempt_at,
+                    value.acquired_at + 10 * 60_000
+                );
+            } else {
+                assert!(server.received_requests().await.unwrap().is_empty());
+                assert_eq!(value.value, "a".repeat(292));
+            }
+            config.state_ttl_minutes = 15;
+            config.refresh_interval_minutes = 10;
+            bundle
+                .admin_provider()
+                .configure_turn_state_fetcher(config.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                bundle
+                    .admin_provider()
+                    .turn_state_fetcher()
+                    .await
+                    .unwrap()
+                    .values[0]
+                    .expires_at,
+                value.acquired_at + 15 * 60_000
+            );
+            for (interval, ttl) in [(0, 60), (61, 60), (1, 0), (1, 1441)] {
+                config.refresh_interval_minutes = interval;
+                config.state_ttl_minutes = ttl;
+                assert!(
+                    bundle
+                        .admin_provider()
+                        .configure_turn_state_fetcher(config.clone())
+                        .await
+                        .is_err()
+                );
             }
         }
     }

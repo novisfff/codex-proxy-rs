@@ -1,6 +1,6 @@
 //! 独立低并发获取任务。凭据、账号额度与业务共用；连接池、出站代理与用量记录独立。
 
-use super::turn_state::{REFRESH_AFTER_MS, REFRESH_BEFORE_MS, TurnStateCache};
+use super::turn_state::TurnStateCache;
 use super::turn_state_probe_usage::{ProbeDiagnostics, ProbeUsage};
 use crate::transport::canonical::{CodexCanonicalDecoder, CodexCanonicalOutcome};
 use crate::{
@@ -150,6 +150,13 @@ fn build_probe_body(
         }]);
     }
     body
+}
+
+fn refresh_at(value: &TurnStateValue, config: &TurnStateFetcherConfig) -> i64 {
+    value
+        .expires_at
+        .saturating_sub(config.state_ttl_ms())
+        .saturating_add(config.refresh_interval_ms())
 }
 
 struct Running {
@@ -334,10 +341,11 @@ impl TurnStateFetcher {
         config: TurnStateFetcherConfig,
     ) -> Result<(), ProviderStoreError> {
         ProviderAccountId::new(config.account_id.clone()).map_err(|_| invalid())?;
-        if config
-            .schedule
-            .as_ref()
-            .is_some_and(|schedule| !schedule.is_valid())
+        if !config.valid_refresh_interval()
+            || config
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| !schedule.is_valid())
         {
             return Err(invalid());
         }
@@ -375,6 +383,8 @@ impl TurnStateFetcher {
         }
         let _update = self.updates.lock().await;
         self.store.save_config(config.clone()).await?;
+        self.cache
+            .set_lifetime(&config.account_id, config.state_ttl_ms());
         for running in self
             .running
             .lock()
@@ -570,7 +580,7 @@ impl TurnStateFetcher {
                     .iter()
                     .find(|v| v.account_id == config.account_id && v.model == *model);
                 if previous.is_none_or(|a| a.status != "queued")
-                    && value.is_some_and(|v| now < v.expires_at.saturating_sub(REFRESH_BEFORE_MS))
+                    && value.is_some_and(|v| now < refresh_at(v, config))
                 {
                     continue;
                 }
@@ -589,7 +599,10 @@ impl TurnStateFetcher {
             if values.iter().any(|v| {
                 v.account_id == r.account
                     && v.model == r.model
-                    && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > now
+                    && configs
+                        .iter()
+                        .find(|c| c.account_id == r.account)
+                        .is_some_and(|c| refresh_at(v, c) > now)
                     && r.initial_value.as_ref() != Some(&v.value)
             }) {
                 r.cancellation.cancel();
@@ -706,7 +719,7 @@ impl TurnStateFetcher {
             .values()
             .iter()
             .find(|v| v.account_id == config.account_id && v.model == model)
-            .map(|v| v.value.clone());
+            .cloned();
         let started = Instant::now();
         let mut outcome = tokio::select! {
             biased;
@@ -735,8 +748,8 @@ impl TurnStateFetcher {
         if self.cache.values().iter().any(|v| {
             v.account_id == config.account_id
                 && v.model == model
-                && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > finished
-                && initial_value.as_ref() != Some(&v.value)
+                && refresh_at(v, &config) > finished
+                && initial_value.as_ref().map(|v| &v.value) != Some(&v.value)
         }) {
             return Ok(());
         }
@@ -744,21 +757,22 @@ impl TurnStateFetcher {
             diagnostics.record().repeated = self.cache.values().iter().any(|v| {
                 v.account_id == config.account_id && v.model == model && v.value == *value
             });
-            self.cache.observe_at(
+            if !self.cache.observe_probe(
                 (&config.account_id, &model),
                 value,
-                "fetcher",
-                outcome.proxy_url.as_deref(),
-                outcome.session.as_ref(),
+                (outcome.proxy_url.as_deref(), outcome.session.as_ref()),
                 outcome.received_at,
-            );
+                &initial_value,
+            ) {
+                return Ok(());
+            }
             self.persist().await?;
             if !outcome.paused
                 && outcome.retry_after == 0
                 && self.cache.values().iter().any(|v| {
                     v.account_id == config.account_id
                         && v.model == model
-                        && v.expires_at.saturating_sub(REFRESH_BEFORE_MS) > finished
+                        && refresh_at(v, &config) > finished
                 })
             {
                 outcome.success = true;
@@ -824,8 +838,8 @@ impl TurnStateFetcher {
                 .values()
                 .iter()
                 .find(|v| v.account_id == config.account_id && v.model == model)
-                .map_or(finished + REFRESH_AFTER_MS, |v| {
-                    v.expires_at.saturating_sub(REFRESH_BEFORE_MS)
+                .map_or(finished.saturating_add(config.refresh_interval_ms()), |v| {
+                    refresh_at(v, &config)
                 })
         } else {
             finished.saturating_add(i64::try_from(delay.saturating_mul(1000)).unwrap_or(i64::MAX))

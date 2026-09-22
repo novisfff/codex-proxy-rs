@@ -35,6 +35,8 @@ export interface FetcherConfig {
   schedule?: { startMinute: number, endMinute: number } | null
   probeProfile: ProbeProfile
   adaptiveConcurrency: boolean
+  refreshIntervalMinutes: number
+  stateTtlMinutes: number
   revision: number
 }
 export interface FetcherValue {

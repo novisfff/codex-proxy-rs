@@ -15,10 +15,8 @@ use std::{
 };
 
 pub(crate) const STATE_TTL_MS: i64 = 60 * 60 * 1000;
-pub(crate) const REFRESH_AFTER_MS: i64 = 40 * 60 * 1000;
-pub(crate) const REFRESH_BEFORE_MS: i64 = STATE_TTL_MS - REFRESH_AFTER_MS;
 
-fn expiration(value: &str, acquired_at: i64) -> i64 {
+fn expiration(value: &str, acquired_at: i64, ttl_ms: i64) -> i64 {
     // Fernet 的版本和大端秒级时间戳是明文；这里只用于调度，不验证签名。
     let generated_at = URL_SAFE.decode(value).ok().and_then(|raw| {
         if raw.first() != Some(&0x80) || raw.len() < 73 || (raw.len() - 57) % 16 != 0 {
@@ -29,17 +27,18 @@ fn expiration(value: &str, acquired_at: i64) -> i64 {
         DateTime::from_timestamp_millis(millis)?;
         Some(millis)
     });
-    // 未知格式保持兼容；未来时间不能将有效期延长到获取时间一小时以后。
+    // 未知格式从获取时刻计时；未来时间不能延长配置的有效期。
     generated_at
         .unwrap_or(acquired_at)
         .min(acquired_at)
-        .saturating_add(STATE_TTL_MS)
+        .saturating_add(ttl_ms)
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct TurnStateCache {
     values: Arc<Mutex<BTreeMap<(String, String), TurnStateValue>>>,
     store: Arc<Mutex<Option<Arc<dyn TurnStateStore>>>>,
+    lifetimes: Arc<Mutex<BTreeMap<String, i64>>>,
     client_retries: Arc<Mutex<BTreeMap<(String, String), ClientRetryState>>>,
 }
 
@@ -49,6 +48,29 @@ struct ClientRetryState {
 }
 
 impl TurnStateCache {
+    pub(crate) fn set_lifetime(&self, account_id: &str, ttl_ms: i64) {
+        let mut values = self
+            .values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.lifetimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(account_id.to_owned(), ttl_ms);
+        for value in values.values_mut().filter(|v| v.account_id == account_id) {
+            value.expires_at = expiration(&value.value, value.acquired_at, ttl_ms);
+        }
+    }
+
+    fn lifetime(&self, account_id: &str) -> i64 {
+        self.lifetimes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(account_id)
+            .copied()
+            .unwrap_or(STATE_TTL_MS)
+    }
+
     pub(crate) fn valid_accounts(&self, model: &str) -> BTreeSet<String> {
         let now = Utc::now().timestamp_millis();
         self.values
@@ -72,6 +94,13 @@ impl TurnStateCache {
             key: (account_id.to_owned(), model.to_owned()),
             proxy_url: None,
             session: None,
+            baseline: Mutex::new(
+                self.values
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&(account_id.to_owned(), model.to_owned()))
+                    .cloned(),
+            ),
         }
     }
 
@@ -82,7 +111,11 @@ impl TurnStateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for mut value in values {
             if valid_value(&value.value) && value.acquired_at <= value.last_seen_at {
-                value.expires_at = expiration(&value.value, value.acquired_at);
+                value.expires_at = expiration(
+                    &value.value,
+                    value.acquired_at,
+                    self.lifetime(&value.account_id),
+                );
                 cache.insert((value.account_id.clone(), value.model.clone()), value);
             }
         }
@@ -113,7 +146,8 @@ impl TurnStateCache {
             .collect()
     }
 
-    pub(crate) fn observe_at(
+    #[cfg(test)]
+    fn observe_at(
         &self,
         (account_id, model): (&str, &str),
         value: &str,
@@ -122,45 +156,98 @@ impl TurnStateCache {
         session: Option<&TurnStateSession>,
         now: i64,
     ) {
+        self.observe_matching(
+            (account_id, model),
+            (value, source, proxy_url, session),
+            now,
+            None,
+        );
+    }
+
+    pub(super) fn observe_probe(
+        &self,
+        key: (&str, &str),
+        value: &str,
+        binding: (Option<&str>, Option<&TurnStateSession>),
+        now: i64,
+        expected: &Option<TurnStateValue>,
+    ) -> bool {
+        self.observe_matching(
+            key,
+            (value, "fetcher", binding.0, binding.1),
+            now,
+            Some(expected),
+        )
+        .is_some()
+    }
+
+    fn observe_matching(
+        &self,
+        (account_id, model): (&str, &str),
+        (value, source, proxy_url, session): (&str, &str, Option<&str>, Option<&TurnStateSession>),
+        now: i64,
+        expected: Option<&Option<TurnStateValue>>,
+    ) -> Option<TurnStateValue> {
         if !valid_value(value) {
-            return;
+            return None;
         }
         let mut cache = self
             .values
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (account_id.to_owned(), model.to_owned());
+        // 业务响应只能更新它开始时读取的整组票据；迟到流量不得回滚新探测结果。
+        if expected.is_some_and(|expected| !same_binding(cache.get(&key), expected.as_ref())) {
+            return None;
+        }
+        let ttl_ms = self.lifetime(account_id);
+        let last_seen_at = cache.get(&key).map_or(now, |v| v.last_seen_at.max(now));
         if let Some(previous) = cache.get_mut(&key) {
-            if previous.last_seen_at > now {
-                return;
+            if expected.is_none() && previous.last_seen_at > now {
+                return None;
             }
             if previous.value == value {
-                previous.last_seen_at = now;
-                previous.proxy_url = proxy_url.map(str::to_owned);
-                previous.session = session.cloned();
-                return;
+                previous.last_seen_at = last_seen_at;
+                // 重复票据不续期，也不改绑到另一次探测的代理或会话。
+                return Some(previous.clone());
             }
         }
         cache.insert(
-            key,
+            key.clone(),
             TurnStateValue {
                 account_id: account_id.to_owned(),
                 model: model.to_owned(),
                 value: value.to_owned(),
                 acquired_at: now,
-                last_seen_at: now,
-                expires_at: expiration(value, now),
+                last_seen_at,
+                expires_at: expiration(value, now, ttl_ms),
                 source: source.to_owned(),
                 proxy_url: proxy_url.map(str::to_owned),
                 session: session.cloned(),
             },
         );
-        if expiration(value, now) > now {
+        if expiration(value, now, ttl_ms) > now {
             self.client_retries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&(account_id.to_owned(), model.to_owned()));
         }
+        cache.get(&key).cloned()
+    }
+}
+
+// last_seen_at 只表示重复观察，不是绑定版本；持续流量不能阻止后台更新票据。
+fn same_binding(left: Option<&TurnStateValue>, right: Option<&TurnStateValue>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.value == right.value
+                && left.acquired_at == right.acquired_at
+                && left.expires_at == right.expires_at
+                && left.proxy_url == right.proxy_url
+                && left.session == right.session
+        }
+        _ => false,
     }
 }
 
@@ -173,6 +260,7 @@ pub(super) struct ScopedTurnState {
     key: (String, String),
     proxy_url: Option<String>,
     session: Option<TurnStateSession>,
+    baseline: Mutex<Option<TurnStateValue>>,
 }
 impl ScopedTurnState {
     pub(super) fn bind_base_url(&mut self, base_url: &str) {
@@ -234,14 +322,23 @@ impl ScopedTurnState {
     }
 
     pub(super) fn observe(&self, value: &str) {
-        self.cache.observe_at(
+        let mut baseline = self
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(updated) = self.cache.observe_matching(
             (&self.key.0, &self.key.1),
-            value,
-            "traffic",
-            self.proxy_url.as_deref(),
-            self.session.as_ref(),
+            (
+                value,
+                "traffic",
+                self.proxy_url.as_deref(),
+                self.session.as_ref(),
+            ),
             Utc::now().timestamp_millis(),
-        );
+            Some(&baseline),
+        ) {
+            *baseline = Some(updated);
+        }
     }
     pub(super) fn observe_headers(&self, headers: &[(String, Bytes)]) {
         for (name, value) in headers {
@@ -286,8 +383,12 @@ impl ScopedTurnState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&self.key)
-            .filter(|v| v.expires_at > Utc::now().timestamp_millis())
             .cloned();
+        *self
+            .baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cached.clone();
+        let cached = cached.filter(|v| v.expires_at > Utc::now().timestamp_millis());
         let proxy = if config.mode == CodexTurnStateMode::Auto {
             cached
                 .as_ref()
@@ -464,6 +565,103 @@ mod timestamp_tests {
     }
 
     #[test]
+    fn configured_lifetime_recalculates_cached_and_restored_expiry() {
+        let generated = 1_800_000_000_000;
+        let cache = TurnStateCache::default();
+        let value = token((generated / 1000) as u64);
+        cache.observe_at(
+            ("account", "model"),
+            &value,
+            "fetcher",
+            None,
+            None,
+            generated + 1000,
+        );
+        cache.set_lifetime("account", 90 * 60_000);
+        assert_eq!(cache.values()[0].expires_at, generated + 90 * 60_000);
+        let restored = TurnStateCache::default();
+        restored.set_lifetime("account", 15 * 60_000);
+        restored.restore(cache.values());
+        assert_eq!(restored.values()[0].expires_at, generated + 15 * 60_000);
+    }
+
+    #[test]
+    fn repeated_traffic_does_not_starve_new_probe_binding() {
+        let now = Utc::now().timestamp_millis();
+        let cache = TurnStateCache::default();
+        cache.observe_at(
+            ("account", "model"),
+            &"a".repeat(292),
+            "fetcher",
+            Some("socks5h://old"),
+            None,
+            now - 3000,
+        );
+        let expected = Some(cache.values()[0].clone());
+        cache.observe_at(
+            ("account", "model"),
+            &"a".repeat(292),
+            "traffic",
+            Some("socks5h://old"),
+            None,
+            now,
+        );
+        assert!(cache.observe_probe(
+            ("account", "model"),
+            &"b".repeat(292),
+            (Some("socks5h://new"), None),
+            now - 1000,
+            &expected
+        ));
+        let current = cache.values().remove(0);
+        assert_eq!(current.proxy_url.as_deref(), Some("socks5h://new"));
+        assert_eq!(current.last_seen_at, now);
+        assert_eq!(current.acquired_at, now - 1000);
+    }
+
+    #[test]
+    fn late_traffic_and_probe_cannot_replace_a_new_ticket_proxy_pair() {
+        let now = Utc::now().timestamp_millis();
+        let cache = TurnStateCache::default();
+        let old = "a".repeat(292);
+        let new = "b".repeat(292);
+        cache.observe_at(
+            ("account", "model"),
+            &old,
+            "fetcher",
+            Some("socks5h://old:pass@localhost:1080"),
+            None,
+            now - 2000,
+        );
+        let expected = Some(cache.values()[0].clone());
+        let mut traffic = cache.scope("account", "model");
+        traffic.proxy_url = expected.as_ref().and_then(|v| v.proxy_url.clone());
+        cache.observe_at(
+            ("account", "model"),
+            &new,
+            "fetcher",
+            Some("socks5h://new:pass@localhost:1080"),
+            None,
+            now - 1000,
+        );
+        traffic.observe(&old);
+        traffic.observe(&"c".repeat(292));
+        assert!(!cache.observe_probe(
+            ("account", "model"),
+            &old,
+            (Some("socks5h://old:pass@localhost:1080"), None),
+            now,
+            &expected
+        ));
+        let current = cache.values().remove(0);
+        assert_eq!(current.value, new);
+        assert_eq!(
+            current.proxy_url.as_deref(),
+            Some("socks5h://new:pass@localhost:1080")
+        );
+    }
+
+    #[test]
     fn turn_state_generation_time_controls_expiry_and_refresh() {
         let generated = 1_800_000_000_000;
         let acquired = generated + 45 * 60 * 1000;
@@ -481,7 +679,7 @@ mod timestamp_tests {
         let entry = cache.values().remove(0);
         assert_eq!(entry.acquired_at, acquired);
         assert_eq!(entry.expires_at, generated + STATE_TTL_MS);
-        assert!(entry.expires_at - REFRESH_BEFORE_MS < acquired);
+        assert!(entry.expires_at - 20 * 60 * 1000 < acquired);
         cache.observe_at(
             ("account", "model"),
             &value,
@@ -499,7 +697,7 @@ mod timestamp_tests {
     }
 
     #[test]
-    fn probe_proxy_updates_for_same_value_without_renewing_expiry() {
+    fn repeated_probe_keeps_original_proxy_and_expiry() {
         let acquired = 1_800_000_000_000;
         let cache = TurnStateCache::default();
         let value = token((acquired / 1000) as u64);
@@ -524,7 +722,7 @@ mod timestamp_tests {
         );
         assert_eq!(
             cache.values()[0].proxy_url.as_deref(),
-            Some("socks5h://latest")
+            Some("socks5h://first")
         );
         assert_eq!(cache.values()[0].expires_at, original_expiry);
 
@@ -712,26 +910,31 @@ mod timestamp_tests {
             "a".repeat(292)
         );
         scope.bind_request(&request, Some(&proxy));
-        // 后台刷新后，正在执行的请求仍应记录自己实际使用的会话及出口。
+        // 后台刷新后，旧请求即使返回另一张票据，也不能覆盖新代理与会话。
+        let new_session = TurnStateSession {
+            session_id: "new-probe-session".to_owned(),
+            ..session
+        };
         cache.observe_at(
             ("account", "model"),
             &"b".repeat(292),
             "fetcher",
-            None,
-            None,
+            Some("socks5h://new-proxy:1080"),
+            Some(&new_session),
             now,
         );
         scope.observe(&"c".repeat(292));
-        assert!(cache.values()[0].session.as_ref() == Some(&session));
+        assert_eq!(cache.values()[0].value, "b".repeat(292));
+        assert!(cache.values()[0].session.as_ref() == Some(&new_session));
         assert_eq!(
             cache.values()[0].proxy_url.as_deref(),
-            Some("socks5h://localhost:1080")
+            Some("socks5h://new-proxy:1080")
         );
         let restored = TurnStateCache::default();
         restored.restore(
             serde_json::from_str(&serde_json::to_string(&cache.values()).unwrap()).unwrap(),
         );
-        assert!(restored.values()[0].session.as_ref() == Some(&session));
+        assert!(restored.values()[0].session.as_ref() == Some(&new_session));
     }
 
     #[test]
@@ -772,18 +975,18 @@ mod timestamp_tests {
     #[test]
     fn turn_state_expired_future_and_invalid_timestamps_are_bounded() {
         let now = 1_800_000_000_000;
-        assert!(expiration(&token((now / 1000 - 3601) as u64), now) < now);
+        assert!(expiration(&token((now / 1000 - 3601) as u64), now, STATE_TTL_MS) < now);
         assert_eq!(
-            expiration(&token((now / 1000 + 600) as u64), now),
+            expiration(&token((now / 1000 + 600) as u64), now, STATE_TTL_MS),
             now + STATE_TTL_MS
         );
         for value in ["a".repeat(292), token(u64::MAX), "%%%".to_owned()] {
-            assert_eq!(expiration(&value, now), now + STATE_TTL_MS);
+            assert_eq!(expiration(&value, now, STATE_TTL_MS), now + STATE_TTL_MS);
         }
         let mut wrong_version = URL_SAFE.decode(token(1_800_000_000)).unwrap();
         wrong_version[0] = 0x81;
         assert_eq!(
-            expiration(&URL_SAFE.encode(wrong_version), now),
+            expiration(&URL_SAFE.encode(wrong_version), now, STATE_TTL_MS),
             now + STATE_TTL_MS
         );
     }

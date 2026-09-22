@@ -161,6 +161,14 @@ impl DynamicEgress {
                     "provisioning" => tokio::time::sleep(Duration::from_secs(2)).await,
                     "ready" => {
                         let ip = lease_ip(&body, &selection.family)?;
+                        if matches!(body.provider.as_deref(), Some("socks5" | "novaproxy")) {
+                            // 不完整的 SOCKS5 租约不能发起探测，避免票据落入旧代理或直连。
+                            let url = body.upstream_proxy_url.as_deref().ok_or(())?;
+                            if url.contains("__CPR_292_SID__") {
+                                return Err(());
+                            }
+                            gateway_core::account::OutboundProxy::parse(url).map_err(|_| ())?;
+                        }
                         let proxy = turn_state_proxy(&body.proxy_url.ok_or(())?).map_err(|_| ())?
                             .basic_auth(&lease.id, &body.secret.ok_or(())?);
                         lease.http = Some(build_turn_state_http_client(
@@ -201,6 +209,47 @@ fn lease_ip(body: &LeaseResponse, family: &str) -> Result<Option<String>, ()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn socks5_lease_requires_a_concrete_replay_proxy() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for url in [
+            None,
+            Some("not-a-proxy"),
+            Some("socks5h://user:__CPR_292_SID__@localhost:1080"),
+            Some("socks5h://user:pass_session-fixed@localhost:1080"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/v1/leases")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "state":"ready", "provider":"socks5", "ip":null, "ipVerification":"unverified",
+                "proxyUrl":"http://127.0.0.1:19081", "secret":"test-secret", "upstreamProxyUrl":url
+            }))).mount(&server).await;
+            let service = DynamicEgress {
+                http: Client::builder().no_proxy().build().unwrap(),
+                url: server.uri(),
+                token: "test-token".to_owned().into(),
+            };
+            let result = service
+                .acquire(
+                    &DynamicEgressSelection {
+                        instance: "test".to_owned(),
+                        family: "ipv4".to_owned(),
+                    },
+                    TurnStateProbeProfile::MinimalCompat,
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                url.is_some_and(|v| v.contains("pass_session-fixed"))
+            );
+            if let Ok(lease) = result {
+                assert_eq!(lease.upstream_proxy_url.as_deref(), url);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn release_reports_retention_only_after_explicit_success() {
