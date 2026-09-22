@@ -133,7 +133,11 @@ impl CodexBackendClient {
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
+        let mut headers = if self.turn_state_compat {
+            self.compat_response_headers(request, context)?
+        } else {
+            self.response_headers(request, context)?
+        };
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         insert_optional_protocol_header(
@@ -149,11 +153,36 @@ impl CodexBackendClient {
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
-        let mut headers = self.response_headers(request, context)?;
+        let mut headers = if self.turn_state_compat {
+            self.compat_response_headers(request, context)?
+        } else {
+            self.response_headers(request, context)?
+        };
+        // WebSocket 必须保留 upgrade 握手和对应 Beta，不能发送 Connection: close。
+        headers.remove("connection");
         headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses_websockets=2026-02-06"),
         );
+        Ok(headers)
+    }
+
+    fn compat_response_headers(
+        &self,
+        request: &CodexResponsesRequest,
+        context: CodexRequestContext<'_>,
+    ) -> CodexClientResult<HeaderMap> {
+        let mut headers = build_turn_state_compat_headers(context)?;
+        insert_optional_protocol_header(&mut headers, "x-codex-turn-state", context.turn_state);
+        // 会改变业务执行语义的字段必须保留，其他客户端画像/诊断头不覆盖兼容画像。
+        insert_optional_protocol_header(
+            &mut headers,
+            X_OPENAI_MEMGEN_REQUEST_HEADER,
+            request.memgen_request.as_deref(),
+        );
+        if let Some(subagent) = openai_subagent_from_metadata(request.client_metadata()) {
+            insert_optional_protocol_header(&mut headers, "x-openai-subagent", Some(&subagent));
+        }
         Ok(headers)
     }
 
@@ -307,4 +336,43 @@ fn websocket_header_order(name: &str) -> usize {
         .iter()
         .position(|candidate| name.eq_ignore_ascii_case(candidate))
         .unwrap_or(OFFICIAL_INSERTION_ORDER.len())
+}
+
+/// 探测和自动 State 正式请求共用固定兼容身份；调用方只添加业务必需字段。
+pub(super) fn build_turn_state_compat_headers(
+    context: CodexRequestContext<'_>,
+) -> CodexClientResult<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_str(context.authorization)?,
+    );
+    if let Some(account) = context.account_id {
+        headers.insert("chatgpt-account-id", HeaderValue::from_str(account)?);
+    }
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        reqwest::header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        "openai-beta",
+        HeaderValue::from_static("responses=experimental"),
+    );
+    headers.insert("connection", HeaderValue::from_static("close"));
+    headers.insert("originator", HeaderValue::from_static("codex-tui"));
+    headers.insert("version", HeaderValue::from_static("0.153.4"));
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_static("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
+    );
+    let session_id = context
+        .session_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    headers.insert("session_id", HeaderValue::from_str(&session_id)?);
+    if let Some(cookie) = context.cookie_header {
+        headers.insert(reqwest::header::COOKIE, HeaderValue::from_str(cookie)?);
+    }
+    Ok(headers)
 }

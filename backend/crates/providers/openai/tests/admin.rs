@@ -692,7 +692,11 @@ mod turn_state_fetcher {
             .await;
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut ws = crate::transport::accept_codex_test_websocket(socket).await;
+            let mut ws =
+                crate::transport::accept_codex_test_websocket_with(socket, |request, _| {
+                    assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                })
+                .await;
             ws.next().await.unwrap().unwrap();
             ws.send(Message::Text(json!({"type":"response.metadata", "headers":{"x-codex-turn-state":["x".repeat(312)]}}).to_string().into())).await.unwrap();
             ws.send(Message::Text(json!({"type":"response.completed", "response":{"id":"resp_gate_ws", "model":MODEL, "status":"completed", "output":[]}}).to_string().into())).await.unwrap();
@@ -715,7 +719,14 @@ mod turn_state_fetcher {
             ]),
         )
         .unwrap()
-        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
+        .with_context(Map::from_iter([
+            ("use_websocket".to_owned(), json!(true)),
+            ("session_id".to_owned(), json!("missing-state-ws")),
+            (
+                "downstream_websocket_connection_id".to_owned(),
+                json!("missing-state-lane"),
+            ),
+        ]));
         let mut stream = bundle
             .core_provider()
             .execute(
@@ -742,7 +753,12 @@ mod turn_state_fetcher {
                 ),
             }
         }
-        assert_eq!(error.unwrap().retry_after(), Some(Duration::from_secs(30)));
+        let error = error.unwrap();
+        assert_eq!(
+            error.retry_after(),
+            Some(Duration::from_secs(30)),
+            "{error:?}"
+        );
         server.await.unwrap();
     }
 
@@ -1771,6 +1787,99 @@ mod turn_state_fetcher {
     }
 
     #[tokio::test]
+    async fn automatic_business_tls_matches_minimal_probe_for_http_and_required_websocket() {
+        use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for websocket in [false, true] {
+            let upstream = MockServer::start().await;
+            let accounts = fetch_accounts(&upstream).await;
+            accounts
+                .set_openai_base_url(ACCOUNT, Some("https://probe.invalid".to_owned()))
+                .await;
+            accounts
+                .set_turn_state(
+                    ACCOUNT,
+                    CodexTurnStateConfig {
+                        mode: CodexTurnStateMode::Auto,
+                        value: String::new(),
+                    },
+                )
+                .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            accounts.set_egress(
+                ACCOUNT,
+                Some(
+                    OutboundProxy::parse(&format!("http://{}", listener.local_addr().unwrap()))
+                        .unwrap(),
+                ),
+                None,
+            );
+            let capture = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    header.push(socket.read_u8().await.unwrap());
+                }
+                assert!(
+                    String::from_utf8(header)
+                        .unwrap()
+                        .to_lowercase()
+                        .starts_with("connect probe.invalid:443 http/1.1")
+                );
+                socket
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                assert_probe_tls(&mut socket, true).await;
+            });
+            let bundle = provider_openai::initialize(
+                valid_config().config,
+                provider_ports_with(accounts, Arc::new(TestOAuthPending::default())),
+            )
+            .await
+            .unwrap();
+            let mut context = Map::from_iter([
+                ("use_websocket".to_owned(), json!(websocket)),
+                ("session_id".to_owned(), json!("compat-tls-session")),
+            ]);
+            if websocket {
+                context.insert(
+                    "downstream_websocket_connection_id".to_owned(),
+                    json!("compat-tls"),
+                );
+            }
+            let payload = ProtocolPayload::json_object(
+                "openai",
+                serde_json::from_value(json!({"model":MODEL, "input":"test"})).unwrap(),
+            )
+            .unwrap()
+            .with_context(context);
+            let mut stream = bundle
+                .core_provider()
+                .execute(
+                    initialized_provider_request(
+                        Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                        ACCOUNT,
+                    ),
+                    initialized_attempt_context("req_compat_tls", ACCOUNT),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = stream.next().await {
+                    if event.is_err() {
+                        break;
+                    }
+                }
+                capture.await.unwrap();
+            })
+            .await
+            .unwrap();
+            assert!(upstream.received_requests().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn automatic_state_routes_business_request_through_captured_socks_proxy() {
         use gateway_core::policy::{CodexTurnStateConfig, CodexTurnStateMode};
         for websocket in [false, true] {
@@ -1804,16 +1913,20 @@ mod turn_state_fetcher {
                         socket,
                         |request, _response| {
                             assert_eq!(request.headers()["x-codex-turn-state"], "a".repeat(292));
-                            assert_eq!(request.headers()["session-id"], "probe-session");
-                            assert_eq!(request.headers()["thread-id"], "probe-thread");
+                            assert_eq!(request.headers()["session_id"], "probe-session");
+                            assert!(!request.headers().contains_key("thread-id"));
+                            assert!(!request.headers().contains_key("sec-websocket-extensions"));
                         },
                     )
                     .await;
                     let frame = ws.next().await.unwrap().unwrap();
                     let body: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-                    assert_eq!(body["client_metadata"]["session_id"], "probe-session");
-                    assert_eq!(body["client_metadata"]["thread_id"], "probe-thread");
-                    assert_eq!(body["client_metadata"]["x-codex-window-id"], "probe-window");
+                    assert!(body["client_metadata"].get("session_id").is_none());
+                    assert!(body["client_metadata"].get("thread_id").is_none());
+                    assert_eq!(
+                        body["client_metadata"]["x-codex-turn-state"],
+                        "a".repeat(292)
+                    );
                     ws.send(Message::Text(json!({"type":"response.metadata","headers":{"x-codex-turn-state":["b".repeat(292)]}}).to_string().into())).await.unwrap();
                     ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"resp_auto_proxy_ws","model":MODEL,"status":"completed","output":[]}}).to_string().into())).await.unwrap();
                     return;
@@ -1822,10 +1935,7 @@ mod turn_state_fetcher {
                 let _ = tokio::io::copy_bidirectional(&mut socket, &mut remote).await;
             });
             accounts
-                .set_openai_base_url(
-                    ACCOUNT,
-                    Some(format!("http://localhost:{}", destination.port())),
-                )
+                .set_openai_base_url(ACCOUNT, Some("http://127.0.0.1:1".to_owned()))
                 .await;
             let store = Arc::new(MemoryTurnStateStore::default());
             let now = Utc::now().timestamp_millis();
@@ -1842,6 +1952,7 @@ mod turn_state_fetcher {
                     session_id: "probe-session".to_owned(),
                     thread_id: "probe-thread".to_owned(),
                     window_id: "probe-window".to_owned(),
+                    base_url: Some(format!("http://localhost:{}", destination.port())),
                 }),
             });
             let bundle = provider_openai::initialize(
@@ -1856,10 +1967,18 @@ mod turn_state_fetcher {
                 serde_json::from_value(json!({"model":MODEL,"input":"test"})).unwrap(),
             )
             .unwrap()
-            .with_context(Map::from_iter([(
-                "use_websocket".to_owned(),
-                json!(websocket),
-            )]));
+            .with_context(if websocket {
+                Map::from_iter([
+                    ("use_websocket".to_owned(), json!(true)),
+                    ("session_id".to_owned(), json!("compat-test-session")),
+                    (
+                        "downstream_websocket_connection_id".to_owned(),
+                        json!("compat-test-lane"),
+                    ),
+                ])
+            } else {
+                Map::from_iter([("use_websocket".to_owned(), json!(false))])
+            });
             let mut stream = bundle
                 .core_provider()
                 .execute(
@@ -1885,7 +2004,7 @@ mod turn_state_fetcher {
             if !websocket {
                 assert_eq!(requests.len(), 1);
                 assert_eq!(requests[0].headers["x-codex-turn-state"], "a".repeat(292));
-                assert_eq!(requests[0].headers["session-id"], "probe-session");
+                assert_eq!(requests[0].headers["session_id"], "probe-session");
             } else {
                 assert!(requests.is_empty());
             }
@@ -2010,7 +2129,9 @@ mod turn_state_fetcher {
             .await;
         let store = Arc::new(MemoryTurnStateStore::default());
         *store.proxy.lock().unwrap() = Some(OutboundProxy::parse(&proxy.uri()).unwrap());
-        store.configs.lock().unwrap().push(fetch_config());
+        let mut probe_config = fetch_config();
+        probe_config.probe_profile = TurnStateProbeProfile::MinimalCompat;
+        store.configs.lock().unwrap().push(probe_config);
         let mut config = valid_config().config;
         // 仅在测试中使用明文代理捕获官方域名请求；生产配置仍要求非本地地址使用 HTTPS。
         config.api.base_url = "http://chatgpt.com".to_owned();
@@ -2024,10 +2145,10 @@ mod turn_state_fetcher {
         cycle(&fetch_worker(&mut bundle)).await;
         let payload = ProtocolPayload::json_object(
             "openai",
-            serde_json::from_value(json!({"model":MODEL,"input":"test"})).unwrap(),
+            serde_json::from_value(json!({"model":MODEL,"input":"business input", "instructions":"real instruction", "tools":[{"type":"function", "name":"business_tool", "parameters":{"type":"object"}}], "reasoning":{"effort":"high"}})).unwrap(),
         )
         .unwrap()
-        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(true))]));
         let mut stream = bundle
             .core_provider()
             .execute(
@@ -2052,10 +2173,12 @@ mod turn_state_fetcher {
             "originator",
             "authorization",
             "chatgpt-account-id",
-            "x-codex-installation-id",
-            "session-id",
-            "thread-id",
-            "x-codex-window-id",
+            "session_id",
+            "version",
+            "openai-beta",
+            "connection",
+            "content-type",
+            "accept",
         ] {
             assert_eq!(
                 requests[0].headers.get(name),
@@ -2065,38 +2188,28 @@ mod turn_state_fetcher {
         }
         let bodies: Vec<Value> = requests
             .iter()
-            .map(|request| {
-                let decoded =
-                    zstd::stream::decode_all(std::io::Cursor::new(&request.body)).unwrap();
-                serde_json::from_slice(&decoded).unwrap()
-            })
+            .map(|request| request.body_json().unwrap())
             .collect();
-        for key in ["session_id", "thread_id", "x-codex-window-id"] {
-            assert_eq!(
-                bodies[0]["client_metadata"][key],
-                bodies[1]["client_metadata"][key]
-            );
+        assert_eq!(bodies[0]["input"][0]["content"][0]["text"], "ping");
+        assert_eq!(bodies[1]["instructions"], "real instruction");
+        assert_eq!(bodies[1]["tools"][0]["name"], "business_tool");
+        assert_eq!(bodies[1]["reasoning"]["effort"], "high");
+        assert!(bodies[1].to_string().contains("business input"));
+        for name in [
+            "content-encoding",
+            "session-id",
+            "thread-id",
+            "x-codex-window-id",
+            "x-client-request-id",
+            "x-codex-turn-metadata",
+            "x-codex-routing-hint",
+        ] {
+            assert!(!requests[1].headers.contains_key(name), "{name}");
         }
-        assert_eq!(bodies[0]["prompt_cache_key"], bodies[1]["prompt_cache_key"]);
-        assert_ne!(
-            requests[0].headers["x-client-request-id"],
-            requests[1].headers["x-client-request-id"]
-        );
-        assert_ne!(
-            bodies[0]["client_metadata"]["turn_id"],
-            bodies[1]["client_metadata"]["turn_id"]
-        );
-        let metadata: Value = serde_json::from_str(
-            requests[1].headers["x-codex-turn-metadata"]
-                .to_str()
-                .unwrap(),
-        )
-        .unwrap();
         assert_eq!(
-            metadata["session_id"],
-            bodies[0]["client_metadata"]["session_id"]
+            requests[1].headers["user-agent"],
+            "codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"
         );
-        assert_eq!(metadata["turn_id"], bodies[1]["client_metadata"]["turn_id"]);
     }
 
     #[tokio::test]

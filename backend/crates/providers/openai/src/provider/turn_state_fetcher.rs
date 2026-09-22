@@ -1283,6 +1283,7 @@ impl TurnStateFetcher {
                 session_id,
                 thread_id,
                 window_id,
+                base_url: Some(client.base_url().to_owned()),
             });
             diagnostics.byte_length = outcome.byte_length;
         }

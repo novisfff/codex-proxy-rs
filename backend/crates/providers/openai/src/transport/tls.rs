@@ -117,6 +117,14 @@ pub fn build_reqwest_client_with_custom_ca(
 pub(crate) fn build_turn_state_compat_client(
     builder: reqwest::ClientBuilder,
 ) -> CustomCaResult<reqwest::Client> {
+    builder
+        .use_preconfigured_tls(turn_state_compat_tls_config()?)
+        .build()
+        .map_err(CustomCaError::BuildClientWithSystemRoots)
+}
+
+/// HTTP 与必须保留的 WebSocket 续接共用兼容探测的 TLS 算法及 ALPN。
+pub(crate) fn turn_state_compat_tls_config() -> CustomCaResult<ClientConfig> {
     let mut roots = native_root_store().map_err(CustomCaError::LoadNativeRoots)?;
     if let Some(bundle) = ProcessEnv.configured_ca_bundle() {
         for (idx, cert) in bundle.load_certificates()?.into_iter().enumerate() {
@@ -138,10 +146,7 @@ pub(crate) fn build_turn_state_compat_client(
             .with_no_client_auth();
     // reqwest 不会为预构建配置填充 ALPN，须显式保留 HTTP/1.1 的协商画像。
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    builder
-        .use_preconfigured_tls(config)
-        .build()
-        .map_err(CustomCaError::BuildClientWithSystemRoots)
+    Ok(config)
 }
 
 /// 返回当前自定义 CA 的缓存键。

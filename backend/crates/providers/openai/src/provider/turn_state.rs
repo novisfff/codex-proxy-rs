@@ -175,6 +175,12 @@ pub(super) struct ScopedTurnState {
     session: Option<TurnStateSession>,
 }
 impl ScopedTurnState {
+    pub(super) fn bind_base_url(&mut self, base_url: &str) {
+        if let Some(session) = self.session.as_mut() {
+            session.base_url = Some(base_url.to_owned());
+        }
+    }
+
     pub(super) fn session(&self) -> Option<&TurnStateSession> {
         self.session.as_ref()
     }
@@ -261,6 +267,7 @@ impl ScopedTurnState {
                 session_id: session_id.clone(),
                 thread_id: thread_id.clone(),
                 window_id: window_id.clone(),
+                base_url: None,
             });
     }
 
@@ -403,6 +410,45 @@ fn apply_session(request: &mut CodexResponsesRequest, session: &TurnStateSession
             }
         }
         metadata.insert("x-codex-turn-metadata".to_owned(), json!(turn_metadata));
+    }
+}
+
+/// 兼容画像以 session_id 请求头关联会话，不重复发送旧画像的身份投影。
+/// 工具、历史、推理、服务档位及 Lite 等业务语义字段仍由原请求持有。
+pub(super) fn apply_compat_body(request: &mut CodexResponsesRequest) {
+    const IDENTITY_KEYS: &[&str] = &[
+        "session_id",
+        "thread_id",
+        "x-codex-window-id",
+        "window_id",
+        "turn_id",
+        "root_turn_id",
+        "x-client-request-id",
+        "turnMetadata",
+        "turn_metadata",
+        "x-codex-turn-metadata",
+        "installation_id",
+        "installationId",
+        "x-codex-installation-id",
+        "turnState",
+        "turn_state",
+        "x-codex-turn-state",
+    ];
+    let body = request.body_mut();
+    for key in IDENTITY_KEYS {
+        body.remove(*key);
+    }
+    body.remove("prompt_cache_key");
+    if let Some(metadata) = body
+        .get_mut("client_metadata")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in IDENTITY_KEYS {
+            metadata.remove(*key);
+        }
+        if metadata.is_empty() {
+            body.remove("client_metadata");
+        }
     }
 }
 
@@ -600,6 +646,7 @@ mod timestamp_tests {
             session_id: "probe-session".to_owned(),
             thread_id: "probe-thread".to_owned(),
             window_id: "probe-window".to_owned(),
+            base_url: None,
         };
         cache.observe_at(
             ("account", "model"),

@@ -131,6 +131,7 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
             session_id: "probe-session".to_owned(),
             thread_id: "probe-thread".to_owned(),
             window_id: "probe-window".to_owned(),
+            base_url: Some("https://chatgpt.com/backend-api".to_owned()),
         }),
     };
     store.save_values(vec![value.clone()]).await.unwrap();

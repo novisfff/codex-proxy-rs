@@ -105,6 +105,8 @@ pub struct TurnStateSession {
     pub session_id: String,
     pub thread_id: String,
     pub window_id: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 impl std::fmt::Debug for TurnStateValue {

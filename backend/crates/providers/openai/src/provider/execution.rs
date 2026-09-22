@@ -597,16 +597,46 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         if automatic_turn_state && request.turn_state.is_some() {
             active_account = active_account.with_outbound_proxy(proxy);
         }
-        turn_state.bind_request(&request, active_account.outbound_proxy());
+        // 缓存来自受控探测，仍按上游地址合同验证恢复的数据。
+        let probe_base_url = automatic_turn_state.then(|| turn_state.session().and_then(|session| session.base_url.clone())).flatten();
+        if probe_base_url.as_deref().is_some_and(|url| url != client.base_url() && !crate::transport::valid_upstream_base_url(url)) {
+            Err(provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent))?;
+        }
         // 使用实际出口构造 HTTP 客户端及 WebSocket 池键；失败不回退到账号出口或直连。
         let client = client.for_account(&active_account).map_err(|_| {
             provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
         })?;
+        let client = client.with_base_url(probe_base_url.as_deref());
+        if automatic_turn_state && lease.authentication().oauth().is_some() {
+            // 无缓存的首个正式请求也必须记录真正发出的 session_id，供响应票据继续使用。
+            request.client_session_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+            request.client_thread_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+            request.codex_window_id.get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
+        }
+        turn_state.bind_request(&request, active_account.outbound_proxy());
+        turn_state.bind_base_url(client.base_url());
         let client = if automatic_turn_state {
             client.with_turn_state_session(turn_state.session())
         } else {
             client
         };
+        let client = if automatic_turn_state && lease.authentication().oauth().is_some() {
+            super::turn_state::apply_compat_body(&mut request);
+            client.with_turn_state_compat().map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?
+        } else {
+            client
+        };
+        let effective_origin = client.request_url(crate::transport::CODEX_RESPONSES_PATH).map_err(|_| {
+            provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+        })?;
+        let selected_cookies = if effective_origin != response_origin {
+            Some(selector.cookies_for_origin(lease.account(), &effective_origin).await.map_err(|_| {
+                provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
+            })?)
+        } else { None };
+        let response_origin = effective_origin;
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
         let failure_context = OpenAiFailureContext {
@@ -618,7 +648,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             allows_account_state_mutation,
             allows_capacity_feedback: !context.is_diagnostic_required_account(),
         };
-        let cookie_header = build_cookie_header(lease.cookies())?;
+        let cookie_header = build_cookie_header(selected_cookies.as_deref().unwrap_or(lease.cookies()))?;
         let authorization = lease
             .authentication()
             .authorization_header()

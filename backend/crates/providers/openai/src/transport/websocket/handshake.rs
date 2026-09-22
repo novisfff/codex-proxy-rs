@@ -40,6 +40,11 @@ const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 impl CodexWebSocketConnection {
+    pub(crate) fn disable_compression(&mut self) {
+        self.headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("sec-websocket-extensions"));
+    }
+
     /// 构造 Responses WebSocket 连接描述。
     pub fn responses(
         base_url: &str,
@@ -66,6 +71,7 @@ impl CodexWebSocketConnection {
             endpoint,
             headers,
             outbound_proxy: None,
+            turn_state_compat: false,
         }
     }
 
@@ -160,14 +166,21 @@ async fn connect_websocket(
     connection: &CodexWebSocketConnection,
 ) -> Result<(RawWsStream, WsResponse<Option<Vec<u8>>>), CodexWebSocketExchangeError> {
     let request = websocket_handshake_request(connection)?;
-    let connector = tls::maybe_build_rustls_client_config_with_custom_ca()
-        .map_err(|error| {
-            CodexWebSocketExchangeError::Connect(tungstenite::Error::Io(std::io::Error::other(
-                error,
-            )))
-        })?
-        .map(Connector::Rustls);
-    let result = timeout(WEBSOCKET_CONNECT_TIMEOUT, async {
+    let connector = if connection.turn_state_compat {
+        tls::turn_state_compat_tls_config().map(|config| Some(std::sync::Arc::new(config)))
+    } else {
+        tls::maybe_build_rustls_client_config_with_custom_ca()
+    }
+    .map_err(|error| {
+        CodexWebSocketExchangeError::Connect(tungstenite::Error::Io(std::io::Error::other(error)))
+    })?
+    .map(Connector::Rustls);
+    let connect_timeout = if connection.turn_state_compat {
+        Duration::from_secs(8)
+    } else {
+        WEBSOCKET_CONNECT_TIMEOUT
+    };
+    let result = timeout(connect_timeout, async {
         // Preserve the native direct handshake; explicit egress never inherits a global proxy.
         if connection.outbound_proxy.is_none()
             && matches!(
@@ -175,24 +188,32 @@ async fn connect_websocket(
                 Ok(None)
             )
         {
-            let (websocket, response) =
-                connect_async_tls_with_config(request, Some(websocket_config()), false, connector)
-                    .await?;
+            let (websocket, response) = connect_async_tls_with_config(
+                request,
+                Some(websocket_config(connection.turn_state_compat)),
+                false,
+                connector,
+            )
+            .await?;
             return Ok((Box::new(websocket) as RawWsStream, response));
         }
         let stream = dial_account(connection).await?;
         match stream {
             MaybeTlsStream::Plain(tcp) => {
-                let (websocket, response) =
-                    client_async_tls_with_config(request, tcp, Some(websocket_config()), connector)
-                        .await?;
+                let (websocket, response) = client_async_tls_with_config(
+                    request,
+                    tcp,
+                    Some(websocket_config(connection.turn_state_compat)),
+                    connector,
+                )
+                .await?;
                 Ok((Box::new(websocket) as RawWsStream, response))
             }
             stream => {
                 let (websocket, response) = client_async_tls_with_config(
                     request,
                     stream,
-                    Some(websocket_config()),
+                    Some(websocket_config(connection.turn_state_compat)),
                     connector,
                 )
                 .await?;
@@ -202,7 +223,7 @@ async fn connect_websocket(
     })
     .await
     .map_err(|_| CodexWebSocketExchangeError::ConnectTimeout {
-        timeout: WEBSOCKET_CONNECT_TIMEOUT,
+        timeout: connect_timeout,
     })?;
     match result {
         Ok((websocket, response)) => Ok((websocket, response)),
@@ -313,9 +334,9 @@ fn websocket_handshake_request(
     builder.body(())
 }
 
-fn websocket_config() -> WebSocketConfig {
+fn websocket_config(compat: bool) -> WebSocketConfig {
     let mut extensions = ExtensionsConfig::default();
-    extensions.permessage_deflate = Some(DeflateConfig::default());
+    extensions.permessage_deflate = (!compat).then(DeflateConfig::default);
 
     let mut config = WebSocketConfig::default();
     // 上游 Responses 事件属于 Codex 协议数据，不能沿用 tungstenite 的私有

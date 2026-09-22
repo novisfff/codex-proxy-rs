@@ -4932,10 +4932,8 @@ async fn account_turn_state_should_refresh_metadata_on_reused_websocket() {
         let mut websocket =
             crate::transport::accept_codex_test_websocket_with(socket, |request, response| {
                 assert!(!request.headers().contains_key("x-codex-turn-state"));
-                response.headers_mut().insert(
-                    "sec-websocket-extensions",
-                    "permessage-deflate".parse().unwrap(),
-                );
+                assert!(!request.headers().contains_key("sec-websocket-extensions"));
+                assert!(request.headers().contains_key("session_id"));
                 response
                     .headers_mut()
                     .insert("x-codex-turn-state", "a".repeat(292).parse().unwrap());

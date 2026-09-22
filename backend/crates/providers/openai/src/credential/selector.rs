@@ -1182,6 +1182,15 @@ impl CodexCredentialSelector {
             .ok_or(CredentialSelectionError::InvalidCredential)
     }
 
+    pub(crate) async fn cookies_for_origin(
+        &self,
+        account: &ProviderAccount,
+        origin: &Url,
+    ) -> Result<Vec<RuntimeCodexCookie>, CredentialSelectionError> {
+        let runtime = self.repository.load_runtime_credential(account).await?;
+        Ok(self.replay_cookies(runtime.cookies, origin))
+    }
+
     pub(crate) fn replay_cookies(
         &self,
         cookies: Vec<RuntimeCodexCookie>,

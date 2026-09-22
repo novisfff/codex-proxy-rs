@@ -554,7 +554,10 @@ impl Provider for CodexProvider {
                 UpstreamSendState::NotSent,
             ));
         }
-        let requested_transport = if api_http {
+        let automatic_compat = lease.codex_turn_state().mode
+            == gateway_core::policy::CodexTurnStateMode::Auto
+            && lease.authentication().oauth().is_some();
+        let requested_transport = if api_http || automatic_compat {
             CodexProviderTransport::HttpOnly
         } else {
             selected_transport(&upstream_request)

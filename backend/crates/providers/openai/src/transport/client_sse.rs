@@ -68,6 +68,7 @@ impl CodexBackendClient {
             base_url,
             official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
             protocol: OpenAiUpstreamProtocol::Codex,
+            turn_state_compat: false,
             profile,
             websocket_pool: None,
             websocket_origin_breaker: WebSocketOriginBreaker::default(),
@@ -98,15 +99,19 @@ impl CodexBackendClient {
         // Codex 上游只交付 SSE；即使下游请求 `stream: false`，也要上游流式执行，
         // 再由 API 层收集 canonical events 并返回完整 JSON。不能把下游的传输偏好
         // 直接透传给 Codex，否则上游会以 400 拒绝非流式请求。
-        let mut upstream_body = upstream_request.body().clone();
-        upstream_body.insert("stream".to_owned(), serde_json::Value::Bool(true));
+        let mut upstream_body = serde_json::Value::Object(upstream_request.body().clone());
+        upstream_body["stream"] = serde_json::Value::Bool(true);
+        if self.turn_state_compat {
+            // 兼容获取器递归排序 JSON；只改变编码顺序，保留真实请求内容和执行参数。
+            upstream_body.sort_all_objects();
+        }
         let body =
             serde_json::to_vec(&upstream_body).map_err(CodexClientError::RequestBodyEncode)?;
         self.send_response_stream_http_sse(
             headers,
             body,
             context,
-            self.protocol == OpenAiUpstreamProtocol::Codex,
+            self.protocol == OpenAiUpstreamProtocol::Codex && !self.turn_state_compat,
         )
         .await
     }
@@ -119,38 +124,7 @@ impl CodexBackendClient {
         model: &str,
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            HeaderValue::from_str(context.authorization)?,
-        );
-        if let Some(account) = context.account_id {
-            headers.insert("chatgpt-account-id", HeaderValue::from_str(account)?);
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            reqwest::header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            "openai-beta",
-            HeaderValue::from_static("responses=experimental"),
-        );
-        headers.insert("connection", HeaderValue::from_static("close"));
-        headers.insert("originator", HeaderValue::from_static("codex-tui"));
-        headers.insert("version", HeaderValue::from_static("0.153.4"));
-        headers.insert(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static("codex-tui/0.153.4 (Ubuntu 22.4.0; x86_64) xterm-256color"),
-        );
-        let session_id = context
-            .session_id
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        headers.insert("session_id", HeaderValue::from_str(&session_id)?);
-        if let Some(cookie) = context.cookie_header {
-            headers.insert(reqwest::header::COOKIE, HeaderValue::from_str(cookie)?);
-        }
+        let headers = super::headers::build_turn_state_compat_headers(context)?;
         let mut body = serde_json::json!({
             "model": model, "store": false, "stream": true,
             "instructions": "Reply with exactly: pong",
@@ -335,6 +309,10 @@ impl CodexBackendClient {
         )
         .map_err(CodexClientError::WebSocketEncode)?;
         websocket_create.connection.outbound_proxy = self.outbound_proxy.clone();
+        websocket_create.connection.turn_state_compat = self.turn_state_compat;
+        if self.turn_state_compat {
+            websocket_create.connection.disable_compression();
+        }
         context.trace.cloned().unwrap_or_default().headers(
             "upstream.request.headers",
             serde_json::json!({"transport": "websocket", "phase": "prepared_opening"}),

@@ -701,6 +701,7 @@ pub struct CodexBackendClient {
     pub(super) base_url: String,
     pub(super) official_base_url: String,
     pub(super) protocol: OpenAiUpstreamProtocol,
+    pub(super) turn_state_compat: bool,
     pub(super) profile: CodexWireProfileState,
     pub(super) websocket_pool: Option<Arc<CodexWebSocketPool>>,
     pub(super) websocket_origin_breaker: WebSocketOriginBreaker,
@@ -710,6 +711,38 @@ pub struct CodexBackendClient {
 }
 
 impl CodexBackendClient {
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub(crate) fn with_turn_state_compat(mut self) -> Result<Self, CustomCaError> {
+        let proxy = self
+            .outbound_proxy
+            .as_ref()
+            .map(|proxy| turn_state_proxy(proxy.expose_url()))
+            .transpose()?;
+        let mut builder = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(8));
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
+        // 正式生成不能继承探测的 25 秒总超时；继续使用业务的流空闲及请求截止时间。
+        self.client = super::tls::build_turn_state_compat_client(builder)?;
+        self.turn_state_compat = true;
+        self.egress_key.push_str(":minimal-compat");
+        self.websocket_origin_key = format!(
+            "{}:{}",
+            websocket_origin_key(&self.base_url),
+            self.egress_key
+        );
+        Ok(self)
+    }
+
     pub(crate) fn with_turn_state_session(
         mut self,
         session: Option<&gateway_core::provider_ports::turn_state::TurnStateSession>,
