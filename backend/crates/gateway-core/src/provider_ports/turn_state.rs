@@ -23,8 +23,8 @@ pub struct TurnStateFetcherConfig {
     pub adaptive_concurrency: bool,
     #[serde(default = "default_refresh_interval_minutes")]
     pub refresh_interval_minutes: u16,
-    #[serde(default = "default_state_ttl_minutes")]
-    pub state_ttl_minutes: u16,
+    #[serde(default = "default_state_ttl_seconds")]
+    pub state_ttl_seconds: u32,
     pub revision: i64,
 }
 
@@ -75,14 +75,15 @@ pub const fn default_refresh_interval_minutes() -> u16 {
     40
 }
 
-pub const fn default_state_ttl_minutes() -> u16 {
-    60
+pub const fn default_state_ttl_seconds() -> u32 {
+    3600
 }
 
 impl TurnStateFetcherConfig {
     pub fn valid_refresh_interval(&self) -> bool {
-        (1..=1440).contains(&self.state_ttl_minutes)
-            && (1..=self.state_ttl_minutes).contains(&self.refresh_interval_minutes)
+        (1..=86400).contains(&self.state_ttl_seconds)
+            && self.refresh_interval_minutes > 0
+            && u32::from(self.refresh_interval_minutes) * 60 <= self.state_ttl_seconds
     }
 
     pub fn refresh_interval_ms(&self) -> i64 {
@@ -90,7 +91,7 @@ impl TurnStateFetcherConfig {
     }
 
     pub fn state_ttl_ms(&self) -> i64 {
-        i64::from(self.state_ttl_minutes) * 60_000
+        i64::from(self.state_ttl_seconds) * 1000
     }
 
     pub fn allows_probe_at(&self, now_ms: i64) -> bool {

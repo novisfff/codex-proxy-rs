@@ -27,7 +27,7 @@ async fn turn_state_schedule_roundtrip_update_clear_and_validation() {
         probe_profile: TurnStateProbeProfile::CodexCore,
         adaptive_concurrency: false,
         refresh_interval_minutes: 40,
-        state_ttl_minutes: 60,
+        state_ttl_seconds: 3600,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -45,13 +45,13 @@ async fn turn_state_schedule_roundtrip_update_clear_and_validation() {
     config.probe_profile = TurnStateProbeProfile::MinimalCompat;
     config.adaptive_concurrency = true;
     config.refresh_interval_minutes = 12;
-    config.state_ttl_minutes = 90;
+    config.state_ttl_seconds = 5401;
     store.save_config(config.clone()).await.unwrap();
     config.revision = 2;
     assert_eq!(store.configs().await.unwrap(), vec![config.clone()]);
-    for (interval, ttl) in [(0, 60), (61, 60), (1, 0), (1, 1441)] {
+    for (interval, ttl) in [(0, 3600), (61, 3600), (1, 0), (1, 86401)] {
         config.refresh_interval_minutes = interval;
-        config.state_ttl_minutes = ttl;
+        config.state_ttl_seconds = ttl;
         assert_eq!(
             store.save_config(config.clone()).await.unwrap_err().kind(),
             ProviderStoreErrorKind::InvalidData
@@ -84,7 +84,7 @@ async fn turn_state_dynamic_egress_roundtrip_and_exclusive_static_proxy() {
         probe_profile: TurnStateProbeProfile::CodexCore,
         adaptive_concurrency: false,
         refresh_interval_minutes: 40,
-        state_ttl_minutes: 60,
+        state_ttl_seconds: 3600,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -124,7 +124,7 @@ async fn turn_state_persists_with_revision_fencing_and_account_cascade() {
         probe_profile: TurnStateProbeProfile::CodexCore,
         adaptive_concurrency: false,
         refresh_interval_minutes: 40,
-        state_ttl_minutes: 60,
+        state_ttl_seconds: 3600,
         revision: 0,
     };
     store.save_config(config.clone()).await.unwrap();
@@ -239,7 +239,7 @@ async fn turn_state_proxy_must_be_tested_and_cannot_be_deleted_while_bound() {
         probe_profile: TurnStateProbeProfile::CodexCore,
         adaptive_concurrency: false,
         refresh_interval_minutes: 40,
-        state_ttl_minutes: 60,
+        state_ttl_seconds: 3600,
         revision: 0,
     };
     assert!(
@@ -296,7 +296,7 @@ async fn turn_state_probe_history_is_bounded_and_removed_with_config() {
             probe_profile: TurnStateProbeProfile::MinimalCompat,
             adaptive_concurrency: true,
             refresh_interval_minutes: 40,
-            state_ttl_minutes: 60,
+            state_ttl_seconds: 3600,
             revision: 0,
         })
         .await

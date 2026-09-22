@@ -771,15 +771,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             &response,
             &request,
         );
-        if let Some(observation) = observation_state.observation(None) {
-            yield ProviderEvent::observation(observation);
-        }
         for (name, value) in &response.response_metadata.client_headers {
             if name.eq_ignore_ascii_case("x-codex-turn-state")
                 && let Some(delay) = turn_state.missing_state_retry(automatic_turn_state, value.len()).await
             {
                 Err(missing_turn_state_error(delay))?;
             }
+        }
+        if let Some(observation) = observation_state.observation(None) {
+            yield ProviderEvent::observation(observation);
         }
         if let Some(etag) = response.response_metadata.models_etag.as_deref()
             && let Err(error) = catalog.observe_response_etag(etag)
@@ -1257,7 +1257,8 @@ async fn merge_response_metadata_updates(
 }
 
 fn missing_turn_state_error(seconds: u64) -> ProviderError {
-    let message = format!("当前不存在有效 Turn State，正在尝试获取，请在 {seconds} 秒后重试");
+    let message =
+        format!("上游返回了 312 字节 Turn State，本次响应已拦截，请在 {seconds} 秒后重试");
     let body = json!({"error": {"message": message, "type": "server_error", "code": "turn_state_unavailable", "retry_after": seconds}});
     // 请求已经发给上游，不允许网关偷偷换号重放；将等待时间交给客户端。
     ProviderError::new(ProviderErrorKind::Unavailable, UpstreamSendState::Sent)

@@ -278,31 +278,36 @@ impl ScopedTurnState {
         automatic: bool,
         returned_length: usize,
     ) -> Option<u64> {
-        if !automatic || returned_length != 312 {
+        if returned_length != 312 {
             return None;
+        }
+        if !automatic {
+            return Some(30);
         }
         let store = self
             .cache
             .store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()?;
-        let configs = store.configs().await.ok()?;
-        let config = configs
+            .clone();
+        let Some(store) = store else {
+            return Some(30);
+        };
+        let Ok(configs) = store.configs().await else {
+            return Some(30);
+        };
+        let Some(config) = configs
             .iter()
-            .find(|c| c.enabled && c.account_id == self.key.0 && c.models.contains(&self.key.1))?;
+            .find(|c| c.enabled && c.account_id == self.key.0 && c.models.contains(&self.key.1))
+        else {
+            return Some(30);
+        };
         // 与观察新值采用相同锁顺序，避免并发获取成功后又增加旧的退避次数。
-        let values = self
+        let _values = self
             .cache
             .values
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if values
-            .get(&self.key)
-            .is_some_and(|v| v.expires_at > Utc::now().timestamp_millis())
-        {
-            return None;
-        }
         let mut retries = self
             .cache
             .client_retries

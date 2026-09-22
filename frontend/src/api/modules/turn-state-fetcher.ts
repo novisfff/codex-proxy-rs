@@ -36,7 +36,7 @@ export interface FetcherConfig {
   probeProfile: ProbeProfile
   adaptiveConcurrency: boolean
   refreshIntervalMinutes: number
-  stateTtlMinutes: number
+  stateTtlSeconds: number
   revision: number
 }
 export interface FetcherValue {

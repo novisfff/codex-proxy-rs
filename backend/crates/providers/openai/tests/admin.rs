@@ -184,7 +184,7 @@ mod turn_state_fetcher {
             probe_profile: TurnStateProbeProfile::CodexCore,
             adaptive_concurrency: false,
             refresh_interval_minutes: 40,
-            state_ttl_minutes: 60,
+            state_ttl_seconds: 3600,
             revision: 0,
         }
     }
@@ -792,8 +792,8 @@ mod turn_state_fetcher {
         expired[1..9].copy_from_slice(&((Utc::now().timestamp() - 7200) as u64).to_be_bytes());
         let expired = URL_SAFE.encode(expired);
         for (index, (on, mode, header, expected)) in [
-            (false, CodexTurnStateMode::Auto, "x".repeat(312), None),
-            (true, CodexTurnStateMode::Manual, "x".repeat(312), None),
+            (false, CodexTurnStateMode::Auto, "x".repeat(312), Some(30)),
+            (true, CodexTurnStateMode::Manual, "x".repeat(312), Some(30)),
             (true, CodexTurnStateMode::Auto, "x".repeat(291), None),
             (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(30)),
             (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(60)),
@@ -802,9 +802,9 @@ mod turn_state_fetcher {
             (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(600)),
             (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(600)),
             (true, CodexTurnStateMode::Auto, fresh, None),
-            (true, CodexTurnStateMode::Auto, "x".repeat(312), None),
-            (true, CodexTurnStateMode::Auto, expired, None),
             (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(30)),
+            (true, CodexTurnStateMode::Auto, expired, None),
+            (true, CodexTurnStateMode::Auto, "x".repeat(312), Some(60)),
         ]
         .into_iter()
         .enumerate()
@@ -842,9 +842,18 @@ mod turn_state_fetcher {
                 .unwrap();
             let mut failure = None;
             while let Some(event) = stream.next().await {
-                if let Err(error) = event {
-                    failure = Some(error);
-                    break;
+                match event {
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                    Ok(event) if expected.is_some() => {
+                        assert!(
+                            event.canonical_facts().is_empty(),
+                            "312 must not deliver response content"
+                        );
+                    }
+                    Ok(_) => {}
                 }
             }
             assert_eq!(
@@ -976,7 +985,7 @@ mod turn_state_fetcher {
             });
             let mut config = fetch_config();
             config.refresh_interval_minutes = refresh;
-            config.state_ttl_minutes = 90;
+            config.state_ttl_seconds = 5401;
             store.configs.lock().unwrap().push(config.clone());
             let mut bundle = provider_openai::initialize(
                 valid_config().config,
@@ -996,14 +1005,14 @@ mod turn_state_fetcher {
                     .unwrap()
                     .values[0]
                     .expires_at,
-                acquired + 90 * 60_000
+                acquired + 5401 * 1000
             );
             cycle(&fetch_worker(&mut bundle)).await;
             let snapshot = bundle.admin_provider().turn_state_fetcher().await.unwrap();
             let value = &snapshot.values[0];
             if refresh == 10 {
                 assert_eq!(value.value, "b".repeat(292));
-                assert_eq!(value.expires_at, value.acquired_at + 90 * 60_000);
+                assert_eq!(value.expires_at, value.acquired_at + 5401 * 1000);
                 assert_eq!(
                     snapshot.attempts[0].next_attempt_at,
                     value.acquired_at + 10 * 60_000
@@ -1012,7 +1021,7 @@ mod turn_state_fetcher {
                 assert!(server.received_requests().await.unwrap().is_empty());
                 assert_eq!(value.value, "a".repeat(292));
             }
-            config.state_ttl_minutes = 15;
+            config.state_ttl_seconds = 901;
             config.refresh_interval_minutes = 10;
             bundle
                 .admin_provider()
@@ -1027,11 +1036,11 @@ mod turn_state_fetcher {
                     .unwrap()
                     .values[0]
                     .expires_at,
-                value.acquired_at + 15 * 60_000
+                value.acquired_at + 901 * 1000
             );
-            for (interval, ttl) in [(0, 60), (61, 60), (1, 0), (1, 1441)] {
+            for (interval, ttl) in [(0, 3600), (61, 3600), (1, 0), (1, 86401)] {
                 config.refresh_interval_minutes = interval;
-                config.state_ttl_minutes = ttl;
+                config.state_ttl_seconds = ttl;
                 assert!(
                     bundle
                         .admin_provider()
